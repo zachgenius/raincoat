@@ -1035,13 +1035,57 @@ TEST(Profile, LoadFullReferenceConfigMapsEverySection) {
     EXPECT_EQ(find_set_env(o.set_env, "https_proxy"), nullptr);
     EXPECT_EQ(find_set_env(o.set_env, "all_proxy"), nullptr);
 
-    // ---- reserved sections recorded ----
-    EXPECT_TRUE(any_contains(o.ext.reserved_notes, "egress"));
+    // ---- egress: PARSED into ext.egress this phase (no longer a reserved note) ----
+    EXPECT_TRUE(o.ext.egress.enabled);
+    EXPECT_EQ(o.ext.egress.mode, "bridge");
+    EXPECT_TRUE(o.ext.egress.hide_upstreams_from_child);
+    EXPECT_EQ(o.ext.egress.timeout_seconds, 120);
+    ASSERT_EQ(o.ext.egress.bridges.size(), 2u);
+    EXPECT_EQ(o.ext.egress.bridges[0].name, "primary-api");
+    EXPECT_EQ(o.ext.egress.bridges[0].env, "SOME_BASE_URL");
+    EXPECT_EQ(o.ext.egress.bridges[0].child_endpoint, "http://127.0.0.1:18080");
+    EXPECT_FALSE(o.ext.egress.bridges[0].preserve_host);
+    EXPECT_EQ(o.ext.egress.bridges[1].name, "secondary-api");
+    EXPECT_EQ(o.ext.egress.bridges[1].env, "SECONDARY_BASE_URL");
+    EXPECT_EQ(o.ext.egress.bridges[1].child_endpoint, "http://127.0.0.1:18081");
+    // Egress is enforced this phase, so it must NOT appear as a reserved note.
+    EXPECT_FALSE(any_contains(o.ext.reserved_notes, "egress"));
+
+    // ---- reserved sections still recorded (browser/dns/network_policy) ----
     EXPECT_TRUE(any_contains(o.ext.reserved_notes, "browser"));
     EXPECT_TRUE(any_contains(o.ext.reserved_notes, "dns"));
     EXPECT_TRUE(any_contains(o.ext.reserved_notes, "network_policy"));
-    // The egress note mentions the bridge count (2 configured).
-    EXPECT_TRUE(any_contains(o.ext.reserved_notes, "2 bridge"));
+}
+
+// Load the ACTUAL docs/full-config-reference.toml from the source tree (not the
+// inline verbatim copy) and assert the egress bridge section parses end-to-end.
+// This guards against the shipped reference config and the parser drifting apart.
+TEST(Profile, DocsReferenceEgressBridgeParses) {
+    std::filesystem::path doc =
+        std::filesystem::path(RC_SOURCE_DIR) / "docs" / "full-config-reference.toml";
+    ASSERT_TRUE(std::filesystem::exists(doc)) << "missing " << doc;
+
+    std::string err;
+    auto opt = load_profile(doc.string(), err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    const auto& eg = opt->ext.egress;
+
+    EXPECT_TRUE(eg.enabled);
+    EXPECT_EQ(eg.mode, "bridge");
+    ASSERT_EQ(eg.bridges.size(), 2u);
+
+    EXPECT_EQ(eg.bridges[0].name, "primary-api");
+    EXPECT_EQ(eg.bridges[0].env, "SOME_BASE_URL");
+    EXPECT_EQ(eg.bridges[0].child_endpoint, "http://127.0.0.1:18080");
+    EXPECT_EQ(eg.bridges[0].upstream_endpoint, "https://real-upstream.example.com");
+    EXPECT_FALSE(eg.bridges[0].preserve_host);
+    EXPECT_FALSE(eg.bridges[0].strip_headers.empty());
+
+    EXPECT_EQ(eg.bridges[1].name, "secondary-api");
+    EXPECT_EQ(eg.bridges[1].env, "SECONDARY_BASE_URL");
+    EXPECT_EQ(eg.bridges[1].child_endpoint, "http://127.0.0.1:18081");
+    EXPECT_EQ(eg.bridges[1].upstream_endpoint,
+              "https://secondary-upstream.example.com");
 }
 
 // The reserved network mode leaves net unset; resolve_config's value_or then picks

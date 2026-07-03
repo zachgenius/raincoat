@@ -8,9 +8,11 @@
 // merge combines a profile Options with a CLI Options where CLI wins.
 #include "profile.hpp"
 
+#include <exception>
 #include <fstream>
 #include <set>
 #include <sstream>
+#include <utility>
 
 #include "toml.hpp"
 
@@ -260,11 +262,68 @@ std::optional<Options> load_profile(const std::string& path, std::string& err) {
         o.ext.reserved_notes.push_back(
             "seccomp filter requested but not yet enforced (reserved)");
     }
+    // [egress] + [[egress.bridge]] -> ext.egress (EgressConfig). Unlike the
+    // browser/dns/network_policy sections below, egress forwarding LANDS this phase,
+    // so this is REAL parsed config now — NOT a reserved note. The bridge module
+    // (host-side listeners + HTTP forwarding) consumes ext.egress; the profile layer
+    // only has to map the schema faithfully and stay tolerant of unknown keys.
     if (t.contains("egress")) {
-        std::size_t n = t.get_table_array("egress.bridge").size();
-        o.ext.reserved_notes.push_back(
-            "egress bridge configured (" + std::to_string(n) +
-            (n == 1 ? " bridge)" : " bridges)") + " — not yet enforced (phase 2)");
+        EgressConfig& eg = o.ext.egress;
+
+        // [egress].* scalars/bools. Absent keys keep the struct's defaults.
+        if (auto s = t.get_string("egress.mode"); s.has_value()) eg.mode = *s;
+        if (auto b = t.get_bool("egress.hide_upstreams_from_child"); b.has_value())
+            eg.hide_upstreams_from_child = *b;
+        if (auto b = t.get_bool("egress.redact_upstreams_in_audit"); b.has_value())
+            eg.redact_upstreams_in_audit = *b;
+        if (auto b = t.get_bool("egress.log_request_bodies"); b.has_value())
+            eg.log_request_bodies = *b;
+        if (auto b = t.get_bool("egress.log_response_bodies"); b.has_value())
+            eg.log_response_bodies = *b;
+        if (auto b = t.get_bool("egress.streaming"); b.has_value()) eg.streaming = *b;
+        // timeout_seconds is an integer; the toml module stores numeric scalars as
+        // their raw source text, so parse it defensively and ignore a non-numeric
+        // value (keeps the default rather than aborting the whole profile load).
+        if (auto s = t.get_string("egress.timeout_seconds"); s.has_value()) {
+            try {
+                eg.timeout_seconds = std::stoi(*s);
+            } catch (const std::exception&) {
+                // leave the default; tolerating unknown/odd values, never fatal.
+            }
+        }
+
+        // [[egress.bridge]] array-of-tables -> one EgressBridge per entry, in order.
+        for (const TomlTable& bt : t.get_table_array("egress.bridge")) {
+            EgressBridge br;
+            if (auto s = bt.get_string("name"); s.has_value()) br.name = *s;
+            if (auto s = bt.get_string("env"); s.has_value()) br.env = *s;
+            if (auto s = bt.get_string("child_endpoint"); s.has_value())
+                br.child_endpoint = *s;
+            if (auto s = bt.get_string("upstream_endpoint"); s.has_value())
+                br.upstream_endpoint = *s;
+            if (auto b = bt.get_bool("hide_upstream"); b.has_value())
+                br.hide_upstream = *b;
+            if (auto b = bt.get_bool("preserve_host"); b.has_value())
+                br.preserve_host = *b;
+            if (auto b = bt.get_bool("preserve_path"); b.has_value())
+                br.preserve_path = *b;
+            if (auto b = bt.get_bool("preserve_query"); b.has_value())
+                br.preserve_query = *b;
+            if (auto b = bt.get_bool("preserve_method"); b.has_value())
+                br.preserve_method = *b;
+            if (auto a = bt.get_string_array("strip_headers"); a.has_value())
+                br.strip_headers = *a;
+            // [egress.bridge.inject_headers] is a sub-table on the entry: name->value
+            // header pairs added to the upstream request.
+            for (const auto& kv : bt.get_table_of_strings("inject_headers"))
+                br.inject_headers.emplace_back(kv.first, kv.second);
+            eg.bridges.push_back(std::move(br));
+        }
+
+        // enabled only when the bridge mode is active AND at least one bridge exists.
+        // Any other mode (disabled/proxy/guarded) or an empty bridge list leaves the
+        // forwarding path OFF, matching EGRESS.md's MVP scope (bridge mode only).
+        eg.enabled = (eg.mode == "bridge") && !eg.bridges.empty();
     }
     if (t.contains("browser")) {
         o.ext.reserved_notes.push_back(

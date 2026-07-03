@@ -139,6 +139,35 @@ struct BackendConfig {
     bool seccomp        = false;        // reserved (not implemented)
 };
 
+// One egress bridge: the child sees only `child_endpoint`; Raincoat privately forwards to
+// `upstream_endpoint` (kept host-side, never shown to the child). From [[egress.bridge]].
+struct EgressBridge {
+    std::string name;
+    std::string env;                // env var injected into the child (e.g. SOME_BASE_URL)
+    std::string child_endpoint;     // e.g. http://127.0.0.1:18080  (what the child connects to)
+    std::string upstream_endpoint;  // e.g. https://real-upstream.example.com (host-side only)
+    bool hide_upstream = true;
+    bool preserve_host = false;     // false => send upstream's Host; true => keep child's Host
+    bool preserve_path = true;
+    bool preserve_query = true;
+    bool preserve_method = true;
+    std::vector<std::string> strip_headers;                        // dropped before forwarding
+    std::vector<std::pair<std::string, std::string>> inject_headers;  // added to upstream request
+};
+
+// The [egress] section. `enabled` is true when mode == "bridge" and at least one bridge is set.
+struct EgressConfig {
+    bool enabled = false;
+    std::string mode;               // disabled | proxy | bridge | guarded
+    bool hide_upstreams_from_child = true;
+    bool redact_upstreams_in_audit = true;
+    bool log_request_bodies = false;
+    bool log_response_bodies = false;
+    int  timeout_seconds = 120;
+    bool streaming = true;
+    std::vector<EgressBridge> bridges;
+};
+
 // The rich, forward-compatible profile options that go BEYOND the flat MVP schema. These are
 // populated by the profile layer from the sectioned config (docs/full-config-reference.toml)
 // and carried through merge into Config. Every field defaults to the existing MVP behavior so
@@ -160,6 +189,7 @@ struct ExtendedConfig {
     std::vector<std::string> init_create_dirs; // [init].create_dirs
     std::optional<bool> playful_report;        // [report].playful_summary
     std::optional<std::string> report_log;     // [report].latest_log
+    EgressConfig egress;                       // [egress] + [[egress.bridge]] (phase 2)
     // A RESERVED restrictive network mode ("proxy"/"bridge"/"guarded") was requested but
     // is not yet enforced. Carries the requested mode name so resolve_config can fail
     // CLOSED (fall back to NetMode::Off, never Full) and the runner can warn on stderr.

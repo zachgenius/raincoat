@@ -20,6 +20,11 @@ list(REMOVE_ITEM CORE_SOURCES "${CMAKE_SOURCE_DIR}/src/main.cpp")
 add_library(raincoat_core STATIC ${CORE_SOURCES})
 target_include_directories(raincoat_core PUBLIC "${CMAKE_SOURCE_DIR}/src")
 
+# Egress bridge (phase 2) uses sockets + OpenSSL (HTTPS upstreams) and threads.
+find_package(Threads REQUIRED)
+find_package(OpenSSL REQUIRED)
+target_link_libraries(raincoat_core PUBLIC OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+
 # ---------------------------------------------------------------------------
 # Executable
 # ---------------------------------------------------------------------------
@@ -53,6 +58,7 @@ foreach(test_src ${TEST_SOURCES})
   get_filename_component(test_name "${test_src}" NAME_WE)
   add_executable(${test_name} "${test_src}")
   target_include_directories(${test_name} PRIVATE "${CMAKE_SOURCE_DIR}/src")
+  target_compile_definitions(${test_name} PRIVATE RC_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   target_link_libraries(${test_name} PRIVATE raincoat_core ${RC_GTEST_LIBS})
   add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
