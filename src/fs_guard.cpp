@@ -325,4 +325,22 @@ bool audit_dir_child_writable(const std::string& audit_log_path,
     return false;
 }
 
+bool audit_dir_child_readable(const std::string& audit_log_path,
+                              const std::vector<Mount>& mounts) {
+    fs::path parent = fs::path(audit_log_path).parent_path();
+    if (parent.empty()) {
+        return false;
+    }
+    fs::path parent_canon = canon_or_lexical(parent);
+    for (const auto& m : mounts) {
+        // ANY mount — read-only OR read-write — makes the audit dir child-READABLE.
+        // (audit_dir_child_writable deliberately skips read-only mounts; this must not.)
+        fs::path host = canon_or_lexical(fs::path(m.host_path));
+        if (is_ancestor_or_equal(host, parent_canon)) {
+            return true;  // a mount roots at or above the audit dir
+        }
+    }
+    return false;
+}
+
 }  // namespace raincoat

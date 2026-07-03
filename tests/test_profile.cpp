@@ -1057,6 +1057,63 @@ TEST(Profile, LoadFullReferenceConfigMapsEverySection) {
     EXPECT_TRUE(any_contains(o.ext.reserved_notes, "network_policy"));
 }
 
+// Regression (fix round 1): egress.timeout_seconds must be CLAMPED to a positive
+// floor at load time. A value <= 0 would disable SO_RCVTIMEO and the slowloris
+// wall-clock deadline in the bridge; since an active bridge shares the host net,
+// any local process could then pin a worker thread and block EgressServer::stop()
+// (and SIGINT teardown) indefinitely. The profile layer must never hand a non-
+// positive timeout to the bridge.
+TEST(Profile, EgressTimeoutZeroClampedToPositiveFloor) {
+    std::string path = write_temp_file(
+        "[egress]\n"
+        "mode = \"bridge\"\n"
+        "timeout_seconds = 0\n"
+        "[[egress.bridge]]\n"
+        "name = \"api\"\n"
+        "env = \"BASE\"\n"
+        "child_endpoint = \"http://127.0.0.1:18080\"\n"
+        "upstream_endpoint = \"http://127.0.0.1:9\"\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    EXPECT_GE(opt->ext.egress.timeout_seconds, 1)
+        << "timeout_seconds=0 must be clamped to a positive floor, not left disabled";
+}
+
+TEST(Profile, EgressTimeoutNegativeClampedToPositiveFloor) {
+    std::string path = write_temp_file(
+        "[egress]\n"
+        "mode = \"bridge\"\n"
+        "timeout_seconds = -30\n"
+        "[[egress.bridge]]\n"
+        "name = \"api\"\n"
+        "env = \"BASE\"\n"
+        "child_endpoint = \"http://127.0.0.1:18080\"\n"
+        "upstream_endpoint = \"http://127.0.0.1:9\"\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    EXPECT_GE(opt->ext.egress.timeout_seconds, 1)
+        << "negative timeout_seconds must be clamped to a positive floor";
+}
+
+// A normal positive value is preserved unchanged (the clamp only raises a bad floor).
+TEST(Profile, EgressTimeoutPositiveValuePreserved) {
+    std::string path = write_temp_file(
+        "[egress]\n"
+        "mode = \"bridge\"\n"
+        "timeout_seconds = 45\n"
+        "[[egress.bridge]]\n"
+        "name = \"api\"\n"
+        "env = \"BASE\"\n"
+        "child_endpoint = \"http://127.0.0.1:18080\"\n"
+        "upstream_endpoint = \"http://127.0.0.1:9\"\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    EXPECT_EQ(opt->ext.egress.timeout_seconds, 45);
+}
+
 // Load the ACTUAL docs/full-config-reference.toml from the source tree (not the
 // inline verbatim copy) and assert the egress bridge section parses end-to-end.
 // This guards against the shipped reference config and the parser drifting apart.

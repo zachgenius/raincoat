@@ -258,3 +258,153 @@ TEST(ResolveConfig, MissingProfileFileYieldsError) {
 
     EXPECT_FALSE(err.empty());
 }
+
+// ---------------------------------------------------------------------------
+// Egress bridge mode (phase 2) — network resolution + conflict handling
+// ---------------------------------------------------------------------------
+
+// A minimal profile enabling egress bridge mode with one bridge.
+static const char kEgressProfile[] =
+    "[egress]\n"
+    "mode = \"bridge\"\n"
+    "hide_upstreams_from_child = true\n"
+    "\n"
+    "[[egress.bridge]]\n"
+    "name = \"primary-api\"\n"
+    "env = \"SOME_BASE_URL\"\n"
+    "child_endpoint = \"http://127.0.0.1:18080\"\n"
+    "upstream_endpoint = \"https://real-upstream.example.com\"\n";
+
+TEST(ResolveConfigEgress, BridgeModeSharesHostNet) {
+    // Egress bridge mode needs loopback reachability, so the resolved network must be
+    // SHARED host net (Full for flag emission => no --unshare-net), NOT fail-closed off.
+    const std::string profile = write_temp_profile(kEgressProfile);
+    Options cli;
+    cli.profile_path = profile;
+
+    std::string err;
+    Config cfg = resolve_config(run_inv(cli), fake_parent_env(), kCwd, err);
+
+    ASSERT_TRUE(err.empty()) << err;
+    EXPECT_TRUE(cfg.ext.egress.enabled);
+    EXPECT_EQ(cfg.net, NetMode::Full);
+    // The profile path is carried through for the leak guard.
+    ASSERT_TRUE(cfg.profile_path.has_value());
+    EXPECT_EQ(*cfg.profile_path, profile);
+    // The upstream endpoint survives in config (host-side only) but is never a net mode.
+    ASSERT_EQ(cfg.ext.egress.bridges.size(), 1u);
+    EXPECT_EQ(cfg.ext.egress.bridges[0].upstream_endpoint,
+              "https://real-upstream.example.com");
+}
+
+TEST(ResolveConfigEgress, BridgeModeStrictStillSharesHostNet) {
+    // Even under --strict (which would otherwise default net to Off), egress bridge mode
+    // wins so the child can reach the bridge.
+    const std::string profile = write_temp_profile(kEgressProfile);
+    Options cli;
+    cli.profile_path = profile;
+    cli.strict = true;
+    cli.strict_set = true;
+
+    std::string err;
+    Config cfg = resolve_config(run_inv(cli), fake_parent_env(), kCwd, err);
+
+    ASSERT_TRUE(err.empty()) << err;
+    EXPECT_TRUE(cfg.strict);
+    EXPECT_EQ(cfg.net, NetMode::Full);
+}
+
+TEST(ResolveConfigEgress, ExplicitNetOffConflictsRefused) {
+    // Egress needs reachability; an explicit --net off contradicts it => hard error.
+    const std::string profile = write_temp_profile(kEgressProfile);
+    Options cli;
+    cli.profile_path = profile;
+    cli.net = NetMode::Off;  // explicit CLI --net off
+
+    std::string err;
+    Config cfg = resolve_config(run_inv(cli), fake_parent_env(), kCwd, err);
+
+    EXPECT_FALSE(err.empty());
+    EXPECT_NE(err.find("egress"), std::string::npos);
+}
+
+TEST(ResolveConfigEgress, ProfileNetworkOffConflictsRefused) {
+    // Same conflict when network="off" comes from the profile itself.
+    const std::string profile = write_temp_profile(
+        std::string("network = \"off\"\n") + kEgressProfile);
+    Options cli;
+    cli.profile_path = profile;
+
+    std::string err;
+    Config cfg = resolve_config(run_inv(cli), fake_parent_env(), kCwd, err);
+
+    EXPECT_FALSE(err.empty());
+    EXPECT_NE(err.find("egress"), std::string::npos);
+}
+
+TEST(ResolveConfigEgress, ExplicitNetFullHonoredWithEgress) {
+    // An explicit --net full is compatible with egress (still shared host net).
+    const std::string profile = write_temp_profile(kEgressProfile);
+    Options cli;
+    cli.profile_path = profile;
+    cli.net = NetMode::Full;
+
+    std::string err;
+    Config cfg = resolve_config(run_inv(cli), fake_parent_env(), kCwd, err);
+
+    ASSERT_TRUE(err.empty()) << err;
+    EXPECT_EQ(cfg.net, NetMode::Full);
+    EXPECT_TRUE(cfg.ext.egress.enabled);
+}
+
+// ===========================================================================
+// audit_hides_upstream — per-bridge audit-redaction precedence (pure)
+// ===========================================================================
+//
+// This is the exact decision the runner uses to redact each bridge's upstream in the audit
+// (see runner.cpp). It must fail CLOSED: an upstream is disclosed ONLY when every hiding
+// condition is off. Locks docs/EGRESS.md "Audit redaction (per-bridge)".
+
+namespace {
+// Build a global egress config with the given global redaction flag, and a bridge with the
+// given per-bridge hide_upstream, then evaluate the redaction predicate.
+bool hides(bool global_redact, bool bridge_hide, bool child_readable) {
+    raincoat::EgressConfig eg;
+    eg.redact_upstreams_in_audit = global_redact;
+    raincoat::EgressBridge br;
+    br.hide_upstream = bridge_hide;
+    return raincoat::audit_hides_upstream(eg, br, child_readable);
+}
+}  // namespace
+
+// Default posture (both flags default true, audit not child-readable): upstream hidden.
+TEST(AuditHidesUpstream, DefaultsHide) {
+    EXPECT_TRUE(hides(/*global*/ true, /*bridge*/ true, /*child_readable*/ false));
+}
+
+// The ONLY way to disclose an upstream: global redaction off AND this bridge's
+// hide_upstream off AND the audit is not child-readable.
+TEST(AuditHidesUpstream, AllOffDiscloses) {
+    EXPECT_FALSE(hides(/*global*/ false, /*bridge*/ false, /*child_readable*/ false));
+}
+
+// Global redaction off but the per-bridge hide_upstream still true: hidden. This is the
+// per-bridge knob being LIVE (a sibling with hide_upstream=false can be shown while this one
+// stays hidden).
+TEST(AuditHidesUpstream, PerBridgeHideOverridesGlobalOff) {
+    EXPECT_TRUE(hides(/*global*/ false, /*bridge*/ true, /*child_readable*/ false));
+}
+
+// Global redaction on hides regardless of the per-bridge flag.
+TEST(AuditHidesUpstream, GlobalRedactHidesEvenIfBridgeShown) {
+    EXPECT_TRUE(hides(/*global*/ true, /*bridge*/ false, /*child_readable*/ false));
+}
+
+// Fail-closed: a child-READABLE audit forces hiding even when BOTH the global flag and the
+// per-bridge flag are off — the upstream must NEVER be revealed to a child that can read the
+// audit, regardless of the flags.
+TEST(AuditHidesUpstream, ChildReadableForcesHideRegardlessOfFlags) {
+    EXPECT_TRUE(hides(/*global*/ false, /*bridge*/ false, /*child_readable*/ true));
+    EXPECT_TRUE(hides(/*global*/ false, /*bridge*/ true, /*child_readable*/ true));
+    EXPECT_TRUE(hides(/*global*/ true, /*bridge*/ false, /*child_readable*/ true));
+}

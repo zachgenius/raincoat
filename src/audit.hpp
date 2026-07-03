@@ -9,6 +9,18 @@
 
 namespace raincoat {
 
+// One active egress bridge's audit summary. Carries only child-safe values by
+// default: the real upstream is stored in `upstream` ONLY when redaction is off
+// (redact_upstreams_in_audit == false). By default `upstream_hidden` is true and
+// `upstream` is empty so the real upstream URL is never persisted.
+struct EgressBridgeAudit {
+    std::string name;            // bridge name
+    std::string child_endpoint;  // child-visible endpoint (safe to log)
+    std::string injected_env;    // env var name injected into the child
+    bool upstream_hidden = true; // true => "Upstream endpoint: hidden"
+    std::string upstream;        // real upstream, populated ONLY when not redacted
+};
+
 struct AuditRecord {
     std::string command_line;
     bool strict = false;
@@ -33,6 +45,12 @@ struct AuditRecord {
     std::optional<std::string> profile_name;
     std::vector<std::string> active_policy_notes;
     std::vector<std::string> reserved_notes;
+
+    // Egress bridges that are ACTIVE this run (phase 2). One entry per bridge; the
+    // formatter emits the child-visible endpoint and the injected env var NAME, and
+    // hides the real upstream unless redaction was explicitly disabled. Empty => no
+    // egress bridges (nothing printed).
+    std::vector<EgressBridgeAudit> egress_bridges;
 };
 
 std::string format_audit_start(const AuditRecord& r);

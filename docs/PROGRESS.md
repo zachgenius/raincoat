@@ -169,45 +169,49 @@ CLI grammar: the subcommand must be the first token (e.g. `raincoat init --profi
 
 ---
 
-## Phase 2 — Egress bridge / endpoint indirection  (see docs/EGRESS.md)
+## Phase 2 — Egress bridge / endpoint indirection  (see docs/EGRESS.md)  ✅ MVP LANDED
 
-Generic, profile-driven. No provider/model/env/service names hard-coded.
+Generic, profile-driven. No provider/model/env/service names hard-coded. Host-side HTTP(S)
+forward proxy per bridge (`src/egress.*`), wired into the live runner. Deferred items below
+stay honest `[-]` (a true network jail, guarded/DNS policy, transparent/MITM modes).
 
 ### 2.1 Profile schema & parsing
-- [ ] `[egress] mode = off|bridge`; `[[egress.bridge]]` array-of-tables — *profile/egress*
-- [ ] TOML parser supports `[[array-of-tables]]` — *toml / test_toml*
-- [ ] Fields: `name, env, child_endpoint, upstream_endpoint, hide_upstream_from_child, preserve_host` — *egress*
+- [x] `[egress] mode = off|bridge`; `[[egress.bridge]]` array-of-tables — *profile/egress*
+- [x] TOML parser supports `[[array-of-tables]]` — *toml / test_toml*
+- [x] Fields: `name, env, child_endpoint, upstream_endpoint, hide_upstream, preserve_host` (+ `preserve_path/query/method`, `strip_headers`, `inject_headers`) — *config/profile/egress*
 
 ### 2.2 Host-side bridge lifecycle  (egress)
-- [ ] Read profile on host BEFORE sandbox start
-- [ ] Start local listener per `child_endpoint`; support multiple bridge entries
-- [ ] Clean shutdown/teardown with the sandbox
+- [x] Read profile on host BEFORE sandbox start — *runner* (host-side `egress_srv.start` before fork)
+- [x] Start local listener per `child_endpoint`; support multiple bridge entries — *egress / test_egress_e2e*
+- [x] Clean shutdown/teardown with the sandbox (accept + per-conn threads joined; rollback on bind failure) — *egress*
 
 ### 2.3 Child visibility / isolation
-- [ ] Inject ONLY the configured `env=child_endpoint` into child
-- [ ] Child never sees `upstream_endpoint` in its environment
-- [ ] Profile file NOT mounted into sandbox unless explicitly allowed
-- [ ] Resolve netns reachability (child reaches 127.0.0.1 bridge) — document MVP constraint
+- [x] Inject ONLY the configured `env=child_endpoint` into child — *runner* (verified: child sees only the child endpoint)
+- [x] Child never sees `upstream_endpoint` in its environment — *runner* (verified e2e)
+- [x] Profile file NOT mounted into sandbox unless explicitly allowed; masked (empty shadow) if reachable — *runner* (verified)
+- [x] Resolve netns reachability: egress-bridge mode shares host netns so child reaches 127.0.0.1 bridge; `--net off` conflict refused — *runner* (documented MVP constraint)
 
 ### 2.4 Forwarding
-- [ ] Basic HTTP forwarding (MVP): method, path, query, headers, body preserved
-- [ ] Host header policy via `preserve_host`
-- [ ] Streaming responses where practical
+- [x] HTTP forwarding: method, path, query, headers, body preserved — *egress / test_egress + e2e* (verified)
+- [x] Host header policy via `preserve_host` — *egress::build_upstream_head / test_egress*
+- [x] Streaming responses where practical (pipe upstream→child until EOF) — *egress / test_egress_e2e*
+- [x] HTTPS upstreams (TLS to upstream via OpenSSL) — *egress*
 
 ### 2.5 Audit
-- [ ] Log "Egress bridge enabled: <name>", child endpoint, "Upstream endpoint: hidden", injected env var
-- [ ] Never log upstream endpoint or sensitive bodies by default (verbose mode = explicit opt-in, later)
+- [x] Log "Egress bridge enabled: <name>", child endpoint, "Upstream endpoint: hidden", injected env var — *audit / runner* (verified)
+- [x] Never log upstream endpoint or sensitive bodies by default; per-bridge + child-readable fail-closed redaction — *runner / test_egress_audit_ro_leak_attack*
 
 ### 2.6 Longer-term (deferred, design so they slot in)
-- [-] HTTPS upstreams · [-] header rewrite rules · [-] domain allow/block · [-] transparent egress · [-] explicit MITM (off by default)
+- [-] True network jail (egress-only netns via veth/slirp) · [-] `guarded` mode + domain allow/block · [-] DNS policy · [-] transparent egress · [-] explicit MITM (off by default)
 
 ### 2.7 Limitations documented (honest)
-- [ ] Hides upstream hostname from child env, not the fact a custom endpoint is used
-- [ ] HTTPS hostname rewrite may need MITM/cert control/transparent routing
-- [ ] No claims of bypassing any specific tool/service detection
+- [x] Hides upstream URL from child env, not the fact a custom endpoint is used — *EGRESS.md / README*
+- [x] Shared host netns ⇒ NOT a network jail; upstream IP:port visible via `/proc/net/tcp`; general net access retained — *EGRESS.md / README* (disclosed in the audit every run)
+- [x] HTTPS hostname rewrite may need MITM/cert control/transparent routing — *EGRESS.md*
+- [x] No claims of bypassing any specific tool/service detection — *EGRESS.md / README*
 
-### 2.8 Verification gate (Phase 2 done when ALL true)
-- [ ] Unit + integration tests: env injection, upstream hidden from child, profile not mounted, HTTP forward + stream, audit redaction
-- [ ] Real demo: child hits `child_endpoint`, receives upstream response, upstream absent from child env & audit
-- [ ] EGRESS.md limitations reflected in README
-- [ ] Committed + pushed to master
+### 2.8 Verification gate (Phase 2)
+- [x] Unit + integration tests (7 egress suites / ~90 cases): env injection, upstream hidden from child, profile not mounted, HTTP forward + stream, audit redaction, teardown, honesty regressions
+- [x] Real demo: child hits `child_endpoint`, receives upstream response, upstream absent from child env & audit — verified against `./build/raincoat`
+- [x] EGRESS.md limitations reflected in README (Egress bridge section + roadmap)
+- [ ] Committed + pushed to master — *docs commit pending*

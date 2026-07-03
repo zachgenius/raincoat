@@ -460,6 +460,64 @@ raincoat --profile /path/to/ai-agent.toml -- your-agent ...
 
 ---
 
+## Egress bridge (endpoint indirection)
+
+Raincoat can hand the sandboxed tool a **generic loopback endpoint** while privately
+forwarding its traffic to the real upstream. The child is given only a `child_endpoint`
+through one injected env var and never sees the real upstream hostname in its environment;
+the profile that holds the upstream is not mounted into the sandbox (and is masked with an
+empty file if it turns out to be reachable). This is generic and profile-driven — no
+provider, model, or service names are baked into Raincoat. Full details and the honest
+threat model are in [`docs/EGRESS.md`](docs/EGRESS.md).
+
+Turn it on with an `[egress]` block plus one or more `[[egress.bridge]]` entries. A minimal,
+generic profile lives at [`examples/egress.toml`](examples/egress.toml):
+
+```toml
+[egress]
+mode = "bridge"                     # off | bridge
+redact_upstreams_in_audit = true    # record upstreams as "hidden" in the audit
+streaming = true                    # stream responses (LLM/agent APIs)
+
+[[egress.bridge]]
+name = "primary-api"
+env = "API_BASE_URL"                       # the ONLY env var injected for this bridge
+child_endpoint = "http://127.0.0.1:18080"  # what the child connects to
+upstream_endpoint = "https://upstream.example.com"  # host-side only; never shown to the child
+preserve_host = false                      # send the upstream's Host header
+```
+
+Run it from a directory that does **not** contain the profile:
+
+```sh
+raincoat --profile /path/to/egress.toml -- your-tool ...
+```
+
+Inside the sandbox the tool sees only `API_BASE_URL=http://127.0.0.1:18080`; the real
+upstream never appears in its environment. HTTP and HTTPS upstreams (TLS terminated to the
+upstream via OpenSSL), streaming responses, multiple bridges, `preserve_host` /
+strip-header / inject-header policy are all implemented in the MVP. The audit log records:
+
+```
+Egress bridge enabled: primary-api
+  Child-visible endpoint: http://127.0.0.1:18080
+  Upstream endpoint: hidden
+  Injected env var: API_BASE_URL
+```
+
+> **Honest limitation — this is URL indirection, not a network jail.** For the child to
+> reach the loopback bridge, an active egress bridge makes the sandbox **share the host
+> network namespace** (the net is *not* unshared). So the child also keeps **general host
+> network access**, and the upstream's resolved IP:port is observable to it via
+> `/proc/net/tcp`. The bridge hides the upstream **URL** from the child's environment/config;
+> it does **not** firewall the network or hide that a custom endpoint is in use. Because
+> egress needs shared networking, `[egress] mode = "bridge"` conflicts with `--net off` and
+> Raincoat refuses that combination. A true egress-only jail (net-namespace isolation +
+> veth/slirp) is out of MVP scope. The audit log discloses the shared-net model on every run
+> so it is never a silent leak.
+
+---
+
 ## Roadmap
 
 The MVP implements the fake home, env scrub, generic locale/timezone, best-effort fonts,
@@ -478,15 +536,11 @@ filesystem restriction, `full`/`off` networking, and the audit log. Planned and 
 - **JSON audit logs** — a machine-readable audit format alongside the human-readable one.
 - **Per-command policy templates** — reusable presets for common tools.
 - **Agent-specific profiles** — curated starting points for popular AI agents.
-- **Egress bridge / endpoint indirection** *(planned, next phase — see [`docs/EGRESS.md`](docs/EGRESS.md))* —
-  a host-side HTTP bridge that lets the child connect to a generic local endpoint (e.g.
-  `http://127.0.0.1:18080`) while Raincoat privately forwards to the real upstream. The child is
-  handed only a configured `child_endpoint` via one env var and never sees the real upstream
-  hostname in its environment; the profile holding the upstream is not mounted into the sandbox
-  unless you explicitly allow it. Everything is profile-driven and provider-agnostic — no
-  hard-coded services. It hides the upstream *hostname* from the child's environment; it does not
-  claim to hide that a custom endpoint is in use, and it makes no claim to bypass any specific
-  tool or service.
+- **Egress bridge / endpoint indirection** *(implemented in the MVP — see the
+  [Egress bridge](#egress-bridge-endpoint-indirection) section and [`docs/EGRESS.md`](docs/EGRESS.md))*.
+  Still deferred within egress: a true network jail (egress-only netns via veth/slirp so the
+  child cannot reach the wider network), a `guarded` mode with a domain allow/block policy, DNS
+  policy, a transparent egress mode, and an explicit MITM mode (off by default).
 
 ---
 

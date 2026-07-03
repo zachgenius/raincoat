@@ -89,4 +89,15 @@ std::string audit_mask_dir(const std::string& audit_log_path,
 bool audit_dir_child_writable(const std::string& audit_log_path,
                               const std::vector<Mount>& mounts);
 
+// True when the untrusted child could READ the audit log's parent directory through
+// ANY mount — read-only OR read-write. Unlike `audit_dir_child_writable` (which only
+// classifies read-write mounts, for the tamper warning), this also counts read-only
+// mounts: a `--audit-log` inside an `--allow-read`'d directory is child-READABLE even
+// though the child cannot write it. The runner uses this to FORCE egress upstream
+// redaction whenever the on-disk audit is reachable by the child, so the real upstream
+// endpoint (written to the "start" block before the fork) can never be read out of the
+// audit file — not merely when the audit dir is child-writable.
+bool audit_dir_child_readable(const std::string& audit_log_path,
+                              const std::vector<Mount>& mounts);
+
 }  // namespace raincoat

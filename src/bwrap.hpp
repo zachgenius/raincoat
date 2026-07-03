@@ -14,7 +14,9 @@ std::vector<std::string> build_bwrap_argv(const std::string& bwrap_path, const C
                                           const std::string& sandbox_tmp, bool bind_resolv_conf,
                                           const std::string& font_dir = "",
                                           const std::string& audit_mask_dir = "",
-                                          const std::string& sandbox_out = "");
+                                          const std::string& sandbox_out = "",
+                                          const std::string& mask_empty_file = "",
+                                          const std::vector<std::string>& mask_files = {});
 
 // PURE. Render the bwrap argv as a display-safe string for the audit log. Every
 // `--setenv <NAME> <VALUE>` value is redacted to `<redacted>` (the NAME is shown)

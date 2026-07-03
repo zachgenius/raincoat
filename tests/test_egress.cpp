@@ -148,6 +148,93 @@ TEST(ContentLength, InvalidIsMinusOne) {
     EXPECT_EQ(content_length(h), -1);
 }
 
+// ===========================================================================
+// check_request_framing — request-smuggling / body-framing guard (pure)
+// ===========================================================================
+
+TEST(CheckRequestFraming, NoBodyIsSafe) {
+    HttpRequestHead h;
+    std::string err;
+    ASSERT_TRUE(parse_request_head("GET / HTTP/1.1\r\nHost: x\r\n\r\n", h, err));
+    EXPECT_EQ(check_request_framing(h), FramingReject::None);
+}
+
+TEST(CheckRequestFraming, SingleValidContentLengthIsSafe) {
+    HttpRequestHead h;
+    std::string err;
+    ASSERT_TRUE(parse_request_head("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n", h, err));
+    EXPECT_EQ(check_request_framing(h), FramingReject::None);
+}
+
+TEST(CheckRequestFraming, ChunkedOnlyIsSafe) {
+    HttpRequestHead h;
+    std::string err;
+    ASSERT_TRUE(parse_request_head(
+        "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n", h, err));
+    EXPECT_EQ(check_request_framing(h), FramingReject::None);
+}
+
+// Duplicate-but-IDENTICAL Content-Length is NOT a conflict: it is accepted and collapsed to
+// a single line by build_upstream_head (so exactly one Content-Length crosses to upstream).
+TEST(CheckRequestFraming, DuplicateIdenticalContentLengthAcceptedAndCollapsed) {
+    HttpRequestHead h;
+    std::string err;
+    ASSERT_TRUE(parse_request_head(
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n", h, err));
+    EXPECT_EQ(check_request_framing(h), FramingReject::None);
+
+    Url up;
+    std::string e;
+    ASSERT_TRUE(parse_url("http://up.example.com/", up, e)) << e;
+    EgressBridge b;  // defaults
+    std::string head = build_upstream_head(h, b, up);
+    int count = 0;
+    for (size_t p = head.find("Content-Length"); p != std::string::npos;
+         p = head.find("Content-Length", p + 1)) {
+        ++count;
+    }
+    EXPECT_EQ(count, 1) << "duplicate-identical Content-Length not collapsed to one line:\n"
+                        << head;
+}
+
+// Two CONFLICTING Content-Length values -> CL.CL smuggling -> reject.
+TEST(CheckRequestFraming, ConflictingContentLengthRejected) {
+    HttpRequestHead h;
+    std::string err;
+    ASSERT_TRUE(parse_request_head(
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 100\r\n\r\n", h, err));
+    EXPECT_EQ(check_request_framing(h), FramingReject::ConflictingCl);
+}
+
+// Content-Length together with Transfer-Encoding -> CL.TE smuggling -> reject.
+TEST(CheckRequestFraming, ContentLengthWithTransferEncodingRejected) {
+    HttpRequestHead h;
+    std::string err;
+    ASSERT_TRUE(parse_request_head(
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n",
+        h, err));
+    EXPECT_EQ(check_request_framing(h), FramingReject::ClTe);
+}
+
+// A NON-NUMERIC Content-Length cannot frame a body -> reject (previously it was treated as
+// "no body" and the request was forwarded verbatim, bogus header and all).
+TEST(CheckRequestFraming, NonNumericContentLengthRejected) {
+    HttpRequestHead h;
+    std::string err;
+    ASSERT_TRUE(parse_request_head(
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: notanumber\r\n\r\n", h, err));
+    EXPECT_EQ(check_request_framing(h), FramingReject::MalformedCl);
+}
+
+// A NEGATIVE Content-Length is invalid framing -> reject.
+TEST(CheckRequestFraming, NegativeContentLengthRejected) {
+    HttpRequestHead h;
+    std::string err;
+    ASSERT_TRUE(parse_request_head(
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: -5\r\n\r\n", h, err));
+    EXPECT_EQ(check_request_framing(h), FramingReject::MalformedCl);
+}
+
 TEST(ParseRequestHead, HeaderValueWhitespaceTrimmed) {
     HttpRequestHead h;
     std::string err;
@@ -864,6 +951,52 @@ TEST(EgressAttack, PostBodyReachesUpstreamIntact) {
 
     EXPECT_EQ(up.body(), body) << "upstream did not receive the exact request body";
     EXPECT_NE(resp.find(body), std::string::npos);
+    up.stop();
+}
+
+// A single MALFORMED (non-numeric) Content-Length must be REJECTED with 400 and must NOT
+// reach the upstream. Before the fix the bridge treated an unparseable Content-Length as
+// "no body" and forwarded the request (bogus header and all) verbatim to the upstream.
+TEST(EgressAttack, MalformedContentLengthRejectedNotForwarded) {
+    CapturingUpstream up;
+    ASSERT_TRUE(up.start());
+    EgressServer server;
+    std::string err;
+    ASSERT_TRUE(server.start(make_cfg(up.url()), err)) << err;
+    int port = server.port_for("primary");
+    ASSERT_GT(port, 0);
+
+    std::string req =
+        "POST /v1/chat HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: notanumber\r\n\r\nXXXX";
+    std::string resp = client_roundtrip(port, req);
+    server.stop();
+
+    EXPECT_NE(resp.find("400"), std::string::npos)
+        << "bridge did not 400 a malformed Content-Length; response:\n" << resp;
+    EXPECT_TRUE(up.head().empty())
+        << "a malformed-Content-Length request was forwarded to the upstream:\n" << up.head();
+    up.stop();
+}
+
+// A single NEGATIVE Content-Length is likewise rejected with 400 and never forwarded.
+TEST(EgressAttack, NegativeContentLengthRejectedNotForwarded) {
+    CapturingUpstream up;
+    ASSERT_TRUE(up.start());
+    EgressServer server;
+    std::string err;
+    ASSERT_TRUE(server.start(make_cfg(up.url()), err)) << err;
+    int port = server.port_for("primary");
+    ASSERT_GT(port, 0);
+
+    std::string req =
+        "POST /v1/chat HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: -5\r\n\r\n";
+    std::string resp = client_roundtrip(port, req);
+    server.stop();
+
+    EXPECT_NE(resp.find("400"), std::string::npos)
+        << "bridge did not 400 a negative Content-Length; response:\n" << resp;
+    EXPECT_TRUE(up.head().empty())
+        << "a negative-Content-Length request was forwarded to the upstream:\n" << up.head();
     up.stop();
 }
 

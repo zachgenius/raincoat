@@ -291,6 +291,14 @@ std::optional<Options> load_profile(const std::string& path, std::string& err) {
                 // leave the default; tolerating unknown/odd values, never fatal.
             }
         }
+        // CLAMP to a sane floor. A value <= 0 would disable SO_RCVTIMEO and the
+        // slowloris wall-clock deadline in the bridge (read_request_head /
+        // handle_connection). Because an active egress bridge SHARES the host
+        // network namespace, ANY local process can connect to the loopback bridge
+        // and dribble a request; a disabled timeout pins a worker thread forever and
+        // EgressServer::stop() then blocks run teardown (and SIGINT cleanup) waiting
+        // on active_conns_. Never allow a non-positive timeout to reach the bridge.
+        if (eg.timeout_seconds < 1) eg.timeout_seconds = 1;
 
         // [[egress.bridge]] array-of-tables -> one EgressBridge per entry, in order.
         for (const TomlTable& bt : t.get_table_array("egress.bridge")) {
@@ -324,6 +332,24 @@ std::optional<Options> load_profile(const std::string& path, std::string& err) {
         // Any other mode (disabled/proxy/guarded) or an empty bridge list leaves the
         // forwarding path OFF, matching EGRESS.md's MVP scope (bridge mode only).
         eg.enabled = (eg.mode == "bridge") && !eg.bridges.empty();
+
+        // FAIL CLOSED for a RESTRICTIVE egress intent that did NOT actually activate.
+        // A profile that asks for a constraining egress mode ("bridge"/"proxy"/"guarded")
+        // but does not activate the forwarding path (e.g. mode="bridge" with ZERO bridges,
+        // or an unimplemented proxy/guarded mode) has expressed a clear intent to CONSTRAIN
+        // the network. Left alone, resolve_config's default would hand a non-strict run FULL
+        // open networking (shared host net) — the exact OPPOSITE of that intent, and a silent
+        // fail-OPEN downgrade. Instead record it as a reserved (unenforced) network mode so
+        // resolve_config falls back to NetMode::Off (never Full) and the runner warns on
+        // stderr. Only when egress did NOT actually activate; an active bridge intentionally
+        // shares the host net (handled separately). Do not clobber a mode already recorded by
+        // the top-level `network` key.
+        if (!eg.enabled && !o.ext.reserved_net_mode.has_value() &&
+            (eg.mode == "bridge" || eg.mode == "proxy" || eg.mode == "guarded")) {
+            o.ext.reserved_net_mode = eg.mode;
+            o.ext.reserved_notes.push_back(
+                "network mode \"" + eg.mode + "\" is not yet enforced (phase 2)");
+        }
     }
     if (t.contains("browser")) {
         o.ext.reserved_notes.push_back(

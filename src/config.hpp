@@ -146,6 +146,11 @@ struct EgressBridge {
     std::string env;                // env var injected into the child (e.g. SOME_BASE_URL)
     std::string child_endpoint;     // e.g. http://127.0.0.1:18080  (what the child connects to)
     std::string upstream_endpoint;  // e.g. https://real-upstream.example.com (host-side only)
+    // Per-bridge audit redaction override. When true (default) this bridge's upstream is
+    // recorded as "hidden" in the audit even if the global egress.redact_upstreams_in_audit
+    // is disabled. Effective redaction = egress.redact_upstreams_in_audit || hide_upstream ||
+    // (audit child-readable). To surface exactly one upstream in the audit, disable the
+    // global flag AND set that single bridge's hide_upstream=false.
     bool hide_upstream = true;
     bool preserve_host = false;     // false => send upstream's Host; true => keep child's Host
     bool preserve_path = true;
@@ -167,6 +172,20 @@ struct EgressConfig {
     bool streaming = true;
     std::vector<EgressBridge> bridges;
 };
+
+// True when a bridge's real upstream MUST be recorded as "hidden" in the audit rather than
+// disclosed. Redaction is forced ON when ANY of:
+//   * the global egress.redact_upstreams_in_audit is set (default true), OR
+//   * this bridge's own hide_upstream is set (default true), OR
+//   * the audit log is child-readable (fail-closed — an un-redacted upstream sitting in a
+//     child-readable audit is a leak regardless of the flags).
+// So to surface exactly one upstream a user must disable the global flag AND set that single
+// bridge's hide_upstream=false AND keep the audit out of the child's reach; every other
+// bridge stays hidden by its own default-true hide_upstream.
+inline bool audit_hides_upstream(const EgressConfig& egress, const EgressBridge& bridge,
+                                 bool audit_child_readable) {
+    return egress.redact_upstreams_in_audit || bridge.hide_upstream || audit_child_readable;
+}
 
 // The rich, forward-compatible profile options that go BEYOND the flat MVP schema. These are
 // populated by the profile layer from the sectioned config (docs/full-config-reference.toml)
@@ -271,6 +290,11 @@ struct Config {
     // Rich sectioned-config options (identity/environment/filesystem/backend/init/report...),
     // resolved from the profile. Defaults leave MVP behavior unchanged.
     ExtendedConfig ext;
+
+    // The --profile file this config was loaded from (if any). Carried through so the
+    // runner can detect and mask a profile that lands inside a mounted path — the
+    // profile contains egress upstream_endpoint values that must never reach the child.
+    std::optional<std::string> profile_path;
 
     std::vector<std::string> command;  // target argv
 };

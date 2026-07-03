@@ -69,6 +69,23 @@ long content_length(const HttpRequestHead& head);
 // std::nullopt-equivalent via the bool return.
 bool find_header(const HttpRequestHead& head, const std::string& name, std::string& value_out);
 
+// Why a request head must be REJECTED for HTTP request-smuggling / ambiguous body framing,
+// or None when the request is safe to forward. This is the pure decision the connection
+// handler enforces BEFORE it ever connects upstream (a rejected request is answered 400 and
+// never relayed).
+enum class FramingReject {
+    None,           // safe to forward
+    ClTe,           // both Content-Length and Transfer-Encoding present (CL.TE)
+    ConflictingCl,  // multiple Content-Length headers with differing values (CL.CL)
+    MalformedCl,    // a Content-Length header whose value is malformed or negative
+};
+
+// Analyze the request head's body-framing headers for request-smuggling safety, with no
+// I/O. Returns FramingReject::None when the request may be forwarded; otherwise names why it
+// MUST be rejected. Duplicate-but-identical Content-Length values are NOT a conflict (they
+// are collapsed to a single line by build_upstream_head).
+FramingReject check_request_framing(const HttpRequestHead& head);
+
 // Build the request head to send upstream, applying a bridge's policy:
 //   * request-line: preserve method + target + version (paths/queries preserved).
 //   * Host: upstream host (with :port when non-default) unless b.preserve_host, in

@@ -13,12 +13,14 @@
 #include <string>
 #include <vector>
 
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include "audit.hpp"
 #include "bwrap.hpp"
 #include "doctor.hpp"
+#include "egress.hpp"
 #include "env_guard.hpp"
 #include "font_guard.hpp"
 #include "fs_guard.hpp"
@@ -102,8 +104,31 @@ Config resolve_config(const CliInvocation& inv,
 
     Config cfg;
     cfg.strict = options.strict;
+
+    // Egress bridge mode (phase 2) is ACTIVE when [egress] mode=="bridge" with at least
+    // one bridge (load_profile sets ext.egress.enabled). It changes the network model:
+    // the child must reach the host-loopback bridge, so the sandbox SHARES the host
+    // network namespace (no --unshare-net). See run() and docs/EGRESS.md.
+    const bool egress_active = options.ext.egress.enabled;
+
+    // A hard conflict: egress-bridge mode needs loopback reachability, but the user also
+    // demanded `--net off` (or profile network="off"). Honoring both is impossible, so
+    // REFUSE with an explicit error rather than silently picking a winner. (We choose to
+    // refuse rather than silently share the host net; the user must drop one flag.)
+    if (egress_active && options.net.has_value() && *options.net == NetMode::Off) {
+        err =
+            "Error: egress bridge mode ([egress] mode=\"bridge\") requires network "
+            "reachability to the host loopback bridge, but network was set to \"off\" "
+            "(--net off or network = \"off\"). These conflict. Remove the off setting to "
+            "run egress (the sandbox shares the host network namespace), or disable "
+            "egress.";
+        return Config{};
+    }
+
     // Network resolution + reserved fallback.
     //   * An explicit net (CLI --net or profile network=full|off) always wins.
+    //   * Egress bridge mode overrides the reserved fail-closed: it forces SHARED host
+    //     net (Full for flag emission — no --unshare-net) so 127.0.0.1 reaches the bridge.
     //   * A reserved restrictive mode (proxy/bridge/guarded) leaves options.net unset but
     //     sets ext.reserved_net_mode (see load_profile). It is NOT yet enforced, so fail
     //     CLOSED: fall back to NetMode::Off regardless of strict — never Full. The user
@@ -113,6 +138,8 @@ Config resolve_config(const CliInvocation& inv,
     //   * Otherwise (flat/absent profile) keep the MVP default: Off in strict, Full else.
     if (options.net.has_value()) {
         cfg.net = *options.net;
+    } else if (egress_active) {
+        cfg.net = NetMode::Full;
     } else if (options.ext.reserved_net_mode.has_value()) {
         cfg.net = NetMode::Off;
     } else {
@@ -132,7 +159,17 @@ Config resolve_config(const CliInvocation& inv,
     if (cfg.ext.reserved_net_mode.has_value()) {
         const std::string& mode = *cfg.ext.reserved_net_mode;
         std::string reconciled;
-        if (cfg.net == NetMode::Off) {
+        if (egress_active) {
+            // Egress bridge forwarding is actually running this phase. The reserved
+            // NetMode itself is still not enforced, but the honest outcome is not
+            // "unrestricted with no egress handling" — it is "egress bridge active,
+            // sharing the host net namespace (child NOT network-jailed)".
+            reconciled = "network mode \"" + mode +
+                         "\": egress bridge forwarding is ACTIVE; the child reaches "
+                         "configured upstreams via the injected loopback bridge, but the "
+                         "sandbox SHARES the host network namespace so the child is NOT "
+                         "network-jailed (it retains general host network access)";
+        } else if (cfg.net == NetMode::Off) {
             reconciled = "network mode \"" + mode +
                          "\" is not yet enforced (phase 2); egress fails closed to "
                          "\"off\" (all networking blocked)";
@@ -177,6 +214,11 @@ Config resolve_config(const CliInvocation& inv,
     cfg.keep_temp = options.keep_temp;
     cfg.command = options.command;
 
+    // Carry the --profile path (if any) so run() can detect and mask a profile that
+    // lands inside a mounted path — it holds egress upstream_endpoint values that must
+    // never reach the child. Sourced from the CLI invocation (where --profile came from).
+    cfg.profile_path = inv.options.profile_path;
+
     return cfg;
 }
 
@@ -211,6 +253,19 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         ::sigaction(SIGHUP, &old_hup, nullptr);
         g_child_pid = 0;
     };
+
+    // ---- Egress bridge server (phase 2) ---------------------------------
+    // Declared here at function scope so its destructor tears down every loopback
+    // listener + worker thread on ANY return path (errors, signals, normal exit) — no
+    // orphaned listeners. It is only started() when egress-bridge mode is active; an
+    // unstarted server destructs harmlessly (stop() is idempotent). When active, the
+    // sandbox SHARES the host network namespace (see resolve_config: cfg.net forced to a
+    // shared/Full mode, so build_bwrap_argv emits no --unshare-net) so the child can
+    // reach 127.0.0.1:<bridge>. This does NOT jail the network: the bridge only hides the
+    // real upstream URL from the child's env/config; the child keeps general host network
+    // access. Documented, honest limitation (docs/EGRESS.md).
+    const bool egress_active = cfg.ext.egress.enabled;
+    EgressServer egress_srv;
 
     // ---- 1. Create the sandbox root + fixed sub-tree ---------------------
     const char* tmpdir_env = std::getenv("TMPDIR");
@@ -337,6 +392,42 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     if (!hostname_set_explicitly) {
         env.resolved["HOSTNAME"] = identity_host;
         record_set("HOSTNAME");
+    }
+
+    // ---- 3e. Egress bridge: start listeners + inject child endpoints -----
+    // BEFORE launching bwrap, bind each bridge's loopback listener and inject the
+    // child-visible endpoint into the child env. The upstream_endpoint is NEVER injected
+    // — only the generic child_endpoint. `child_visible[name]` records the endpoint we
+    // actually injected (with the real bound port substituted for a ":0" placeholder) so
+    // the audit reflects what the child received. If start() fails (e.g. the port is
+    // already in use), abort the run rather than silently proceed WITHOUT the bridge —
+    // the child would otherwise get no endpoint and the run would misbehave.
+    std::map<std::string, std::string> child_visible;
+    if (egress_active) {
+        std::string serr;
+        if (!egress_srv.start(cfg.ext.egress, serr)) {
+            err = "Error: could not start egress bridge: " + serr;
+            cleanup_root();
+            restore_signals();
+            return 1;
+        }
+        for (const auto& br : cfg.ext.egress.bridges) {
+            // Reconstruct the child-visible endpoint with the ACTUAL bound port (handles
+            // a ":0" ephemeral request). Fall back to the configured string on any parse
+            // hiccup — start() already validated it, so this is belt-and-suspenders.
+            std::string endpoint = br.child_endpoint;
+            Url u;
+            std::string uerr;
+            int port = egress_srv.port_for(br.name);
+            if (port > 0 && parse_url(br.child_endpoint, u, uerr)) {
+                endpoint = u.scheme + "://" + u.host + ":" + std::to_string(port) + u.path;
+            }
+            if (!br.env.empty()) {
+                env.resolved[br.env] = endpoint;
+                record_set(br.env);
+            }
+            child_visible[br.name] = endpoint;
+        }
     }
 
     // ---- 4. Fontconfig isolation (best-effort) ---------------------------
@@ -468,13 +559,25 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // CLI --net overrode it), but that only shows in the audit log. Surface it on stderr
     // too so a user who never opens the audit still learns their egress restriction was
     // not applied and what networking they actually got.
-    if (cfg.ext.reserved_net_mode.has_value()) {
+    if (cfg.ext.reserved_net_mode.has_value() && !egress_active) {
         if (!warning.empty()) warning += "\n";
         warning +=
             "Warning: network mode \"" + *cfg.ext.reserved_net_mode +
             "\" is not yet enforced; the configured egress restriction was NOT applied. "
             "Networking fell back to \"" + std::string(to_string(cfg.net)) +
             "\" (fail-closed to off unless overridden with --net).";
+    }
+
+    // Honest disclosure when egress-bridge mode is active: the child is NOT network-jailed
+    // (the sandbox shares the host network namespace so it can reach the loopback bridge).
+    // Surface it on stderr too so a user who never opens the audit still learns the model.
+    if (egress_active) {
+        if (!warning.empty()) warning += "\n";
+        warning +=
+            "Note: egress bridge mode is active; the sandbox SHARES the host network "
+            "namespace so the child can reach the loopback bridge. The bridge hides the "
+            "upstream URL from the child's environment, but the child is NOT network-jailed "
+            "(it retains general host network access).";
     }
 
     // ---- 7. Locate the bubblewrap backend --------------------------------
@@ -506,7 +609,23 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // but we are NOT masking it — either a custom --audit-log points into a user
     // --allow-write'd data dir, or the user redundantly --allow-write'd .raincoat. The
     // log is not tamper-proof for this run, so surface that instead of failing silently.
-    if (mask_dir.empty() && audit_dir_child_writable(cfg.audit_log_path, mounts)) {
+    // The same condition means the child can READ the on-disk audit, which matters for
+    // egress: the "start" block is written before the fork, so if it carried the real
+    // upstream (redact_upstreams_in_audit=false) the child could read the upstream out
+    // of the audit file. We force upstream redaction in that case (below) and disclose
+    // it here rather than leak silently under this double opt-out.
+    const bool audit_child_reachable =
+        mask_dir.empty() && audit_dir_child_writable(cfg.audit_log_path, mounts);
+    // The egress upstream leak is about the child READING the on-disk audit "start"
+    // block (written before the fork), which a READ-ONLY mount permits just as well as a
+    // read-write one. audit_dir_child_writable only classifies read-write mounts (correct
+    // for the tamper warning below), so it would MISS a `--audit-log` inside an
+    // `--allow-read`'d directory — a child-readable audit that is not child-writable. Use
+    // the broader readability test for the egress redaction decision so the real upstream
+    // can never be read out of the audit regardless of the mount's read/write mode.
+    const bool audit_child_readable =
+        mask_dir.empty() && audit_dir_child_readable(cfg.audit_log_path, mounts);
+    if (audit_child_reachable) {
         if (!warning.empty()) warning += "\n";
         warning +=
             "Warning: the audit log (" + cfg.audit_log_path +
@@ -514,9 +633,90 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             "tamper-protected and the command could forge or erase it. Use the default "
             "--audit-log location (.raincoat/) to keep the log tamper-proof.";
     }
+    if (egress_active && audit_child_readable && !cfg.ext.egress.redact_upstreams_in_audit) {
+        if (!warning.empty()) warning += "\n";
+        warning +=
+            "Warning: because egress is active and this audit log is child-readable, the "
+            "real upstream endpoint(s) would be readable by the child from the on-disk "
+            "audit; upstream redaction is being FORCED for this run despite "
+            "redact_upstreams_in_audit=false. Move --audit-log to the default (.raincoat/) "
+            "location to record the real upstream safely.";
+    }
+    // Egress profile-leak guard: the --profile file contains upstream_endpoint values.
+    // If that file lives inside a path mounted into the sandbox (e.g. it sits in the
+    // auto-mounted cwd), the child could read the real upstream straight out of the file
+    // — defeating the whole point of hiding it. Detect that and shadow the file with an
+    // empty read-only bind so the child sees nothing. Skipped when the user explicitly
+    // opted out of hiding upstreams ([egress].hide_upstreams_from_child = false). Only
+    // relevant when egress is active AND a profile was loaded.
+    std::string mask_empty_file;
+    std::vector<std::string> mask_files;
+    if (egress_active && cfg.ext.egress.hide_upstreams_from_child &&
+        cfg.profile_path.has_value() && !cfg.profile_path->empty()) {
+        std::string prof_canon =
+            canonicalize(*cfg.profile_path).value_or(absolutize(*cfg.profile_path, cwd));
+        bool prof_reachable = false;
+        for (const auto& m : mounts) {
+            if (path_within(prof_canon, m.sandbox_path)) {
+                prof_reachable = true;
+                break;
+            }
+        }
+        if (prof_reachable) {
+            // Hardlink-alias leak guard: the mask below shadows the profile by PATH (a bind
+            // mount over its canonical name). A SECOND hardlink to the same inode under a
+            // different name inside a mounted path is a distinct directory entry the path-
+            // based mask does NOT cover, so the child could read the real upstream straight
+            // out of the alias while the canonical name reads empty. We cannot cheaply
+            // enumerate every alias across all mounts, so fail CLOSED when the profile has
+            // more than one link rather than leak: refuse the run and tell the user how to
+            // proceed (move the profile outside the mounted paths, drop the extra hardlinks,
+            // or opt out via [egress].hide_upstreams_from_child = false).
+            struct ::stat pst;
+            if (::stat(prof_canon.c_str(), &pst) == 0 && pst.st_nlink > 1) {
+                err = "Error: the --profile at " + prof_canon +
+                      " is reachable by the sandboxed child and has additional hardlinks "
+                      "(link count " + std::to_string(static_cast<unsigned long>(pst.st_nlink)) +
+                      "); raincoat masks the profile by path and cannot shadow every hardlink "
+                      "alias, so an alias would leak the real egress upstream endpoint. Move "
+                      "the profile outside the mounted paths, remove the extra hardlinks, or "
+                      "set [egress].hide_upstreams_from_child = false to allow it.";
+                cleanup_root();
+                restore_signals();
+                return 1;
+            }
+            // Create a raincoat-owned empty file on the host to bind over the profile.
+            mask_empty_file = root + "/.rc-egress-mask-empty";
+            std::ofstream ef(mask_empty_file, std::ios::binary | std::ios::trunc);
+            if (ef) {
+                ef.close();
+                mask_files.push_back(prof_canon);
+                if (!warning.empty()) warning += "\n";
+                warning +=
+                    "Note: the --profile file (" + prof_canon +
+                    ") is inside a path mounted into the sandbox and contains egress "
+                    "upstream endpoints; it is masked (shadowed with an empty file) so the "
+                    "child cannot read the real upstream from it.";
+            } else {
+                // Could not create the mask file: refuse rather than leak the upstream.
+                mask_empty_file.clear();
+                err = "Error: could not create egress profile mask file (" +
+                      mask_empty_file + "); refusing to run because the --profile at " +
+                      prof_canon +
+                      " is reachable by the child and would leak the real upstream "
+                      "endpoint. Move the profile outside the mounted paths, or set "
+                      "[egress].hide_upstreams_from_child = false to allow it.";
+                cleanup_root();
+                restore_signals();
+                return 1;
+            }
+        }
+    }
+
     std::vector<std::string> argv =
         build_bwrap_argv(*bwrap_path, cfg_copy, mounts, env, fake_home, sandbox_tmp,
-                         binds_resolv_conf(cfg.net), font.dir, mask_dir, sandbox_out);
+                         binds_resolv_conf(cfg.net), font.dir, mask_dir, sandbox_out,
+                         mask_empty_file, mask_files);
 
     // ---- 9. Audit record -------------------------------------------------
     AuditRecord rec;
@@ -603,6 +803,50 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             std::to_string(tripwire_planted) + " file(s))");
     }
 
+    // Egress bridge transparency. Honest network-model disclosure + one summary per
+    // bridge (name, child-visible endpoint, injected env var name). The real upstream is
+    // recorded ONLY when redaction was explicitly disabled; by default it is hidden. The
+    // upstream_endpoint is NEVER placed in the child env (only child_endpoint is).
+    if (egress_active) {
+        rec.active_policy_notes.push_back(
+            "egress bridge active: the sandbox SHARES the host network namespace so the "
+            "child can reach the loopback bridge; the child is NOT network-jailed (general "
+            "host network remains reachable). The bridge only hides upstream URLs from the "
+            "child's environment/config; because the net namespace is shared, the resolved "
+            "upstream IP:port is still observable to the child via /proc/net/tcp. A true "
+            "network jail (net-namespace isolation + veth/slirp) is out of MVP scope.");
+        if (!mask_files.empty()) {
+            rec.active_policy_notes.push_back(
+                "egress profile-leak guard: the --profile file is reachable by the child "
+                "and was masked (shadowed with an empty file) so the real upstream cannot "
+                "be read from it.");
+        }
+        // Per-bridge redaction decision. An upstream is hidden in the audit when ANY of:
+        //   * the global [egress].redact_upstreams_in_audit is on (default true), OR
+        //   * this bridge's per-bridge hide_upstream is on (default true), OR
+        //   * the audit log is child-READABLE — forced closed regardless of the settings:
+        //     the "start" block is written to disk before the fork, so an un-redacted
+        //     upstream there is readable by the child through ANY mount (read-only OR
+        //     read-write); the user was warned above.
+        // Honoring br.hide_upstream here makes the per-bridge knob live: to expose exactly
+        // one upstream in the audit a user must BOTH disable the global redaction AND set
+        // that single bridge's hide_upstream=false (every other bridge stays hidden by its
+        // own default-true hide_upstream). The default (both true) hides everything.
+        for (const auto& br : cfg.ext.egress.bridges) {
+            const bool redact =
+                audit_hides_upstream(cfg.ext.egress, br, audit_child_readable);
+            EgressBridgeAudit ba;
+            ba.name = br.name;
+            auto it = child_visible.find(br.name);
+            ba.child_endpoint =
+                (it != child_visible.end()) ? it->second : br.child_endpoint;
+            ba.injected_env = br.env;
+            ba.upstream_hidden = redact;
+            if (!redact) ba.upstream = br.upstream_endpoint;
+            rec.egress_bridges.push_back(std::move(ba));
+        }
+    }
+
     // ---- 10. Write the audit "start" block (+ any warnings) --------------
     if (!warning.empty()) std::cerr << warning << "\n";
     std::string start_content = format_audit_start(rec);
@@ -666,6 +910,13 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // recycled) pid. forward_terminating_signal only signals when g_child_pid > 0.
     g_child_pid = 0;
     restore_signals();
+
+    // Child reaped: tear down the egress bridge listeners + worker threads now (free the
+    // loopback ports promptly). stop() is idempotent and the destructor would also cover
+    // this, but doing it explicitly here matches the lifecycle and releases ports before
+    // the audit/cleanup work below. On the error/signal return paths above, the
+    // function-scope EgressServer destructor performs the same teardown — no orphans.
+    egress_srv.stop();
 
     int exit_code;
     if (WIFEXITED(status)) {

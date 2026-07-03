@@ -29,7 +29,9 @@ std::vector<std::string> build_bwrap_argv(const std::string& bwrap_path, const C
                                           bool bind_resolv_conf,
                                           const std::string& font_dir,
                                           const std::string& audit_mask_dir,
-                                          const std::string& sandbox_out) {
+                                          const std::string& sandbox_out,
+                                          const std::string& mask_empty_file,
+                                          const std::vector<std::string>& mask_files) {
     std::vector<std::string> a;
     auto p1 = [&](const std::string& x) { a.push_back(x); };
     auto p2 = [&](const std::string& x, const std::string& y) {
@@ -111,6 +113,16 @@ std::vector<std::string> build_bwrap_argv(const std::string& bwrap_path, const C
     // cwd mount. The genuine log lives on the host and is written by the raincoat
     // parent process, which is outside this namespace.
     if (!audit_mask_dir.empty()) p2("--tmpfs", audit_mask_dir);
+
+    // Egress profile-leak guard: shadow specific host files (the --profile file, which
+    // contains egress upstream_endpoint values) with an empty read-only file so the
+    // untrusted child cannot read the real upstream out of a profile that happens to sit
+    // inside a mounted path (e.g. the auto-mounted cwd). This MUST come after the user
+    // mounts so it overlays them. `mask_empty_file` is a raincoat-created empty file on
+    // the host; binding it over each target replaces the target's contents with nothing.
+    if (!mask_empty_file.empty()) {
+        for (const auto& f : mask_files) p3("--ro-bind", mask_empty_file, f);
+    }
 
     // Environment: clear then set each resolved entry (std::map => sorted order).
     p1("--clearenv");

@@ -91,6 +91,21 @@ std::string format_audit_start(const AuditRecord& r) {
         }
     }
 
+    // Egress bridges active this run (phase 2). We print the child-visible endpoint and
+    // the injected env var NAME; the real upstream is shown ONLY when redaction was
+    // explicitly disabled (upstream_hidden == false). Request/response bodies are NEVER
+    // logged here. This section never carries a secret VALUE.
+    for (const auto& b : r.egress_bridges) {
+        ss << "Egress bridge enabled: " << b.name << "\n";
+        ss << "  Child-visible endpoint: " << b.child_endpoint << "\n";
+        if (b.upstream_hidden) {
+            ss << "  Upstream endpoint: hidden\n";
+        } else {
+            ss << "  Upstream endpoint: " << b.upstream << "\n";
+        }
+        ss << "  Injected env var: " << b.injected_env << "\n";
+    }
+
     // Sections that were configured but are NOT yet enforced. Surfacing them keeps the
     // audit honest about what the rich profile does (and does not) actually do.
     if (!r.reserved_notes.empty()) {

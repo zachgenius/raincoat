@@ -1,0 +1,92 @@
+# Raincoat profile — egress bridge (endpoint indirection).
+#
+# The child process is handed ONLY a generic loopback endpoint via one injected
+# env var. Raincoat runs a small host-side HTTP(S) forward proxy on that loopback
+# address and privately relays each request to the real upstream, which is NEVER
+# shown to the child (not in its environment, not in the audit log by default).
+#
+# GENERIC BY CONSTRUCTION: no real provider names, hostnames, or secrets appear
+# here. Replace `env`, `child_endpoint`, and `upstream_endpoint` with your own
+# values. Use a generic env var name that your tool already understands as a
+# "base URL" override.
+#
+# KEEP THIS FILE OUTSIDE PATHS MOUNTED INTO THE SANDBOX. It contains the real
+# upstream endpoint. Do not `--allow-read`/`--allow-write` the directory holding
+# it. If Raincoat detects the profile is reachable inside the sandbox it masks it
+# with an empty file so the upstream cannot be read out of it, but the simplest
+# safe habit is to store this profile somewhere the sandbox never sees.
+#
+# HONEST NETWORKING MODEL (read this): when an egress bridge is active the sandbox
+# SHARES the host network namespace (the net is NOT unshared) so the child can
+# reach the loopback bridge. That means the child ALSO keeps general host network
+# access, and the resolved upstream IP:port is observable to the child via
+# /proc/net/tcp. The bridge hides the upstream URL from the child's ENV/config; it
+# is URL indirection, NOT a network jail. See docs/EGRESS.md.
+#
+# Run it (from a directory that does NOT contain this profile):
+#   raincoat --profile /path/to/egress.toml -- your-tool ...
+# Inside the sandbox the tool sees only e.g. API_BASE_URL=http://127.0.0.1:18080.
+
+strict = false
+network = "full"          # egress bridge requires shared host networking (see above)
+
+# Your project. "." resolves to the launch directory. This profile itself should
+# live OUTSIDE this path so it is not mounted into the sandbox.
+allow_read = ["."]
+allow_write = ["."]
+
+# Do NOT forward the upstream credential here if the bridge injects it upstream via
+# inject_headers; forward only what the tool genuinely needs from the parent env.
+allow_env = []
+
+[env]
+TZ = "UTC"
+LANG = "en_US.UTF-8"
+LC_ALL = "en_US.UTF-8"
+
+[fontconfig]
+enabled = true
+
+[audit]
+log_file = ".raincoat/audit.log"
+
+[egress]
+mode = "bridge"                     # off | bridge  (bridge = forwarding is active)
+hide_upstreams_from_child = true    # mask the profile if it is reachable in-sandbox
+redact_upstreams_in_audit = true    # record upstreams as "hidden" in the audit log
+streaming = true                    # stream responses (important for LLM/agent APIs)
+timeout_seconds = 120
+
+# One bridge. Add more [[egress.bridge]] blocks for multiple upstreams — each gets
+# its own loopback listener and its own injected env var.
+[[egress.bridge]]
+name = "primary-api"
+
+# The ONLY env var injected into the child for this bridge. Pick a generic name
+# your tool reads as its base URL. The child sees this pointing at child_endpoint.
+env = "API_BASE_URL"
+
+# What the child connects to (loopback). Use a port that is free on your host.
+child_endpoint = "http://127.0.0.1:18080"
+
+# The real upstream — host-side ONLY. Never shown to the child. May be https://
+# (Raincoat terminates TLS to the upstream via OpenSSL).
+upstream_endpoint = "https://upstream.example.com"
+
+# Host header policy. false => send the upstream's Host (usual for API forwarding);
+# true => keep the child's original Host header.
+preserve_host = false
+
+# Forward method, path, query, and body as-is.
+preserve_path = true
+preserve_query = true
+preserve_method = true
+
+# Drop these request headers before forwarding upstream.
+strip_headers = ["Proxy-Authorization", "Forwarded", "X-Forwarded-For", "X-Real-IP"]
+
+# Optional headers Raincoat injects into the UPSTREAM request (never seen by the
+# child). Put an upstream credential here if you want the child to authenticate
+# without ever holding the secret. Do not commit real secrets to a shared profile.
+[egress.bridge.inject_headers]
+# "Authorization" = "Bearer REPLACE_ME"

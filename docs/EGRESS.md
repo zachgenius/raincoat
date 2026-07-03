@@ -1,6 +1,7 @@
-# Raincoat — Egress Bridge / Endpoint Indirection (NEXT PHASE, not yet implemented)
+# Raincoat — Egress Bridge / Endpoint Indirection
 
-Status: **planned / next phase.** Implement only after the core MVP is finished, committed, and pushed.
+Status: **implemented (MVP).** Host-side HTTP(S) forward proxy per bridge (`src/egress.*`), wired
+into the live sandbox by the runner. See the honest networking model below.
 
 ## Goal
 Let the child process see only a **local or generic endpoint**, while Raincoat privately forwards
@@ -49,18 +50,57 @@ Injected env var: SOME_BASE_URL
 Do NOT log the real upstream endpoint by default. A future verbose/debug mode must require explicit
 opt-in before logging upstream endpoints.
 
-## Scope
-- **MVP:** basic HTTP forwarding first (child_endpoint is plain HTTP on loopback).
-- **Longer-term:** HTTPS upstreams; streaming responses; multiple bridge entries; header rewrite
-  rules; Host header policy; domain allow/block policy; optional transparent egress mode; optional
-  explicit MITM mode (disabled by default).
+## Scope — implemented in the MVP vs future
+**Implemented now (`src/egress.*`, wired into the runner):**
+- Plain-HTTP `child_endpoint` on the host loopback (one listener per bridge; thread-per-connection).
+- **HTTPS upstreams** — TLS is terminated to the upstream via OpenSSL (`upstream_endpoint = "https://…"`).
+- **Streaming responses** — the upstream response is piped back to the child until EOF, so
+  chunked/streamed agent/LLM APIs work (`[egress].streaming`, default true).
+- **Multiple bridge entries** — each `[[egress.bridge]]` gets its own loopback listener and its own
+  injected env var.
+- **Host header policy** via `preserve_host` (send the upstream's Host, or keep the child's).
+- **Header rewrite** — per-bridge `strip_headers` (drop request headers before forwarding) and
+  `inject_headers` (add headers to the upstream request, never shown to the child). Hop-by-hop
+  `Connection`/`Proxy-Connection` headers are dropped and `Connection: close` is forced (MVP: no
+  keep-alive).
+- **Env injection + upstream hiding** — only `env = child_endpoint` reaches the child; the upstream
+  URL is kept host-side and the profile is masked if reachable inside the sandbox.
+- **Audit redaction** — upstreams recorded as `hidden` by default (see below).
+
+**Still future (deferred; the schema/code is shaped so these slot in):**
+- A true **network jail** — an egress-only netns (bridge reachable, everything else blocked) via a
+  veth pair + host forwarding or a userspace net (slirp/passt/pasta). Today egress shares the host
+  net namespace (see Limitations).
+- **`guarded` mode / domain allow-block policy** and **DNS policy** (`[network_policy]`, `[dns]`) —
+  parsed/reserved, not enforced.
+- **Transparent egress mode** (no explicit endpoint) and an explicit **MITM mode** (disabled by
+  default), which would be needed for full HTTPS hostname rewriting without a custom endpoint.
 
 ## Limitations to document (honestly)
-- The bridge hides the real upstream **hostname** from the child's environment.
+- The bridge hides the real upstream **hostname/URL** from the child's **environment/config** — the
+  child is only handed `child_endpoint` via the injected env var, and a `--profile` reachable inside
+  the sandbox is masked (shadowed with an empty file) so the upstream cannot be read out of it.
+- **The upstream is NOT network-jailed and its resolved IP:port is observable to the child.** Because
+  an active egress bridge SHARES the host network namespace (no `--unshare-net`, see below), the child
+  can read raincoat's live connection to the upstream out of `/proc/net/tcp` (e.g. a `127.0.0.1:19191`
+  upstream appears there as `0100007F:4AF7`). The bridge hides the upstream *URL* from the child's
+  env/config; it does NOT hide the upstream *IP:port* from a child that inspects shared `/proc/net`.
+  A true jail (net-namespace isolation + a veth/slirp path) is out of MVP scope. The audit line
+  discloses this shared-net model explicitly so it is never a silent leak.
+- The child also retains **general network access** under the shared namespace — the bridge is
+  URL-indirection, not a network firewall.
 - It does NOT necessarily hide the fact that the child is using a custom/local endpoint.
 - Full HTTPS hostname rewriting without exposing a custom endpoint may require MITM, control of the
   original certificate, or transparent network-level routing.
 - Raincoat must NOT claim to bypass detection by any specific tool or service.
+
+## Audit redaction (per-bridge)
+By default every upstream is recorded as `Upstream endpoint: hidden`. Redaction for a bridge is
+forced on when ANY of: the global `[egress].redact_upstreams_in_audit` is true (default), the
+bridge's own `hide_upstream` is true (default), or the audit log is child-readable (fail-closed,
+regardless of the settings). To surface exactly one upstream in the audit you must BOTH set
+`[egress].redact_upstreams_in_audit = false` AND set that single bridge's `hide_upstream = false`;
+every other bridge stays hidden by its own default-true `hide_upstream`.
 
 ## Key implementation consideration (network namespace interaction) — resolve during design
 The child reaches the bridge at `127.0.0.1:<port>`. That only works if the child's loopback is the
@@ -72,10 +112,13 @@ same loopback the host bridge listens on:
   host's, so a host-side loopback bridge is unreachable. Making egress-only networking work under an
   otherwise-isolated netns needs one of: a veth pair + host-side forwarding, a userspace network
   (slirp/passt/pasta), an abstract/UNIX socket shim, or transparent routing — all deferred.
-- **MVP decision (proposed):** when `[egress] mode = "bridge"` is active, run the child so it can
-  reach the bridge (share loopback / net path), and DOCUMENT that egress-bridge mode currently
-  implies the child can reach the local bridge. Design the code so a future "egress-only" netns
-  (bridge reachable, everything else blocked) can slot in without changing the profile schema.
+- **MVP decision (implemented):** when `[egress] mode = "bridge"` is active, the runner does NOT
+  unshare the net namespace, so the child shares the host loopback and reaches the bridge. This is
+  the documented tradeoff: the child can reach the local bridge AND retains general host network
+  access, and the upstream IP:port is visible via shared `/proc/net/tcp` (see Limitations). This
+  REPLACES the earlier phase-1.5 "bridge fails closed to off" placeholder for the case where
+  bridges are actually configured. The code is structured so a future "egress-only" netns (bridge
+  reachable, everything else blocked) can slot in without changing the profile schema.
 
 ## Suggested module shape (for the implementation phase)
 - New `egress` module: parse `[egress]` + `[[egress.bridge]]` from the profile (via the `toml`

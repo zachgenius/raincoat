@@ -555,3 +555,65 @@ TEST(Audit, StartRichSectionsLeakNoSecretValues) {
     EXPECT_FALSE(contains(out, "sk-SECRETVALUE123"));
     EXPECT_FALSE(contains(out, "supersecretset"));
 }
+
+// ---------------------------------------------------------------------------
+// Egress bridge audit lines (phase 2)
+// ---------------------------------------------------------------------------
+
+// Build an audit record carrying two active egress bridges with the upstream hidden.
+static AuditRecord egress_record() {
+    AuditRecord r = sample_record();
+    EgressBridgeAudit a;
+    a.name = "openai";
+    a.child_endpoint = "http://127.0.0.1:18080";
+    a.injected_env = "OPENAI_BASE_URL";
+    a.upstream_hidden = true;
+    a.upstream = "";  // hidden => never populated
+    r.egress_bridges.push_back(a);
+
+    EgressBridgeAudit b;
+    b.name = "anthropic";
+    b.child_endpoint = "http://127.0.0.1:18081";
+    b.injected_env = "ANTHROPIC_BASE_URL";
+    b.upstream_hidden = true;
+    r.egress_bridges.push_back(b);
+    return r;
+}
+
+TEST(AuditEgress, EmitsPerBridgeLines) {
+    const std::string out = format_audit_start(egress_record());
+    EXPECT_TRUE(contains(out, "Egress bridge enabled: openai"));
+    EXPECT_TRUE(contains(out, "Child-visible endpoint: http://127.0.0.1:18080"));
+    EXPECT_TRUE(contains(out, "Injected env var: OPENAI_BASE_URL"));
+    EXPECT_TRUE(contains(out, "Egress bridge enabled: anthropic"));
+    EXPECT_TRUE(contains(out, "Child-visible endpoint: http://127.0.0.1:18081"));
+    EXPECT_TRUE(contains(out, "Injected env var: ANTHROPIC_BASE_URL"));
+}
+
+TEST(AuditEgress, HidesUpstreamByDefault) {
+    const std::string out = format_audit_start(egress_record());
+    EXPECT_TRUE(contains(out, "Upstream endpoint: hidden"));
+    // The real upstream URL must never be persisted when redacted.
+    EXPECT_FALSE(contains(out, "real-upstream.example.com"));
+    EXPECT_FALSE(contains(out, "https://api.openai.com"));
+}
+
+TEST(AuditEgress, ShowsUpstreamOnlyWhenRedactionDisabled) {
+    AuditRecord r = sample_record();
+    EgressBridgeAudit a;
+    a.name = "openai";
+    a.child_endpoint = "http://127.0.0.1:18080";
+    a.injected_env = "OPENAI_BASE_URL";
+    a.upstream_hidden = false;                       // redaction explicitly disabled
+    a.upstream = "https://api.openai.com";           // now recorded
+    r.egress_bridges.push_back(a);
+
+    const std::string out = format_audit_start(r);
+    EXPECT_TRUE(contains(out, "Upstream endpoint: https://api.openai.com"));
+    EXPECT_FALSE(contains(out, "Upstream endpoint: hidden"));
+}
+
+TEST(AuditEgress, NoEgressSectionWhenEmpty) {
+    const std::string out = format_audit_start(sample_record());
+    EXPECT_FALSE(contains(out, "Egress bridge enabled:"));
+}

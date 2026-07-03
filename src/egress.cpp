@@ -277,6 +277,46 @@ long content_length(const HttpRequestHead& head) {
     return n;
 }
 
+FramingReject check_request_framing(const HttpRequestHead& head) {
+    // Collect Content-Length headers; flag duplicates whose (trimmed) values differ.
+    bool has_cl = false;
+    bool cl_conflict = false;
+    std::string first_cl;
+    for (const auto& kv : head.headers) {
+        if (!iequals(kv.first, "Content-Length")) continue;
+        std::string v = trim_ws(kv.second);
+        if (!has_cl) {
+            has_cl = true;
+            first_cl = v;
+        } else if (v != first_cl) {
+            cl_conflict = true;
+        }
+    }
+    bool te_chunked = false;
+    {
+        std::string te;
+        if (find_header(head, "Transfer-Encoding", te) &&
+            ascii_lower(te).find("chunked") != std::string::npos) {
+            te_chunked = true;
+        }
+    }
+    // CL.TE: Content-Length together with Transfer-Encoding: chunked frames the body two
+    // different ways — the classic smuggling shape. Reject rather than pick a winner.
+    if (has_cl && te_chunked) return FramingReject::ClTe;
+    // CL.CL: multiple Content-Length headers with DIFFERING values. The bridge would frame
+    // the body by the first value while the upstream might frame it by a later one, and
+    // because the bridge injects credentials + forces Connection: close a desync would let
+    // an untrusted child sneak a second authenticated request past the bridge. Reject.
+    if (cl_conflict) return FramingReject::ConflictingCl;
+    // A single (or duplicate-identical) Content-Length whose value is malformed or negative:
+    // the bridge cannot determine the body length, so it cannot safely frame/relay the body.
+    // content_length() returns -1 for a malformed/negative value; duplicates here are
+    // identical, so it reflects the one true value. (Previously such a request was treated
+    // as "no body" and forwarded verbatim with the bogus header.)
+    if (has_cl && content_length(head) < 0) return FramingReject::MalformedCl;
+    return FramingReject::None;
+}
+
 // ---------------------------------------------------------------------------
 // build_upstream_head
 // ---------------------------------------------------------------------------
@@ -347,6 +387,13 @@ std::string build_upstream_head(const HttpRequestHead& req, const EgressBridge& 
 
     out += "Host: " + host_value + "\r\n";
 
+    // CL.CL hygiene: a request with more than one Content-Length header is a classic
+    // request-smuggling shape (the bridge frames the body by the first value, the
+    // upstream might frame it by a later one). handle_connection() rejects conflicting
+    // Content-Length outright; harden this pure builder too so it NEVER re-emits more
+    // than one Content-Length to the upstream — the first occurrence wins, any further
+    // Content-Length lines are dropped. Defense-in-depth for direct callers.
+    bool cl_emitted = false;
     for (const auto& kv : req.headers) {
         const std::string& name = kv.first;
         if (iequals(name, "Host")) continue;               // set explicitly above
@@ -354,6 +401,10 @@ std::string build_upstream_head(const HttpRequestHead& req, const EgressBridge& 
         if (iequals(name, "Proxy-Connection")) continue;   // hop-by-hop, never forward
         if (req_chunked && iequals(name, "Content-Length"))
             continue;  // CL.TE hygiene: chunked framing wins, never forward both
+        if (iequals(name, "Content-Length")) {
+            if (cl_emitted) continue;  // collapse duplicates: never forward two CL headers
+            cl_emitted = true;
+        }
         bool stripped = false;
         for (const std::string& s : b.strip_headers) {
             if (iequals(name, s)) {
@@ -939,7 +990,17 @@ void EgressServer::handle_connection(int child_fd, EgressBridge bridge) {
         return;
     }
 
-    // 1b. Determine request-body framing and reject the ambiguous CL.TE shape up front.
+    // 1b. Reject request-smuggling / ambiguous body framing BEFORE connecting upstream.
+    //     check_request_framing() rejects CL.TE (Content-Length + Transfer-Encoding),
+    //     CL.CL (multiple Content-Length headers with DIFFERING values), and a malformed
+    //     or negative Content-Length whose body length cannot be determined. A rejected
+    //     request is answered 400 and NEVER relayed; the upstream connection is not even
+    //     opened. Duplicate-but-identical Content-Length is safe and is collapsed to one
+    //     line by build_upstream_head().
+    if (check_request_framing(req) != FramingReject::None) {
+        fail400();
+        return;
+    }
     long clen = content_length(req);
     bool te_chunked = false;
     {
@@ -948,15 +1009,6 @@ void EgressServer::handle_connection(int child_fd, EgressBridge bridge) {
             ascii_lower(te).find("chunked") != std::string::npos) {
             te_chunked = true;
         }
-    }
-    // A request carrying BOTH Content-Length and Transfer-Encoding: chunked is a classic
-    // request-smuggling vector (the two headers frame the body differently). Refuse it
-    // rather than pick a winner and forward an ambiguous message upstream.
-    bool has_cl_header = false;
-    { std::string v; has_cl_header = find_header(req, "Content-Length", v); }
-    if (has_cl_header && te_chunked) {
-        fail400();
-        return;
     }
 
     // Detect a strict Expect: 100-continue so we can relay the upstream's interim status
