@@ -277,3 +277,32 @@ TEST(Report, ScrubbedVarsDescribedNeutrallyNotAsSecrets) {
     EXPECT_FALSE(icontains(out, "secret"))
         << "must not claim the withheld env vars were secrets:\n" << out;
 }
+
+// --- plain (non-playful) mode ------------------------------------------------
+
+TEST(Report, PlainModeStillSurfacesTheFacts) {
+    const std::string out = summarize_audit(kStrictAudit, /*playful=*/false);
+    EXPECT_FALSE(out.empty());
+    EXPECT_TRUE(icontains(out, "strict")) << out;
+    EXPECT_TRUE(icontains(out, "off")) << out;                 // network
+    EXPECT_TRUE(contains(out, std::to_string(kStrictScrubbedCount))) << out;
+    EXPECT_TRUE(icontains(out, "home")) << out;
+}
+
+TEST(Report, PlainModeDropsThePlayfulPersona) {
+    const std::string out = summarize_audit(kStrictAudit, /*playful=*/false);
+    // None of the playful narrative / verdict flourishes appear in plain mode.
+    EXPECT_FALSE(icontains(out, "kept an eye on things")) << out;
+    EXPECT_FALSE(icontains(out, "did not get to see you naked")) << out;
+}
+
+TEST(Report, PlayfulIsTheDefault) {
+    // The default (no second arg) equals an explicit playful=true and differs from plain.
+    EXPECT_EQ(summarize_audit(kStrictAudit), summarize_audit(kStrictAudit, true));
+    EXPECT_NE(summarize_audit(kStrictAudit, true), summarize_audit(kStrictAudit, false));
+}
+
+TEST(Report, PlainModeDoesNotBrandVarsAsSecrets) {
+    const std::string out = summarize_audit(kStrictAudit, /*playful=*/false);
+    EXPECT_FALSE(icontains(out, "secret")) << out;
+}

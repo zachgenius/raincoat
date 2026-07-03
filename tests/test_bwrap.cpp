@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -730,4 +731,90 @@ TEST(RedactArgv, EndToEndFromBuildBwrapArgvLeaksNoSecret) {
     EXPECT_NE(out.find("PATH"), std::string::npos);
     // Command survived verbatim at the tail.
     EXPECT_NE(out.find("python train.py"), std::string::npos) << out;
+}
+
+// ---------------------------------------------------------------------------
+// Backend toggles ([backend]) + configurable hostname (ext.hostname).
+// A default-constructed Config reproduces the MVP argv (covered above); these
+// tests exercise the profile overrides carried in cfg.ext.
+// ---------------------------------------------------------------------------
+
+// Build a Config whose ext.backend / ext.hostname are populated for the toggle tests.
+static Config makeBackendConfig(std::function<void(Config&)> tweak) {
+    Config c = makeConfig(NetMode::Off, "/work", {"true"});
+    tweak(c);
+    return c;
+}
+
+static Argv buildWith(const Config& cfg) {
+    return build_bwrap_argv("/usr/bin/bwrap", cfg, {}, makeEnv({}), "/fh", "/tmp", false);
+}
+
+TEST(BwrapBackend, HostnameComesFromExtWhenSet) {
+    Config cfg = makeBackendConfig([](Config& c) { c.ext.hostname = "workstation"; });
+    Argv a = buildWith(cfg);
+    EXPECT_TRUE(hasPair(a, "--hostname", "workstation"));
+    EXPECT_FALSE(hasPair(a, "--hostname", "sandbox"));
+    EXPECT_EQ(countTok(a, "--hostname"), 1);
+}
+
+TEST(BwrapBackend, HostnameDefaultsToSandboxWhenExtUnset) {
+    Argv a = buildWith(makeConfig(NetMode::Off, "/work", {"true"}));
+    EXPECT_TRUE(hasPair(a, "--hostname", "sandbox"));
+}
+
+TEST(BwrapBackend, UnshareUserEmittedOnlyWhenEnabled) {
+    EXPECT_FALSE(has(buildWith(makeConfig(NetMode::Off, "/w", {"true"})), "--unshare-user"));
+    Config cfg = makeBackendConfig([](Config& c) { c.ext.backend.unshare_user = true; });
+    Argv a = buildWith(cfg);
+    EXPECT_TRUE(has(a, "--unshare-user"));
+    // Must sit before the base /usr bind, alongside the other namespace flags.
+    EXPECT_LT(indexOf(a, "--unshare-user"), indexOfTriple(a, "--ro-bind", "/usr", "/usr"));
+}
+
+TEST(BwrapBackend, UnshareCgroupEmittedOnlyWhenEnabled) {
+    EXPECT_FALSE(has(buildWith(makeConfig(NetMode::Off, "/w", {"true"})), "--unshare-cgroup"));
+    Config cfg = makeBackendConfig([](Config& c) { c.ext.backend.unshare_cgroup = true; });
+    EXPECT_TRUE(has(buildWith(cfg), "--unshare-cgroup"));
+}
+
+TEST(BwrapBackend, DieWithParentSuppressible) {
+    Config cfg = makeBackendConfig([](Config& c) { c.ext.backend.die_with_parent = false; });
+    EXPECT_FALSE(has(buildWith(cfg), "--die-with-parent"));
+}
+
+TEST(BwrapBackend, MountProcAndDevSuppressible) {
+    Config cfg = makeBackendConfig([](Config& c) {
+        c.ext.backend.mount_proc = false;
+        c.ext.backend.mount_dev = false;
+    });
+    Argv a = buildWith(cfg);
+    EXPECT_FALSE(hasPair(a, "--proc", "/proc"));
+    EXPECT_FALSE(hasPair(a, "--dev", "/dev"));
+}
+
+TEST(BwrapBackend, TmpfsTmpBindSuppressible) {
+    Config cfg = makeBackendConfig([](Config& c) { c.ext.backend.mount_tmpfs_tmp = false; });
+    Argv a = build_bwrap_argv("/usr/bin/bwrap", cfg, {}, makeEnv({}), "/fh", "/sbx/tmp", false);
+    EXPECT_FALSE(hasTriple(a, "--bind", "/sbx/tmp", "/sbx/tmp"));
+    // The fake home is still bound — only the temp scratch is gated.
+    EXPECT_TRUE(hasTriple(a, "--bind", "/fh", "/fh"));
+}
+
+TEST(BwrapBackend, UnshareUtsFalseDropsUnshareUtsAndHostname) {
+    Config cfg = makeBackendConfig([](Config& c) { c.ext.backend.unshare_uts = false; });
+    Argv a = buildWith(cfg);
+    EXPECT_FALSE(has(a, "--unshare-uts"));
+    EXPECT_FALSE(has(a, "--hostname"));  // hostname needs the UTS namespace
+}
+
+TEST(BwrapBackend, UnshareNetSuppressedWhenToggleOffEvenWhenNetOff) {
+    Config cfg = makeBackendConfig(
+        [](Config& c) { c.ext.backend.unshare_net_when_off = false; });
+    EXPECT_FALSE(has(buildWith(cfg), "--unshare-net"));
+}
+
+TEST(BwrapBackend, UnshareNetStillEmittedByDefaultWhenNetOff) {
+    Argv a = buildWith(makeConfig(NetMode::Off, "/work", {"true"}));
+    EXPECT_TRUE(has(a, "--unshare-net"));
 }

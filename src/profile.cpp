@@ -63,17 +63,37 @@ std::optional<Options> load_profile(const std::string& path, std::string& err) {
     // (a plausible attempt to disable networking) would silently yield OPEN
     // networking.
     if (auto s = t.get_string("network"); s.has_value()) {
-        auto m = net_mode_from_string(*s);
-        // The MVP implements only full|off. net_mode_from_string also accepts the
-        // reserved "allowlist"/"ask" modes, but net_guard emits no --unshare-net
-        // for those, so accepting them would silently yield FULL open networking.
-        // Reject them here exactly as the CLI parser does.
-        if (!m.has_value() || (*m != NetMode::Full && *m != NetMode::Off)) {
-            err = "Error: invalid network value in profile: \"" + *s +
+        const std::string& nv = *s;
+        if (nv == "off") {
+            o.net = NetMode::Off;
+        } else if (nv == "full") {
+            o.net = NetMode::Full;
+        } else if (nv == "proxy" || nv == "bridge" || nv == "guarded") {
+            // Reserved network modes from the rich sectioned schema. The MVP has no
+            // NetMode for these and net_guard emits no enforcement for them, so we do
+            // NOT set o.net (leaving it unset). Instead record the requested mode in
+            // ext.reserved_net_mode so resolve_config fails CLOSED — falling back to
+            // NetMode::Off regardless of strict, never to Full — because the user asked
+            // to CONSTRAIN egress and unrestricted networking is the opposite of that
+            // intent. Also record an honest audit note so the behavior is not silently
+            // misrepresented.
+            o.ext.reserved_net_mode = nv;
+            // Record a load-time placeholder note only. The ACTUAL network outcome
+            // depends on resolution: an explicit `--net full` can override the
+            // fail-closed fallback (options.net wins over reserved_net_mode in
+            // resolve_config), in which case the child gets FULL egress. Baking a
+            // static "fails closed to off" claim here would make the persisted audit
+            // lie whenever that override fires. resolve_config reconciles this note
+            // with the resolved cfg.net, so keep it outcome-free here.
+            o.ext.reserved_notes.push_back(
+                "network mode \"" + nv + "\" is not yet enforced (phase 2)");
+        } else {
+            // allowlist/ask/banana/... : genuinely invalid. Reject exactly as before so
+            // an unimplemented/typo mode never silently yields FULL open networking.
+            err = "Error: invalid network value in profile: \"" + nv +
                   "\" (expected full|off)";
             return std::nullopt;
         }
-        o.net = *m;
     } else if (t.contains("network")) {
         err = "Error: invalid network value in profile (expected full|off)";
         return std::nullopt;
@@ -133,7 +153,131 @@ std::optional<Options> load_profile(const std::string& path, std::string& err) {
         return std::nullopt;
     }
 
-    // set_env is CLI-only: never read from a profile (intentionally ignored).
+    // -----------------------------------------------------------------------
+    // Rich sectioned schema (phase 1.5). Everything below is TOLERANT: absent
+    // sections leave the MVP defaults; unknown keys/sections are ignored (never
+    // fatal). Nested sections take precedence over the equivalent flat top-level
+    // keys. A top-level `set_env` array is still ignored (CLI-only), but the
+    // structured `[environment.set]` table DOES populate set_env per DESIGN.md.
+    // -----------------------------------------------------------------------
+
+    // Small helper: set a backend bool from `key` when present.
+    auto set_backend_bool = [&](const std::string& key, bool& dst) {
+        if (auto b = t.get_bool(key); b.has_value()) dst = *b;
+    };
+
+    // top-level: profile_name / keep_temp / workdir.
+    if (auto s = t.get_string("profile_name"); s.has_value()) o.ext.profile_name = *s;
+    if (auto b = t.get_bool("keep_temp"); b.has_value()) {
+        o.keep_temp = *b;
+        o.keep_temp_set = true;
+    }
+    if (auto s = t.get_string("workdir"); s.has_value()) o.workdir = *s;
+
+    // [identity] -> ext identity + env defaults (TZ/LANG/LC_ALL/LANGUAGE).
+    if (auto s = t.get_string("identity.username"); s.has_value()) o.ext.username = *s;
+    if (auto s = t.get_string("identity.hostname"); s.has_value()) o.ext.hostname = *s;
+    if (auto s = t.get_string("identity.home"); s.has_value()) o.ext.home = *s;
+    if (auto s = t.get_string("identity.timezone"); s.has_value())
+        o.env_defaults["TZ"] = *s;
+    if (auto s = t.get_string("identity.locale"); s.has_value()) {
+        o.env_defaults["LANG"] = *s;
+        o.env_defaults["LC_ALL"] = *s;
+    }
+    if (auto s = t.get_string("identity.language"); s.has_value())
+        o.env_defaults["LANGUAGE"] = *s;
+
+    // [environment]: allow -> allow_env (overrides flat), deny -> ext.env_deny,
+    // scrub_patterns -> ext.scrub_patterns, [environment.set] -> set_env.
+    if (auto a = t.get_string_array("environment.allow"); a.has_value())
+        o.allow_env = *a;
+    if (auto a = t.get_string_array("environment.deny"); a.has_value())
+        o.ext.env_deny = *a;
+    if (auto a = t.get_string_array("environment.scrub_patterns"); a.has_value())
+        o.ext.scrub_patterns = *a;
+    for (const auto& kv : t.get_table_of_strings("environment.set"))
+        o.set_env.emplace_back(kv.first, kv.second);
+
+    // [filesystem]: nested allow_read/allow_write override the flat top-level lists;
+    // deny -> ext.fs_deny; mode == "deny-by-default" -> ext.fs_deny_by_default;
+    // [filesystem.tripwire] -> ext.tripwire_*.
+    if (auto a = t.get_string_array("filesystem.allow_read"); a.has_value())
+        o.allow_read = *a;
+    if (auto a = t.get_string_array("filesystem.allow_write"); a.has_value())
+        o.allow_write = *a;
+    if (auto a = t.get_string_array("filesystem.deny"); a.has_value())
+        o.ext.fs_deny = *a;
+    if (auto s = t.get_string("filesystem.mode"); s.has_value())
+        o.ext.fs_deny_by_default = (*s == "deny-by-default");
+    if (auto b = t.get_bool("filesystem.tripwire.enabled"); b.has_value())
+        o.ext.tripwire_enabled = *b;
+    if (auto a = t.get_string_array("filesystem.tripwire.fake_sensitive_files");
+        a.has_value())
+        o.ext.tripwire_files = *a;
+
+    // [backend] -> ext.backend (start from the MVP defaults, override what is set).
+    if (auto s = t.get_string("backend.bwrap_path"); s.has_value())
+        o.ext.backend.bwrap_path = *s;
+    set_backend_bool("backend.unshare_user", o.ext.backend.unshare_user);
+    set_backend_bool("backend.unshare_pid", o.ext.backend.unshare_pid);
+    set_backend_bool("backend.unshare_ipc", o.ext.backend.unshare_ipc);
+    set_backend_bool("backend.unshare_uts", o.ext.backend.unshare_uts);
+    set_backend_bool("backend.unshare_cgroup", o.ext.backend.unshare_cgroup);
+    set_backend_bool("backend.unshare_net_when_off",
+                     o.ext.backend.unshare_net_when_off);
+    set_backend_bool("backend.mount_proc", o.ext.backend.mount_proc);
+    set_backend_bool("backend.mount_dev", o.ext.backend.mount_dev);
+    set_backend_bool("backend.mount_tmpfs_tmp", o.ext.backend.mount_tmpfs_tmp);
+    set_backend_bool("backend.die_with_parent", o.ext.backend.die_with_parent);
+    set_backend_bool("backend.seccomp", o.ext.backend.seccomp);  // reserved
+
+    // [init].create_dirs -> ext.init_create_dirs.
+    if (auto a = t.get_string_array("init.create_dirs"); a.has_value())
+        o.ext.init_create_dirs = *a;
+
+    // [report]: latest_log -> ext.report_log, playful_summary -> ext.playful_report.
+    if (auto s = t.get_string("report.latest_log"); s.has_value())
+        o.ext.report_log = *s;
+    if (auto b = t.get_bool("report.playful_summary"); b.has_value())
+        o.ext.playful_report = *b;
+
+    // [proxy]: when enabled, inject non-empty proxy vars into set_env. This is a
+    // MECHANISM distinct from the reserved network=proxy MODE above.
+    if (t.get_bool("proxy.enabled").value_or(false)) {
+        for (const char* key : {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}) {
+            if (auto v = t.get_string(std::string("proxy.") + key);
+                v.has_value() && !v->empty()) {
+                o.set_env.emplace_back(key, *v);
+            }
+        }
+    }
+
+    // RESERVED sections: parsed + tolerated, NOT enforced. Record honest audit notes.
+    // [backend].seccomp is accepted and carried in ext.backend.seccomp, but bwrap emits
+    // no seccomp filter for it (see DESIGN.md RESERVED set). Disclose it so the audit
+    // never silently implies syscall hardening that is not actually applied.
+    if (t.get_bool("backend.seccomp").value_or(false)) {
+        o.ext.reserved_notes.push_back(
+            "seccomp filter requested but not yet enforced (reserved)");
+    }
+    if (t.contains("egress")) {
+        std::size_t n = t.get_table_array("egress.bridge").size();
+        o.ext.reserved_notes.push_back(
+            "egress bridge configured (" + std::to_string(n) +
+            (n == 1 ? " bridge)" : " bridges)") + " — not yet enforced (phase 2)");
+    }
+    if (t.contains("browser")) {
+        o.ext.reserved_notes.push_back(
+            "browser isolation configured — not yet enforced (phase 2)");
+    }
+    if (t.contains("dns")) {
+        o.ext.reserved_notes.push_back(
+            "dns override configured — not yet enforced (phase 2)");
+    }
+    if (t.contains("network_policy")) {
+        o.ext.reserved_notes.push_back(
+            "network_policy configured — not yet enforced (phase 2)");
+    }
 
     return o;
 }
@@ -201,6 +345,13 @@ Options merge(const Options& profile, const Options& cli) {
 
     // command is a CLI concept; take CLI when present, else profile.
     m.command = !cli.command.empty() ? cli.command : profile.command;
+
+    // ext (rich sectioned config): the CLI has no way to populate ExtendedConfig
+    // today, so the profile's ext flows through unchanged. Scalar CLI overrides
+    // above (strict/net/workdir/audit/keep_temp/fontconfig) still win; the ext
+    // carries only profile-derived, forward-compatible options. If a CLI ext ever
+    // appears, this is the seam to merge it field-by-field.
+    m.ext = profile.ext;
 
     return m;
 }

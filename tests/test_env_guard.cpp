@@ -16,7 +16,10 @@
 
 #include "env_guard.hpp"
 
+using raincoat::EnvPolicy;
 using raincoat::EnvResolution;
+using raincoat::env_name_matches_glob;
+using raincoat::is_scrubbed_name;
 using raincoat::is_sensitive_env;
 using raincoat::resolve_env;
 
@@ -607,4 +610,128 @@ TEST(EnvGuard, CombinedResolutionPrecedence) {
     EXPECT_FALSE(has(r.scrubbed, "BUILD_ID"));
     // The original parent secret value must not survive.
     for (const auto& kv : r.resolved) EXPECT_NE(kv.second, "sk-secret");
+}
+
+// ===========================================================================
+// env_name_matches_glob — the scrub-pattern glob matcher
+// ===========================================================================
+
+TEST(EnvGuard, GlobStarSuffix) {
+    EXPECT_TRUE(env_name_matches_glob("AWS_REGION", "AWS_*"));
+    EXPECT_TRUE(env_name_matches_glob("AWS_", "AWS_*"));       // * matches empty
+    EXPECT_FALSE(env_name_matches_glob("XAWS_REGION", "AWS_*"));
+}
+
+TEST(EnvGuard, GlobStarPrefix) {
+    EXPECT_TRUE(env_name_matches_glob("GITHUB_TOKEN", "*_TOKEN"));
+    EXPECT_TRUE(env_name_matches_glob("_TOKEN", "*_TOKEN"));
+    EXPECT_FALSE(env_name_matches_glob("TOKEN", "*_TOKEN"));  // needs the underscore
+}
+
+TEST(EnvGuard, GlobStarBothEnds) {
+    EXPECT_TRUE(env_name_matches_glob("MY_SECRET_VALUE", "*SECRET*"));
+    EXPECT_FALSE(env_name_matches_glob("MY_PUBLIC_VALUE", "*SECRET*"));
+}
+
+TEST(EnvGuard, GlobQuestionMark) {
+    EXPECT_TRUE(env_name_matches_glob("AB", "A?"));
+    EXPECT_FALSE(env_name_matches_glob("A", "A?"));   // ? requires exactly one char
+    EXPECT_FALSE(env_name_matches_glob("ABC", "A?"));
+}
+
+TEST(EnvGuard, GlobLiteralNoWildcards) {
+    EXPECT_TRUE(env_name_matches_glob("EXACT", "EXACT"));
+    EXPECT_FALSE(env_name_matches_glob("EXACTX", "EXACT"));
+    EXPECT_TRUE(env_name_matches_glob("", "*"));      // lone star matches empty
+    EXPECT_TRUE(env_name_matches_glob("anything", "*"));
+}
+
+// ===========================================================================
+// is_scrubbed_name — patterns EXTEND the built-in is_sensitive_env defaults
+// ===========================================================================
+
+TEST(EnvGuard, IsScrubbedNameBuiltinsStillApplyWithNoPatterns) {
+    EXPECT_TRUE(is_scrubbed_name("AWS_REGION", {}));      // built-in prefix
+    EXPECT_TRUE(is_scrubbed_name("MY_TOKEN", {}));        // built-in suffix
+    EXPECT_FALSE(is_scrubbed_name("EDITOR", {}));         // neither
+}
+
+TEST(EnvGuard, IsScrubbedNamePatternsExtendBuiltins) {
+    // A name that is NOT a built-in sensitive var becomes sensitive via a custom glob.
+    EXPECT_FALSE(is_scrubbed_name("MYCORP_DATA", {}));
+    EXPECT_TRUE(is_scrubbed_name("MYCORP_DATA", {"MYCORP_*"}));
+    // Built-ins are still honored even when unrelated patterns are supplied.
+    EXPECT_TRUE(is_scrubbed_name("AWS_REGION", {"MYCORP_*"}));
+}
+
+// ===========================================================================
+// resolve_env — EnvPolicy: username, env_deny, scrub_patterns
+// ===========================================================================
+
+// ext.username drives the generic USER value.
+TEST(EnvGuard, PolicyUsernameOverridesGenericUser) {
+    EnvPolicy policy;
+    policy.username = "agent";
+    std::map<std::string, std::string> parent{{"USER", "realuser"}};
+    auto r = resolve_env(parent, kNoAllow, kNoSet, kNoDefaults, false, policy);
+    EXPECT_EQ(resolvedValue(r, "USER"), "agent");
+    EXPECT_TRUE(has(r.set, "USER"));
+    for (const auto& kv : r.resolved) EXPECT_NE(kv.second, "realuser");
+}
+
+// env_deny: a denied name is NEVER copied from the parent, even via --allow-env, and
+// therefore lands in scrubbed.
+TEST(EnvGuard, PolicyEnvDenyBlocksAllowEnv) {
+    EnvPolicy policy;
+    policy.deny = {"DOCKER_HOST"};
+    std::map<std::string, std::string> parent{{"DOCKER_HOST", "tcp://leak"}};
+    std::vector<std::string> allow{"DOCKER_HOST"};  // user tries to allow it back
+    auto r = resolve_env(parent, allow, kNoSet, kNoDefaults, false, policy);
+
+    EXPECT_FALSE(inResolved(r, "DOCKER_HOST"));
+    EXPECT_FALSE(has(r.allowed, "DOCKER_HOST"));
+    EXPECT_TRUE(has(r.scrubbed, "DOCKER_HOST"));
+    for (const auto& kv : r.resolved) EXPECT_NE(kv.second, "tcp://leak");
+}
+
+// env_deny does NOT block an explicit --set-env (a user-chosen synthetic value).
+TEST(EnvGuard, PolicyEnvDenyDoesNotBlockSetEnv) {
+    EnvPolicy policy;
+    policy.deny = {"DOCKER_HOST"};
+    std::vector<std::pair<std::string, std::string>> set{{"DOCKER_HOST", "tcp://chosen"}};
+    auto r = resolve_env(kNoDefaults, kNoAllow, set, kNoDefaults, false, policy);
+    EXPECT_EQ(resolvedValue(r, "DOCKER_HOST"), "tcp://chosen");
+    EXPECT_TRUE(has(r.set, "DOCKER_HOST"));
+}
+
+// scrub_patterns: a matching name is force-scrubbed even when explicitly --allow-env'd.
+TEST(EnvGuard, PolicyScrubPatternBlocksAllowEnv) {
+    EnvPolicy policy;
+    policy.scrub_patterns = {"MYCORP_*"};
+    std::map<std::string, std::string> parent{{"MYCORP_DATA", "corp-value"}};
+    std::vector<std::string> allow{"MYCORP_DATA"};
+    auto r = resolve_env(parent, allow, kNoSet, kNoDefaults, false, policy);
+
+    EXPECT_FALSE(inResolved(r, "MYCORP_DATA"));
+    EXPECT_TRUE(has(r.scrubbed, "MYCORP_DATA"));
+    for (const auto& kv : r.resolved) EXPECT_NE(kv.second, "corp-value");
+}
+
+// Control: without the pattern, the same --allow-env DOES copy the (non-sensitive) var.
+TEST(EnvGuard, WithoutScrubPatternAllowEnvCopiesNonSensitiveVar) {
+    std::map<std::string, std::string> parent{{"MYCORP_DATA", "corp-value"}};
+    std::vector<std::string> allow{"MYCORP_DATA"};
+    auto r = resolve_env(parent, allow, kNoSet, kNoDefaults, false);  // default policy
+    EXPECT_EQ(resolvedValue(r, "MYCORP_DATA"), "corp-value");
+    EXPECT_TRUE(has(r.allowed, "MYCORP_DATA"));
+}
+
+// A default (5-arg) call and a default-constructed EnvPolicy behave identically, so
+// the trailing-parameter change is backward compatible.
+TEST(EnvGuard, DefaultPolicyMatchesLegacyCall) {
+    auto parent = richParent();
+    auto a = resolve_env(parent, kNoAllow, kNoSet, kNoDefaults, false);
+    auto b = resolve_env(parent, kNoAllow, kNoSet, kNoDefaults, false, EnvPolicy{});
+    EXPECT_EQ(a.resolved, b.resolved);
+    EXPECT_EQ(a.scrubbed, b.scrubbed);
 }

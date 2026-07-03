@@ -1,7 +1,9 @@
 // Raincoat — init: generate an example .raincoat.toml and write it out.
 #include "init.hpp"
 
+#include <filesystem>
 #include <fstream>
+#include <system_error>
 #include <sys/stat.h>
 
 namespace raincoat {
@@ -71,6 +73,29 @@ bool write_init(const std::string& path, bool force, std::string& err) {
         return false;
     }
 
+    return true;
+}
+
+bool create_init_dirs(const std::vector<std::string>& dirs, const std::string& base_cwd,
+                      std::string& err) {
+    err.clear();
+    namespace fs = std::filesystem;
+    for (const auto& d : dirs) {
+        if (d.empty()) continue;
+        fs::path p(d);
+        if (!p.is_absolute() && !base_cwd.empty()) {
+            p = fs::path(base_cwd) / p;
+        }
+        std::error_code ec;
+        fs::create_directories(p, ec);
+        // create_directories reports "no directories created" without an error when the
+        // path already exists, so only a real error_code is a failure.
+        if (ec) {
+            err = "Error: could not create init directory '" + p.string() +
+                  "': " + ec.message();
+            return false;
+        }
+    }
     return true;
 }
 

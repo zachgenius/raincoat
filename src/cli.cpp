@@ -26,18 +26,30 @@ CliInvocation parse_cli(const std::vector<std::string>& args) {
         }
         if (first == "init") {
             inv.sub = Subcommand::Init;
-            // `raincoat init [--force|-f]`: --force overwrites an existing
-            // .raincoat.toml. Scan the remaining tokens for the flag; anything
-            // else is ignored (init takes no other options).
+            // `raincoat init [--force|-f] [--profile <path>]`: --force overwrites an
+            // existing .raincoat.toml; --profile names a profile whose [init].create_dirs
+            // are also created. Anything else is ignored (init takes no other options).
             for (size_t j = 1; j < args.size(); ++j) {
                 if (args[j] == "--force" || args[j] == "-f") {
                     inv.options.init_force = true;
+                } else if (args[j] == "--profile" && j + 1 < args.size()) {
+                    inv.options.profile_path = args[++j];
                 }
             }
             return inv;
         }
         if (first == "report") {
             inv.sub = Subcommand::Report;
+            // `raincoat report [path] [--profile <path>]`: an optional positional audit
+            // path and an optional profile (its [report].latest_log / playful_summary
+            // shape the default path and output style).
+            for (size_t j = 1; j < args.size(); ++j) {
+                if (args[j] == "--profile" && j + 1 < args.size()) {
+                    inv.options.profile_path = args[++j];
+                } else if (!args[j].empty() && args[j][0] != '-') {
+                    inv.options.command.push_back(args[j]);  // positional audit path
+                }
+            }
             return inv;
         }
         if (first == "run") {

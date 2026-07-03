@@ -39,6 +39,11 @@ std::string format_audit_start(const AuditRecord& r) {
 
     ss << "=== Raincoat started ===\n";
     ss << "Command:      " << r.command_line << "\n";
+    // Profile name (informational) — printed only when the run came from a profile
+    // that named itself. Never a secret.
+    if (r.profile_name.has_value() && !r.profile_name->empty()) {
+        ss << "Profile:      " << *r.profile_name << "\n";
+    }
     ss << "Mode:         " << (r.strict ? "strict" : "normal") << "\n";
     ss << "Network:      " << to_string(r.net) << "\n";
     ss << "Fake HOME:    " << r.fake_home << "\n";
@@ -77,6 +82,23 @@ std::string format_audit_start(const AuditRecord& r) {
     // print it verbatim — never re-parse or re-redact a flattened string.
     ss << "Bubblewrap command:\n";
     ss << "  " << r.bwrap_command << "\n";
+
+    // Active extended policies (secret-free notes) — only when something is active.
+    if (!r.active_policy_notes.empty()) {
+        ss << "Active policy:\n";
+        for (const auto& note : r.active_policy_notes) {
+            ss << "  - " << note << "\n";
+        }
+    }
+
+    // Sections that were configured but are NOT yet enforced. Surfacing them keeps the
+    // audit honest about what the rich profile does (and does not) actually do.
+    if (!r.reserved_notes.empty()) {
+        ss << "Reserved (configured, not enforced):\n";
+        for (const auto& note : r.reserved_notes) {
+            ss << "  - " << note << "\n";
+        }
+    }
 
     return ss.str();
 }

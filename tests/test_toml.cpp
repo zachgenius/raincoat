@@ -7,8 +7,10 @@
 // crash). Written before the implementation exists; expected to fail (red).
 #include <gtest/gtest.h>
 
+#include <fstream>
 #include <map>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -566,6 +568,439 @@ TEST(Toml, MalformedDoesNotCrashOnJunkBrackets) {
     auto parsed = parse_toml("]][[==\"\"\n", err);
     EXPECT_FALSE(parsed.has_value());
     EXPECT_FALSE(err.empty());
+}
+
+// ---------------------------------------------------------------------------
+// Nested tables: [a.b.c] headers and keys under them.
+// ---------------------------------------------------------------------------
+
+TEST(Toml, DeeplyNestedTableHeader) {
+    auto t = MustParse(
+        "[a.b.c]\n"
+        "key = \"value\"\n"
+        "flag = true\n");
+    EXPECT_EQ(t.get_string("a.b.c.key").value_or(""), "value");
+    ASSERT_TRUE(t.get_bool("a.b.c.flag").has_value());
+    EXPECT_TRUE(*t.get_bool("a.b.c.flag"));
+}
+
+TEST(Toml, NestedTableGetTableOfStrings) {
+    auto t = MustParse(
+        "[a.b]\n"
+        "x = \"1\"\n"
+        "y = \"2\"\n");
+    auto m = t.get_table_of_strings("a.b");
+    EXPECT_EQ(m.size(), 2u);
+    EXPECT_EQ(m["x"], "1");
+    EXPECT_EQ(m["y"], "2");
+}
+
+TEST(Toml, NestedTablesAreDistinct) {
+    auto t = MustParse(
+        "[a.b]\n"
+        "x = \"1\"\n"
+        "[a.c]\n"
+        "x = \"2\"\n");
+    EXPECT_EQ(t.get_string("a.b.x").value_or(""), "1");
+    EXPECT_EQ(t.get_string("a.c.x").value_or(""), "2");
+}
+
+// ---------------------------------------------------------------------------
+// Numeric literals are TOLERATED (stored as raw scalars), never fatal — while
+// genuine bare words stay rejected.
+// ---------------------------------------------------------------------------
+
+TEST(Toml, BareIntegerIsToleratedAsScalar) {
+    auto t = MustParse("timeout_seconds = 120\n");
+    EXPECT_EQ(t.get_string("timeout_seconds").value_or(""), "120");
+    // It is not a bool.
+    EXPECT_FALSE(t.get_bool("timeout_seconds").has_value());
+    // But it is present (present-but-not-a-bool, not absent).
+    EXPECT_TRUE(t.contains("timeout_seconds"));
+}
+
+TEST(Toml, BareIntegerInTableIsTolerated) {
+    auto t = MustParse(
+        "[egress]\n"
+        "timeout_seconds = 120\n");
+    EXPECT_EQ(t.get_string("egress.timeout_seconds").value_or(""), "120");
+    auto m = t.get_table_of_strings("egress");
+    EXPECT_EQ(m["timeout_seconds"], "120");
+}
+
+TEST(Toml, BareNegativeAndFloatTolerated) {
+    auto t = MustParse(
+        "a = -7\n"
+        "b = 3.14\n");
+    EXPECT_EQ(t.get_string("a").value_or(""), "-7");
+    EXPECT_EQ(t.get_string("b").value_or(""), "3.14");
+}
+
+TEST(Toml, BareWordStillRejected) {
+    // Guard: numeric tolerance must not accept alphabetic bare words.
+    ExpectMalformed("network = full\n");
+}
+
+TEST(Toml, UnknownKeysAndSectionsAreTolerated) {
+    // A rich, mixed config with keys/sections this parser doesn't "know" about
+    // must parse without error.
+    auto t = MustParse(
+        "profile_name = \"x\"\n"
+        "[some_future_section]\n"
+        "count = 42\n"
+        "flag = false\n"
+        "label = \"hi\"\n"
+        "list = [\"a\", \"b\"]\n");
+    EXPECT_EQ(t.get_string("profile_name").value_or(""), "x");
+    EXPECT_EQ(t.get_string("some_future_section.count").value_or(""), "42");
+    EXPECT_EQ(t.get_string("some_future_section.label").value_or(""), "hi");
+}
+
+// ---------------------------------------------------------------------------
+// Array-of-tables: [[name]].
+// ---------------------------------------------------------------------------
+
+TEST(Toml, ArrayOfTablesAbsentIsEmpty) {
+    auto t = MustParse("network = \"full\"\n");
+    EXPECT_TRUE(t.get_table_array("egress.bridge").empty());
+}
+
+TEST(Toml, ArrayOfTablesTwoEntries) {
+    auto t = MustParse(
+        "[[server]]\n"
+        "name = \"a\"\n"
+        "port = 1\n"
+        "[[server]]\n"
+        "name = \"b\"\n"
+        "port = 2\n");
+    auto v = t.get_table_array("server");
+    ASSERT_EQ(v.size(), 2u);
+    EXPECT_EQ(v[0].get_string("name").value_or(""), "a");
+    EXPECT_EQ(v[0].get_string("port").value_or(""), "1");
+    EXPECT_EQ(v[1].get_string("name").value_or(""), "b");
+    EXPECT_EQ(v[1].get_string("port").value_or(""), "2");
+    // Entry keys are relative to the entry, not the array name.
+    EXPECT_FALSE(v[0].get_string("server.name").has_value());
+}
+
+TEST(Toml, ArrayOfTablesSingleEntry) {
+    auto t = MustParse(
+        "[[dns.map]]\n"
+        "host = \"example.com\"\n"
+        "ip = \"203.0.113.10\"\n");
+    auto v = t.get_table_array("dns.map");
+    ASSERT_EQ(v.size(), 1u);
+    EXPECT_EQ(v[0].get_string("host").value_or(""), "example.com");
+    EXPECT_EQ(v[0].get_string("ip").value_or(""), "203.0.113.10");
+}
+
+TEST(Toml, ArrayOfTablesWithArraysAndBools) {
+    auto t = MustParse(
+        "[[egress.bridge]]\n"
+        "name = \"primary\"\n"
+        "preserve_host = false\n"
+        "strip_headers = [\"A\", \"B\", \"C\"]\n");
+    auto v = t.get_table_array("egress.bridge");
+    ASSERT_EQ(v.size(), 1u);
+    ASSERT_TRUE(v[0].get_bool("preserve_host").has_value());
+    EXPECT_FALSE(*v[0].get_bool("preserve_host"));
+    auto sh = v[0].get_string_array("strip_headers");
+    ASSERT_TRUE(sh.has_value());
+    ASSERT_EQ(sh->size(), 3u);
+    EXPECT_EQ((*sh)[2], "C");
+}
+
+TEST(Toml, ArrayOfTablesEntrySubTable) {
+    // [egress.bridge.inject_headers] under [[egress.bridge]] must be reachable
+    // from the entry as the sub-table "inject_headers".
+    auto t = MustParse(
+        "[[egress.bridge]]\n"
+        "name = \"primary\"\n"
+        "[egress.bridge.inject_headers]\n"
+        "X-Trace = \"on\"\n"
+        "[[egress.bridge]]\n"
+        "name = \"secondary\"\n");
+    auto v = t.get_table_array("egress.bridge");
+    ASSERT_EQ(v.size(), 2u);
+    EXPECT_EQ(v[0].get_string("name").value_or(""), "primary");
+    auto ih = v[0].get_table_of_strings("inject_headers");
+    ASSERT_EQ(ih.size(), 1u);
+    EXPECT_EQ(ih["X-Trace"], "on");
+    EXPECT_EQ(v[0].get_string("inject_headers.X-Trace").value_or(""), "on");
+    // The sub-table belongs to the FIRST entry only.
+    EXPECT_TRUE(v[1].get_table_of_strings("inject_headers").empty());
+    EXPECT_EQ(v[1].get_string("name").value_or(""), "secondary");
+}
+
+TEST(Toml, ArrayOfTablesEmptySubTableStillReachable) {
+    // An empty sub-table header (only a comment inside) is still present.
+    auto t = MustParse(
+        "[[egress.bridge]]\n"
+        "name = \"primary\"\n"
+        "[egress.bridge.inject_headers]\n"
+        "# nothing here\n");
+    auto v = t.get_table_array("egress.bridge");
+    ASSERT_EQ(v.size(), 1u);
+    EXPECT_TRUE(v[0].get_table_of_strings("inject_headers").empty());
+    // contains() distinguishes present-but-empty from absent.
+    EXPECT_TRUE(v[0].contains("inject_headers"));
+    EXPECT_FALSE(v[0].contains("nonexistent"));
+}
+
+TEST(Toml, TopLevelTableAfterArrayOfTablesResetsContext) {
+    // A plain [header] that is NOT a sub-table of the open array closes the
+    // array scope and lands back at the root.
+    auto t = MustParse(
+        "[[server]]\n"
+        "name = \"a\"\n"
+        "[other]\n"
+        "k = \"v\"\n");
+    EXPECT_EQ(t.get_string("other.k").value_or(""), "v");
+    auto v = t.get_table_array("server");
+    ASSERT_EQ(v.size(), 1u);
+    // "other" must NOT have leaked into the server entry.
+    EXPECT_TRUE(v[0].get_table_of_strings("other").empty());
+}
+
+TEST(Toml, MalformedUnterminatedArrayOfTablesHeader) {
+    ExpectMalformed("[[server]\nname = \"a\"\n");
+}
+
+TEST(Toml, MalformedEmptyArrayOfTablesHeader) {
+    ExpectMalformed("[[]]\n");
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end: the full directional config reference must parse WITHOUT error,
+// with spot-checks across sections, arrays-of-tables and nested sub-tables.
+// ---------------------------------------------------------------------------
+
+namespace {
+// Read docs/full-config-reference.toml, tolerating whichever cwd the test binary
+// runs from (repo root for the standalone build, build/ dir under ctest).
+std::string ReadReferenceConfig() {
+    const char* candidates[] = {
+        "docs/full-config-reference.toml",
+        "../docs/full-config-reference.toml",
+        "../../docs/full-config-reference.toml",
+        "/home/zach/Develop/Raincoat/docs/full-config-reference.toml",
+    };
+    for (const char* path : candidates) {
+        std::ifstream f(path);
+        if (f.good()) {
+            std::ostringstream ss;
+            ss << f.rdbuf();
+            return ss.str();
+        }
+    }
+    return "";
+}
+}  // namespace
+
+TEST(Toml, FullConfigReferenceParsesWithoutError) {
+    std::string text = ReadReferenceConfig();
+    ASSERT_FALSE(text.empty()) << "could not locate docs/full-config-reference.toml";
+    std::string err = "sentinel";
+    auto parsed = parse_toml(text, err);
+    ASSERT_TRUE(parsed.has_value()) << "reference config failed to parse: " << err;
+    EXPECT_TRUE(err.empty());
+}
+
+TEST(Toml, FullConfigReferenceSpotChecks) {
+    std::string text = ReadReferenceConfig();
+    ASSERT_FALSE(text.empty());
+    auto t = MustParse(text);
+
+    // Top-level scalars.
+    ASSERT_TRUE(t.get_bool("strict").has_value());
+    EXPECT_TRUE(*t.get_bool("strict"));
+    EXPECT_EQ(t.get_string("network").value_or(""), "bridge");
+    EXPECT_EQ(t.get_string("profile_name").value_or(""), "default-agent-sandbox");
+
+    // [identity].username
+    EXPECT_EQ(t.get_string("identity.username").value_or(""), "user");
+    EXPECT_EQ(t.get_string("identity.timezone").value_or(""), "UTC");
+
+    // [environment.set] table
+    auto envset = t.get_table_of_strings("environment.set");
+    EXPECT_EQ(envset["HOME"], "/home/user");
+    EXPECT_EQ(envset["USER"], "user");
+    EXPECT_EQ(envset["LANG"], "en_US.UTF-8");
+    EXPECT_EQ(t.get_string("environment.set.TZ").value_or(""), "UTC");
+
+    // A tolerated bare integer somewhere in the config.
+    EXPECT_EQ(t.get_string("egress.timeout_seconds").value_or(""), "120");
+
+    // [[egress.bridge]] has 2 entries.
+    auto bridges = t.get_table_array("egress.bridge");
+    ASSERT_EQ(bridges.size(), 2u);
+
+    // First entry fields.
+    EXPECT_EQ(bridges[0].get_string("name").value_or(""), "primary-api");
+    EXPECT_EQ(bridges[0].get_string("env").value_or(""), "SOME_BASE_URL");
+    EXPECT_EQ(bridges[0].get_string("child_endpoint").value_or(""),
+              "http://127.0.0.1:18080");
+    EXPECT_EQ(bridges[0].get_string("upstream_endpoint").value_or(""),
+              "https://real-upstream.example.com");
+    auto sh0 = bridges[0].get_string_array("strip_headers");
+    ASSERT_TRUE(sh0.has_value());
+    ASSERT_EQ(sh0->size(), 4u);
+    EXPECT_EQ((*sh0)[0], "Proxy-Authorization");
+    EXPECT_EQ((*sh0)[3], "X-Real-IP");
+
+    // First entry's [egress.bridge.inject_headers] sub-table (empty but present).
+    EXPECT_TRUE(bridges[0].get_table_of_strings("inject_headers").empty());
+    EXPECT_TRUE(bridges[0].contains("inject_headers"));
+
+    // Second entry fields.
+    EXPECT_EQ(bridges[1].get_string("name").value_or(""), "secondary-api");
+    EXPECT_EQ(bridges[1].get_string("env").value_or(""), "SECONDARY_BASE_URL");
+    EXPECT_EQ(bridges[1].get_string("upstream_endpoint").value_or(""),
+              "https://secondary-upstream.example.com");
+    auto sh1 = bridges[1].get_string_array("strip_headers");
+    ASSERT_TRUE(sh1.has_value());
+    EXPECT_EQ(sh1->size(), 4u);
+
+    // [[dns.map]] entry.
+    auto dns = t.get_table_array("dns.map");
+    ASSERT_EQ(dns.size(), 1u);
+    EXPECT_EQ(dns[0].get_string("host").value_or(""), "example.com");
+    EXPECT_EQ(dns[0].get_string("ip").value_or(""), "203.0.113.10");
+
+    // A nested [network_policy] array is reachable.
+    auto blocked = t.get_string_array("network_policy.block_hosts");
+    ASSERT_TRUE(blocked.has_value());
+    EXPECT_FALSE(blocked->empty());
+}
+
+// ---------------------------------------------------------------------------
+// ADVERSARIAL ROUND 1 (attack the new TOML features): RED tests that pin down
+// concrete defects. No code fix is applied — these document real, reproducible
+// bugs found by feeding tricky-but-valid and malformed inputs.
+// ---------------------------------------------------------------------------
+
+// DEFECT (security-relevant): a key defined twice is silently accepted with
+// last-value-wins instead of being rejected. TOML forbids duplicate keys, and
+// for a privacy tool this is a silent downgrade vector: `strict = true` followed
+// later (e.g. by an appended/stray line) by `strict = false` yields strict=false
+// with NO error. The profile layer's present-but-wrong-type guards never fire
+// because the value IS a valid bool — it is just the wrong one.
+TEST(Toml, MalformedDuplicateKeyRejected) {
+    ExpectMalformed("strict = true\nstrict = false\n");
+}
+
+// DEFECT: quoted keys keep their literal quote characters instead of being
+// unquoted. The authoritative DEMO config documents inject_headers with a quoted
+// header name (docs/full-config-reference.toml ~line 329:
+// `"X-Raincoat-Bridge" = "primary-api"`) because HTTP header names are not
+// bare-key safe. Parsing stores the key AS `"X-Raincoat-Bridge"` (quotes
+// included), so the logical name is unreachable and the header map is silently
+// wrong the moment a user follows the documented example.
+TEST(Toml, QuotedKeyIsUnquoted) {
+    auto t = MustParse("\"X-Raincoat-Bridge\" = \"primary-api\"\n");
+    EXPECT_EQ(t.get_string("X-Raincoat-Bridge").value_or("<missing>"),
+              "primary-api");
+}
+
+TEST(Toml, QuotedKeyInInjectHeadersSubTable) {
+    auto t = MustParse(
+        "[[egress.bridge]]\n"
+        "name = \"primary-api\"\n"
+        "[egress.bridge.inject_headers]\n"
+        "\"X-Raincoat-Bridge\" = \"primary-api\"\n");
+    auto b = t.get_table_array("egress.bridge");
+    ASSERT_EQ(b.size(), 1u);
+    auto ih = b[0].get_table_of_strings("inject_headers");
+    ASSERT_EQ(ih.size(), 1u);
+    EXPECT_EQ(ih.count("X-Raincoat-Bridge"), 1u)
+        << "quoted header key retained its literal quote characters; stored as "
+        << ih.begin()->first;
+}
+
+// DEFECT: a nested array-of-tables `[[a.b]]` declared while `[[a]]` is the open
+// entry is stored at the ROOT under the dotted name `a.b` instead of nested
+// inside the current `a` entry, and NO error is raised. The nesting is silently
+// lost, so a config relying on nested arrays-of-tables misparses without any
+// diagnostic.
+TEST(Toml, NestedArrayOfTablesBelongsToParentEntry) {
+    auto t = MustParse(
+        "[[fruit]]\n"
+        "name = \"apple\"\n"
+        "[[fruit.variety]]\n"
+        "name = \"red delicious\"\n"
+        "[[fruit.variety]]\n"
+        "name = \"granny smith\"\n");
+    auto fruit = t.get_table_array("fruit");
+    ASSERT_EQ(fruit.size(), 1u);
+    auto var = fruit[0].get_table_array("variety");
+    EXPECT_EQ(var.size(), 2u)
+        << "nested [[fruit.variety]] should belong to the fruit entry, not root";
+}
+
+// DEFECT: a bare key containing whitespace (`a b = ...`) is accepted as a single
+// key literally named "a b". TOML bare keys may not contain spaces; this masks
+// typos like a dropped `=` or an accidental two-word key.
+TEST(Toml, MalformedBareKeyWithSpaceRejected) {
+    ExpectMalformed("a b = \"c\"\n");
+}
+
+// ---------------------------------------------------------------------------
+// ADVERSARIAL ROUND 2 (attack the new TOML features again): RED tests pinning
+// concrete defects found by feeding deeper nesting and type-collision inputs.
+// No code fix is applied — these document real, reproducible bugs.
+// ---------------------------------------------------------------------------
+
+// DEFECT (data loss, no diagnostic): the nested array-of-tables handling only
+// tracks ONE currently-open array name (`current_array`). Descending two levels
+// — [[a]] -> [[a.b]] -> [[a.b.c]] — and then re-opening the intermediate level
+// [[a.b]] as a sibling is NOT recognised as belonging to the a[0] entry, because
+// the open array is now "a.b.c" and "a.b" neither equals it nor is prefixed by
+// it. The entry is silently created at the document ROOT under the dotted name
+// "a.b" instead of appended to a[0]'s "b" array, and NO error is raised. The
+// second variety is simply lost from the structure a caller reads via
+// get_table_array on the parent entry.
+TEST(Toml, NestedArrayOfTablesReturnToIntermediateLevel) {
+    auto t = MustParse(
+        "[[a]]\n"
+        "n = \"1\"\n"
+        "[[a.b]]\n"
+        "n = \"2\"\n"
+        "[[a.b.c]]\n"
+        "n = \"3\"\n"
+        "[[a.b]]\n"          // sibling of the first [[a.b]] under a[0]
+        "n = \"4\"\n");
+    auto a = t.get_table_array("a");
+    ASSERT_EQ(a.size(), 1u);
+    // Both [[a.b]] entries belong to a[0]'s "b" array.
+    EXPECT_EQ(a[0].get_table_array("b").size(), 2u)
+        << "re-opened intermediate [[a.b]] should be a sibling under a[0], not "
+           "stranded at the root";
+    // And nothing should have leaked to a root-level "a.b" array-of-tables.
+    EXPECT_TRUE(t.get_table_array("a.b").empty())
+        << "nested array-of-tables entry was silently misplaced at the document root";
+}
+
+// DEFECT (type collision silently accepted): a name used as an array-of-tables
+// [[egress.bridge]] and then re-declared as a plain [egress.bridge] table (or
+// vice versa) is contradictory in TOML — a single name cannot be both. The
+// parser accepts both with no error, populating array_tables_ AND tables_ under
+// the same dotted name. contains("egress.bridge") is then true while the plain
+// table's keys and the array entries coexist, an incoherent structure that hides
+// a genuine config mistake instead of reporting it.
+TEST(Toml, MalformedTableRedeclaredAsArrayOfTables) {
+    ExpectMalformed(
+        "[[egress.bridge]]\n"
+        "n = \"1\"\n"
+        "[egress.bridge]\n"
+        "x = \"2\"\n");
+}
+
+TEST(Toml, MalformedArrayOfTablesRedeclaredAsTable) {
+    ExpectMalformed(
+        "[egress.bridge]\n"
+        "x = \"2\"\n"
+        "[[egress.bridge]]\n"
+        "n = \"1\"\n");
 }
 
 }  // namespace

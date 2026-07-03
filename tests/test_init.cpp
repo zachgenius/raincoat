@@ -330,3 +330,45 @@ TEST(Init, WriteInitFailsOnUnwritableLocation) {
     EXPECT_FALSE(err.empty()) << "an error message should be set on write failure";
     EXPECT_FALSE(file_exists(path));
 }
+
+// ===========================================================================
+// create_init_dirs() — honor a profile's [init].create_dirs
+// ===========================================================================
+
+TEST(Init, CreateInitDirsCreatesRelativeAndNested) {
+    const std::string dir = make_temp_dir();
+    ASSERT_FALSE(dir.empty());
+
+    std::string err = "sentinel";
+    EXPECT_TRUE(raincoat::create_init_dirs({".raincoat", "out", "a/b/c"}, dir, err));
+    EXPECT_TRUE(err.empty()) << err;
+    EXPECT_TRUE(file_exists(dir + "/.raincoat"));
+    EXPECT_TRUE(file_exists(dir + "/out"));
+    EXPECT_TRUE(file_exists(dir + "/a/b/c"));
+}
+
+TEST(Init, CreateInitDirsHonorsAbsolutePaths) {
+    const std::string dir = make_temp_dir();
+    ASSERT_FALSE(dir.empty());
+    const std::string abs = dir + "/absdir";
+
+    std::string err;
+    EXPECT_TRUE(raincoat::create_init_dirs({abs}, "/ignored/base", err));
+    EXPECT_TRUE(file_exists(abs));
+}
+
+TEST(Init, CreateInitDirsIsIdempotent) {
+    const std::string dir = make_temp_dir();
+    ASSERT_FALSE(dir.empty());
+    std::string err;
+    ASSERT_TRUE(raincoat::create_init_dirs({"x"}, dir, err));
+    // Re-creating an existing directory is not an error.
+    EXPECT_TRUE(raincoat::create_init_dirs({"x"}, dir, err));
+    EXPECT_TRUE(err.empty()) << err;
+}
+
+TEST(Init, CreateInitDirsEmptyListIsNoopSuccess) {
+    std::string err = "sentinel";
+    EXPECT_TRUE(raincoat::create_init_dirs({}, "/tmp", err));
+    EXPECT_TRUE(err.empty());
+}

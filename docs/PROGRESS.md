@@ -140,6 +140,35 @@ Legend for "Where": module source + test file that owns the behavior.
 
 ---
 
+## Phase 1.5 — Config-driven profile (rich sectioned schema)  ✅ COMPLETE
+
+Accepts the rich sectioned config (docs/full-config-reference.toml) — a directional demo, not a
+frozen schema. Backward-compatible with the flat MVP schema; unknown keys/sections tolerated.
+
+### 1.5a TOML engine
+- [x] `[[array-of-tables]]` (`get_table_array`) + nested `[a.b.c]` tables — *toml / test_toml*
+- [x] Unknown keys/sections tolerated (never fatal); wrong-typed known scalars still rejected — *toml/profile*
+
+### 1.5b Parse + map (→ Config.ext)
+- [x] Full sectioned schema parsed into `Config.ext` (ExtendedConfig) — *profile / test_profile*
+- [x] Backward compatible with flat schema; nested wins over flat — *profile* (verified)
+- [x] Reserved/future sections recorded as honest `reserved_notes` — *profile* (verified: 5 notes)
+
+### 1.5c Wire into runtime (verified end-to-end)
+- [x] `[identity]` → USER/HOSTNAME/TZ/LANG/LC_ALL/LANGUAGE + config-driven `--hostname` — *env_guard/bwrap/runner*
+- [x] `[environment]` deny (scrubbed even vs `--allow-env`) + custom `scrub_patterns` (e.g. AZURE_*) + `.set` — *env_guard* (verified)
+- [x] `[filesystem]` deny (never mounted) + `mode=deny-by-default` (strict-like) — *fs_guard*
+- [x] `[backend]` toggles → bwrap flags (`--unshare-user/-cgroup`, mounts, die-with-parent) — *bwrap* (verified)
+- [x] `[backend].unshare_uts=false` conflict with hostname masking → **fail-safe override + warning** — *runner* (verified)
+- [x] `[filesystem.tripwire]` decoys in fake home; `[proxy]` env injection; `[init].create_dirs`; `[report]` toggle
+- [x] Reserved network modes (bridge/guarded/proxy) **fail closed to net-off** + honest audit — *runner* (verified)
+- [x] No MVP regression (21 suites / 671 tests, -Wall -Wextra clean)
+
+**Note:** the `[egress]`/`[[egress.bridge]]` blocks are parsed and reserved; actual forwarding is Phase 2.
+CLI grammar: the subcommand must be the first token (e.g. `raincoat init --profile X`, not `--profile X init`).
+
+---
+
 ## Phase 2 — Egress bridge / endpoint indirection  (see docs/EGRESS.md)
 
 Generic, profile-driven. No provider/model/env/service names hard-coded.

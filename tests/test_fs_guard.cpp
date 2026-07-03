@@ -639,4 +639,105 @@ TEST(FsGuardAuditMask, CustomAuditLogInsideUserAllowedDirIsNotMasked) {
          "writes; only raincoat-owned dirs may be masked without losing user data";
 }
 
+// ---------------------------------------------------------------------------
+// fs_deny_hit — [filesystem].deny matching (with "~" expansion)
+// ---------------------------------------------------------------------------
+
+TEST(FsGuardDeny, HitOnExactAndDescendantNotAncestor) {
+  std::vector<std::string> deny{"/prj/.ssh"};
+  // Exact match and any descendant are refused.
+  EXPECT_TRUE(fs_deny_hit("/prj/.ssh", deny, "").has_value());
+  EXPECT_TRUE(fs_deny_hit("/prj/.ssh/id_rsa", deny, "").has_value());
+  // A sibling or an ancestor is NOT a hit.
+  EXPECT_FALSE(fs_deny_hit("/prj/.sshkeys", deny, "").has_value());  // component-wise
+  EXPECT_FALSE(fs_deny_hit("/prj", deny, "").has_value());          // ancestor of the deny
+  EXPECT_FALSE(fs_deny_hit("/other", deny, "").has_value());
+}
+
+TEST(FsGuardDeny, HitReturnsOriginalSpelling) {
+  auto hit = fs_deny_hit("/prj/.aws/credentials", {"/prj/.aws"}, "");
+  ASSERT_TRUE(hit.has_value());
+  EXPECT_EQ(*hit, "/prj/.aws");
+}
+
+TEST(FsGuardDeny, TildeExpandedAgainstRealHome) {
+  const std::string home = "/home/tester";
+  auto hit = fs_deny_hit(home + "/.ssh/id_rsa", {"~/.ssh"}, home);
+  ASSERT_TRUE(hit.has_value());
+  EXPECT_EQ(*hit, "~/.ssh");  // original spelling preserved for the error
+  // Without a real home, "~/.ssh" cannot expand, so a real path does not match.
+  EXPECT_FALSE(fs_deny_hit(home + "/.ssh/id_rsa", {"~/.ssh"}, "").has_value());
+}
+
+// ---------------------------------------------------------------------------
+// plan_mounts — [filesystem].deny + deny-by-default enforcement
+// ---------------------------------------------------------------------------
+
+TEST_F(FsGuard, PlanMountsRefusesAllowReadUnderDenyRule) {
+  std::string secret = make_subdir("secrets");
+  Config cfg = make_config(/*strict=*/true, {secret}, {});
+  cfg.ext.fs_deny = {secret};  // deny the very path the user tried to allow
+  std::string err;
+  std::string warning;
+  auto mounts = plan_mounts(cfg, cwd(), /*real_home=*/"", err, warning);
+
+  EXPECT_TRUE(mounts.empty());
+  EXPECT_NE(err.find("refusing to mount denied path"), std::string::npos) << err;
+  EXPECT_NE(err.find(secret), std::string::npos) << err;
+}
+
+TEST_F(FsGuard, PlanMountsRefusesAllowWriteBeneathDenyRule) {
+  std::string base = make_subdir("home/user/.gnupg");
+  std::string denied_root = fs::canonical(root_ / "home" / "user" / ".gnupg").string();
+  Config cfg = make_config(/*strict=*/true, {}, {base});
+  cfg.ext.fs_deny = {denied_root};
+  std::string err;
+  std::string warning;
+  auto mounts = plan_mounts(cfg, cwd(), "", err, warning);
+
+  EXPECT_TRUE(mounts.empty());
+  EXPECT_NE(err.find("refusing to mount denied path"), std::string::npos) << err;
+}
+
+TEST_F(FsGuard, PlanMountsAllowsPathOutsideDenyRules) {
+  std::string ok = make_subdir("project");
+  std::string denied = make_subdir("home/user/.ssh");
+  Config cfg = make_config(/*strict=*/true, {ok}, {});
+  cfg.ext.fs_deny = {denied};
+  std::string err = "sentinel";
+  std::string warning;
+  auto mounts = plan_mounts(cfg, cwd(), "", err, warning);
+
+  EXPECT_TRUE(err.empty()) << err;
+  ASSERT_EQ(mounts.size(), 1u);
+  EXPECT_EQ(mounts[0].host_path, ok);
+}
+
+TEST_F(FsGuard, PlanMountsDenyByDefaultSuppressesCwdAutoMount) {
+  // Non-strict, but mode = deny-by-default => the cwd is NOT auto-mounted.
+  std::string proj = make_subdir("work/project");
+  Config cfg = make_config(/*strict=*/false, {}, {});
+  cfg.ext.fs_deny_by_default = true;
+  std::string err = "sentinel";
+  std::string warning = "sentinel";
+  auto mounts = plan_mounts(cfg, /*cwd=*/proj, /*real_home=*/"", err, warning);
+
+  EXPECT_TRUE(err.empty());
+  EXPECT_TRUE(mounts.empty()) << "deny-by-default must not auto-mount the cwd";
+}
+
+TEST_F(FsGuard, PlanMountsDeniedCwdIsNotAutoMountedAndWarns) {
+  // The cwd itself resolves under a deny rule => not auto-mounted, warning surfaced.
+  std::string proj = make_subdir("home/user/.config/gcloud");
+  Config cfg = make_config(/*strict=*/false, {}, {});
+  cfg.ext.fs_deny = {fs::canonical(root_ / "home" / "user" / ".config").string()};
+  std::string err;
+  std::string warning;
+  auto mounts = plan_mounts(cfg, /*cwd=*/proj, /*real_home=*/"", err, warning);
+
+  EXPECT_TRUE(err.empty()) << err;
+  EXPECT_TRUE(mounts.empty());
+  EXPECT_FALSE(warning.empty());
+}
+
 }  // namespace

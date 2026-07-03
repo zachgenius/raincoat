@@ -1065,3 +1065,269 @@ TEST(Integration, FontconfigFileIsCatReadableInsideSandbox) {
         << "FONTCONFIG_FILE was not a readable file inside the sandbox:\n"
         << r.output;
 }
+
+// ---------------------------------------------------------------------------
+// Rich sectioned-profile wiring (phase: wire ext into the live sandbox).
+// ---------------------------------------------------------------------------
+
+namespace {
+// Write `content` to a fresh profile file under its own temp dir; return the path.
+std::string write_profile(const std::string& tag, const std::string& content) {
+    std::string dir = make_temp_dir(tag);
+    std::string path = (fs::path(dir) / "profile.toml").string();
+    std::ofstream(path, std::ios::binary | std::ios::trunc) << content;
+    return path;
+}
+}  // namespace
+
+// A strict profile whose identity/hostname, env deny + scrub patterns, and a
+// RESERVED network mode ("bridge") + unavailable workdir ("/workspace") are all
+// honestly wired: the child sees the generic hostname, the denied/pattern-matched
+// vars are scrubbed even though they are in the profile's allow list, and the audit
+// records the reserved-mode fallback + workdir fallback rather than pretending.
+TEST(IntegrationProfile, ReferenceStyleProfileIsHonestlyWired) {
+    SKIP_UNLESS_SANDBOXABLE(bin);
+
+    const std::string profile = write_profile("refprofile",
+        "profile_name = \"itest-agent\"\n"
+        "strict = true\n"
+        "network = \"bridge\"\n"           // reserved -> must fall back to off (strict)
+        "workdir = \"/workspace\"\n"       // unavailable -> must fall back to fake home
+        "[identity]\n"
+        "username = \"agent\"\n"
+        "hostname = \"workstation\"\n"
+        "[environment]\n"
+        "allow = [\"PATH\", \"TERM\", \"KEEP_ME\", \"DENIED_VAR\", \"MYCORP_DATA\"]\n"
+        "deny = [\"DENIED_VAR\"]\n"
+        "scrub_patterns = [\"MYCORP_*\"]\n"
+        "[backend]\n"
+        "unshare_user = true\n"
+        "unshare_cgroup = true\n");
+
+    std::string real_home = make_temp_dir("realhome");
+    std::string cwd = make_temp_dir("cwd");
+    auto env = base_env(real_home);
+    env["KEEP_ME"] = "keepval";
+    env["DENIED_VAR"] = "denyleak";      // in allow list, but also denied
+    env["MYCORP_DATA"] = "corpleak";     // in allow list, but matches scrub pattern
+
+    RunResult r = run_proc(
+        bin,
+        {"--profile", profile, "--", "sh", "-c",
+         "echo H=$HOSTNAME; echo U=$USER; echo K=$KEEP_ME; echo D=$DENIED_VAR; "
+         "echo M=$MYCORP_DATA"},
+        env, cwd);
+    ASSERT_TRUE(r.spawn_ok);
+    EXPECT_EQ(r.exit_code, 0) << r.output;
+
+    // Identity from [identity] reaches the child env.
+    EXPECT_NE(r.output.find("H=workstation"), std::string::npos) << r.output;
+    EXPECT_NE(r.output.find("U=agent"), std::string::npos) << r.output;
+    // Explicitly-allowed, non-sensitive var survives.
+    EXPECT_NE(r.output.find("K=keepval"), std::string::npos) << r.output;
+    // env_deny beats --allow list; scrub pattern beats --allow list.
+    EXPECT_NE(r.output.find("D=\n"), std::string::npos) << "DENIED_VAR leaked:\n" << r.output;
+    EXPECT_EQ(r.output.find("denyleak"), std::string::npos) << r.output;
+    EXPECT_EQ(r.output.find("corpleak"), std::string::npos) << r.output;
+
+    std::string audit = read_file((fs::path(cwd) / ".raincoat" / "audit.log").string());
+    ASSERT_FALSE(audit.empty());
+    // Honesty: the profile name is recorded, the reserved bridge mode is disclosed and
+    // network fell back to off, the hostname reached --hostname, and the unavailable
+    // workdir fell back to the fake home with a note.
+    EXPECT_NE(audit.find("Profile:"), std::string::npos) << audit;
+    EXPECT_NE(audit.find("itest-agent"), std::string::npos) << audit;
+    EXPECT_NE(audit.find("Network:      off"), std::string::npos) << audit;
+    EXPECT_NE(audit.find("Reserved (configured, not enforced):"), std::string::npos) << audit;
+    EXPECT_NE(audit.find("bridge"), std::string::npos) << audit;
+    EXPECT_NE(audit.find("--hostname workstation"), std::string::npos) << audit;
+    EXPECT_NE(audit.find("--unshare-user"), std::string::npos) << audit;
+    EXPECT_NE(audit.find("--unshare-cgroup"), std::string::npos) << audit;
+    EXPECT_NE(audit.find("working directory is not mounted"), std::string::npos) << audit;
+    // The active-policy transparency section lists the deny/scrub policies.
+    EXPECT_NE(audit.find("Active policy:"), std::string::npos) << audit;
+    EXPECT_NE(audit.find("env deny list active"), std::string::npos) << audit;
+    EXPECT_NE(audit.find("custom env scrub patterns active"), std::string::npos) << audit;
+    // No secret VALUE is ever persisted.
+    EXPECT_EQ(audit.find("denyleak"), std::string::npos) << audit;
+    EXPECT_EQ(audit.find("corpleak"), std::string::npos) << audit;
+}
+
+// [filesystem].deny refuses an explicitly --allow-read'd path that resolves under a
+// deny rule, with a clear error, instead of silently mounting it.
+TEST(IntegrationProfile, FilesystemDenyRefusesAllowedPath) {
+    SKIP_UNLESS_SANDBOXABLE(bin);
+
+    std::string real_home = make_temp_dir("realhome");
+    std::string cwd = make_temp_dir("cwd");
+    // A real "credential" dir that the deny rule protects.
+    std::string secret_dir = (fs::path(cwd) / "secretstore").string();
+    fs::create_directories(secret_dir);
+
+    const std::string profile = write_profile("fsdeny",
+        "strict = true\n"
+        "[filesystem]\n"
+        "deny = [\"" + secret_dir + "\"]\n");
+
+    auto env = base_env(real_home);
+    RunResult r = run_proc(
+        bin, {"--profile", profile, "--allow-read", secret_dir, "--", "/bin/true"},
+        env, cwd);
+    ASSERT_TRUE(r.spawn_ok);
+    EXPECT_NE(r.exit_code, 0) << r.output;
+    EXPECT_NE(r.output.find("refusing to mount denied path"), std::string::npos) << r.output;
+}
+
+// BUG (attack round 1, honesty / unintended network): a profile that requests
+// `network = "off"` but also sets `[backend].unshare_net_when_off = false` disables
+// the ONLY mechanism that isolates the child's network (--unshare-net). The child
+// therefore runs in the HOST network namespace with full connectivity, yet the audit
+// still headlines "Network:      off" — a bald claim that the sandbox has no network.
+// For a privacy tool this is a dishonest audit: the authoritative Network line says
+// "off" while the child can see every host interface and reach the network. The only
+// trace today is a cryptic "backend overrides: ... unshare_net_when_off=off" note that
+// never states network is actually live.
+//
+// This test proves the SECURITY REALITY (host-independent, self-skipping): with only
+// loopback distinguishable it cannot tell the namespaces apart, so it SKIPs; otherwise
+// it asserts the child under a claimed "Network: off" sees ONLY loopback. It FAILS
+// today because the child sees the host's real interfaces while the audit says off.
+namespace {
+// Non-loopback interface names visible in the CALLER's (host) net namespace.
+std::vector<std::string> host_non_lo_ifaces() {
+    std::vector<std::string> out;
+    std::ifstream f("/proc/net/dev");
+    std::string line;
+    while (std::getline(f, line)) {
+        auto colon = line.find(':');
+        if (colon == std::string::npos) continue;  // skip the two header rows
+        std::string pre = line.substr(0, colon);
+        auto b = pre.find_first_not_of(" \t");
+        if (b == std::string::npos) continue;
+        auto e = pre.find_last_not_of(" \t");
+        std::string name = pre.substr(b, e - b + 1);
+        if (name.find(' ') != std::string::npos) continue;  // not an ifname token
+        if (name == "lo") continue;
+        out.push_back(name);
+    }
+    return out;
+}
+}  // namespace
+
+TEST(IntegrationProfile, NetOffMustIsolateNetworkOrNotClaimOff) {
+    SKIP_UNLESS_SANDBOXABLE(bin);
+
+    std::vector<std::string> ifaces = host_non_lo_ifaces();
+    if (ifaces.empty()) {
+        GTEST_SKIP() << "host has only loopback; cannot distinguish shared vs. "
+                        "isolated net namespace on this machine";
+    }
+
+    std::string real_home = make_temp_dir("realhome");
+    std::string cwd = make_temp_dir("cwd");
+    auto env = base_env(real_home);
+
+    // network=off, but the backend toggle disables the unshare that enforces it.
+    const std::string profile = write_profile("netoff_notenforced",
+        "network = \"off\"\n"
+        "[backend]\n"
+        "unshare_net_when_off = false\n");
+
+    RunResult r = run_proc(
+        bin, {"--profile", profile, "--", "sh", "-c", "cat /proc/net/dev"}, env, cwd);
+    ASSERT_TRUE(r.spawn_ok);
+    EXPECT_EQ(r.exit_code, 0) << r.output;
+
+    // The audit authoritatively claims the network is OFF.
+    std::string audit = read_file((fs::path(cwd) / ".raincoat" / "audit.log").string());
+    ASSERT_FALSE(audit.empty());
+    ASSERT_NE(audit.find("Network:      off"), std::string::npos)
+        << "precondition: audit claims network off\n" << audit;
+
+    // Honesty invariant: if the audit says "Network: off", the child must actually be
+    // network-isolated (only loopback visible). Any host interface leaking into the
+    // child proves the "off" claim is false and the child retains unintended network.
+    for (const std::string& name : ifaces) {
+        EXPECT_EQ(r.output.find(name + ":"), std::string::npos)
+            << "audit says 'Network: off' but the sandboxed child sees host interface '"
+            << name << "' in /proc/net/dev -> the child shares the host network "
+               "namespace and has unintended network access:\n"
+            << r.output;
+    }
+}
+
+// `raincoat init --profile <p>` writes .raincoat.toml AND creates [init].create_dirs.
+TEST(IntegrationProfile, InitCreatesProfileDirectories) {
+    SKIP_UNLESS_SANDBOXABLE(bin);
+
+    std::string cwd = make_temp_dir("initcwd");
+    const std::string profile = write_profile("initdirs",
+        "[init]\n"
+        "create_dirs = [\".raincoat\", \"out\", \"nested/deep\"]\n");
+
+    auto env = base_env(make_temp_dir("realhome"));
+    RunResult r = run_proc(bin, {"init", "--profile", profile}, env, cwd);
+    ASSERT_TRUE(r.spawn_ok);
+    EXPECT_EQ(r.exit_code, 0) << r.output;
+
+    EXPECT_TRUE(fs::exists(fs::path(cwd) / ".raincoat.toml")) << r.output;
+    EXPECT_TRUE(fs::exists(fs::path(cwd) / ".raincoat"));
+    EXPECT_TRUE(fs::exists(fs::path(cwd) / "out"));
+    EXPECT_TRUE(fs::exists(fs::path(cwd) / "nested" / "deep"));
+}
+
+// `raincoat report --profile <p>` with playful_summary = false prints the plain
+// factual summary rather than the playful narrative.
+TEST(IntegrationProfile, ReportPlainSummaryWhenPlayfulDisabled) {
+    SKIP_UNLESS_SANDBOXABLE(bin);
+
+    std::string real_home = make_temp_dir("realhome");
+    std::string cwd = make_temp_dir("cwd");
+    auto env = base_env(real_home);
+    env["SECRET_TOKEN"] = "dropme";
+
+    // Produce a real audit log first.
+    RunResult run = run_proc(bin, {"--", "sh", "-c", "true"}, env, cwd);
+    ASSERT_TRUE(run.spawn_ok);
+    EXPECT_EQ(run.exit_code, 0) << run.output;
+    std::string audit_path = (fs::path(cwd) / ".raincoat" / "audit.log").string();
+    ASSERT_TRUE(fs::exists(audit_path));
+
+    const std::string profile = write_profile("plainreport",
+        "[report]\n"
+        "playful_summary = false\n");
+
+    RunResult rep =
+        run_proc(bin, {"report", audit_path, "--profile", profile}, env, cwd);
+    ASSERT_TRUE(rep.spawn_ok);
+    EXPECT_EQ(rep.exit_code, 0) << rep.output;
+    EXPECT_NE(rep.output.find("Raincoat run summary:"), std::string::npos) << rep.output;
+    EXPECT_EQ(rep.output.find("kept an eye on things"), std::string::npos) << rep.output;
+    EXPECT_EQ(rep.output.find("did not get to see you naked"), std::string::npos) << rep.output;
+}
+
+// Tripwire: enabling [filesystem.tripwire] plants inert decoy files inside the fake
+// home so a probing tool finds bait (not real credentials, and never the real home).
+TEST(IntegrationProfile, TripwirePlantsBaitInFakeHome) {
+    SKIP_UNLESS_SANDBOXABLE(bin);
+
+    std::string real_home = make_temp_dir("realhome");
+    std::string cwd = make_temp_dir("cwd");
+    const std::string profile = write_profile("tripwire",
+        "[filesystem.tripwire]\n"
+        "enabled = true\n"
+        "fake_sensitive_files = [\"~/.ssh/id_rsa\", \"~/.aws/credentials\"]\n");
+
+    auto env = base_env(real_home);
+    RunResult r = run_proc(
+        bin,
+        {"--profile", profile, "--", "sh", "-c",
+         "if [ -f \"$HOME/.ssh/id_rsa\" ] && [ -f \"$HOME/.aws/credentials\" ]; "
+         "then echo BAIT_PRESENT; cat \"$HOME/.ssh/id_rsa\"; else echo NO_BAIT; fi"},
+        env, cwd);
+    ASSERT_TRUE(r.spawn_ok);
+    EXPECT_EQ(r.exit_code, 0) << r.output;
+    EXPECT_NE(r.output.find("BAIT_PRESENT"), std::string::npos) << r.output;
+    // The bait is inert, clearly labeled decoy content.
+    EXPECT_NE(r.output.find("tripwire decoy"), std::string::npos) << r.output;
+}

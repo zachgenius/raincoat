@@ -42,18 +42,34 @@ std::vector<std::string> build_bwrap_argv(const std::string& bwrap_path, const C
         a.push_back(z);
     };
 
+    // Backend knobs from the profile's [backend] section. Every field defaults to
+    // the hard-coded MVP behavior (see BackendConfig in config.hpp), so an absent
+    // profile emits exactly the same argv as before.
+    const BackendConfig& backend = cfg.ext.backend;
+
     // argv[0]
     p1(bwrap_path);
 
-    // Lifecycle + namespace isolation.
-    p1("--die-with-parent");
-    p1("--unshare-pid");
-    p1("--unshare-uts");
-    // Give the sandbox a generic hostname so the real host name (a trivially-read
-    // machine fingerprint) never leaks in through the fresh UTS namespace.
-    p2("--hostname", "sandbox");
-    p1("--unshare-ipc");
-    if (cfg.net == NetMode::Off) p1("--unshare-net");
+    // Lifecycle + namespace isolation (each gated on its backend toggle; defaults
+    // reproduce the original unconditional flags).
+    if (backend.die_with_parent) p1("--die-with-parent");
+    // --unshare-user / --unshare-cgroup are OFF by default (they can break tools /
+    // are unnecessary for the privacy model) and only emitted when the profile asks.
+    if (backend.unshare_user) p1("--unshare-user");
+    if (backend.unshare_pid) p1("--unshare-pid");
+    if (backend.unshare_uts) {
+        p1("--unshare-uts");
+        // Give the sandbox a generic hostname so the real host name (a trivially-read
+        // machine fingerprint) never leaks in through the fresh UTS namespace. This
+        // requires --unshare-uts to take effect, so it is gated on it. The value comes
+        // from the profile (ext.hostname), defaulting to "sandbox".
+        p2("--hostname", cfg.ext.hostname.value_or("sandbox"));
+    }
+    if (backend.unshare_ipc) p1("--unshare-ipc");
+    if (backend.unshare_cgroup) p1("--unshare-cgroup");
+    // Honor NetMode::Off with a fresh (empty) network namespace, unless the profile
+    // disabled that coupling via unshare_net_when_off.
+    if (cfg.net == NetMode::Off && backend.unshare_net_when_off) p1("--unshare-net");
 
     // Base system view.
     p3("--ro-bind", "/usr", "/usr");
@@ -61,16 +77,17 @@ std::vector<std::string> build_bwrap_argv(const std::string& bwrap_path, const C
     p3("--symlink", "usr/lib", "/lib");
     p3("--symlink", "usr/lib64", "/lib64");
     p3("--symlink", "usr/sbin", "/sbin");
-    p2("--proc", "/proc");
-    p2("--dev", "/dev");
+    if (backend.mount_proc) p2("--proc", "/proc");
+    if (backend.mount_dev) p2("--dev", "/dev");
 
     // TLS trust store; DNS resolver (only when requested).
     p3("--ro-bind-try", "/etc/ssl", "/etc/ssl");
     if (bind_resolv_conf) p3("--ro-bind-try", "/etc/resolv.conf", "/etc/resolv.conf");
 
-    // Sandbox-writable dirs.
+    // Sandbox-writable dirs. The fake home is always bound; the writable temp scratch
+    // (the sandbox's /tmp) is gated on backend.mount_tmpfs_tmp (default true).
     p3("--bind", fake_home, fake_home);
-    p3("--bind", sandbox_tmp, sandbox_tmp);
+    if (backend.mount_tmpfs_tmp) p3("--bind", sandbox_tmp, sandbox_tmp);
     // Dedicated writable scratch area (SPEC `<temp>/out`). Bound identity so the
     // child has a private, disposable place to write output that lives on the host
     // temp tree and is torn down with the sandbox.

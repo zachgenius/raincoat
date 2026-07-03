@@ -12,6 +12,26 @@ namespace raincoat {
 std::optional<Mount> make_mount(const std::string& user_path, const std::string& cwd,
                                 MountMode mode, std::string& err);
 
+// If `mount_host_path` IS, or lives beneath, any [filesystem].deny entry — OR is a
+// proper ancestor of a deny entry — return that entry's ORIGINAL spelling (for a
+// legible error); otherwise nullopt. The ancestor direction depends on `mount_mode`:
+//   * ReadWrite (default-unsafe direction): ALWAYS a hit, even for a denied descendant
+//     that does not exist yet — a writable bind lets the child mkdir+write the denied
+//     path straight into the real filesystem, so creation rights alone violate the deny
+//     guarantee.
+//   * ReadOnly: a hit only when the denied descendant currently EXISTS on disk (a
+//     non-existent descendant has nothing to expose through a read-only bind, so it
+//     never blocks an unrelated ancestor mount).
+// A leading "~" in a deny entry is expanded against `real_home` before comparison.
+// plan_mounts uses this to refuse an allow_read/allow_write that targets or contains a
+// denied path and to skip auto-mounting a denied cwd (the auto-mount is read-write).
+// `real_home == ""` disables "~" expansion. `mount_mode` defaults to ReadOnly (the
+// safe-to-analyze direction) so bare callers keep the existence-gated semantics.
+std::optional<std::string> fs_deny_hit(const std::string& mount_host_path,
+                                       const std::vector<std::string>& fs_deny,
+                                       const std::string& real_home,
+                                       MountMode mount_mode = MountMode::ReadOnly);
+
 // True when auto-mounting `cwd` would expose the real home directory — i.e. when
 // (canonicalized) `cwd` equals `real_home` or is an ancestor of it. Auto-mounting in
 // that case would bind ~/.ssh, ~/.aws, etc. into the sandbox, defeating Raincoat's

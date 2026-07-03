@@ -94,12 +94,81 @@ struct EnvResolution {
     std::vector<std::string> scrubbed;  // present in parent but deliberately dropped
 };
 
+// Policy inputs for resolve_env that come from the rich sectioned profile
+// (ExtendedConfig). Default-constructing this reproduces the MVP behavior exactly:
+// no extra deny list, no extra scrub globs, and the generic username "user". So a
+// flat/absent profile is unaffected.
+//   deny            -> ext.env_deny: names that must NEVER be copied from the parent,
+//                      even when explicitly --allow-env'd (they land in `scrubbed`).
+//                      An explicit `--set-env NAME=...` (a user-chosen synthetic value)
+//                      still wins — deny blocks host values, not user-chosen ones.
+//   scrub_patterns  -> ext.scrub_patterns: glob-ish patterns ("AWS_*", "*_TOKEN").
+//                      When non-empty they EXTEND the built-in is_sensitive_env
+//                      heuristic and, unlike that heuristic, are strong enough to
+//                      override an explicit --allow-env (see env_guard.cpp).
+//   username        -> ext.username: the generic value forced onto USER (and, by the
+//                      runner, LOGNAME). Defaults to "user".
+struct EnvPolicy {
+    std::vector<std::string> deny;
+    std::vector<std::string> scrub_patterns;
+    std::string username = "user";
+};
+
 // Result of the fontconfig isolation step.
 struct FontSetup {
     FontStatus status = FontStatus::Disabled;
     std::map<std::string, std::string> env;  // FONTCONFIG_PATH, FONTCONFIG_FILE, XDG_DATA_DIRS ...
     std::string dir;   // fontconfig directory created inside the sandbox (may be empty)
     std::string note;  // short human-readable note for the audit log
+};
+
+// Bubblewrap backend knobs (from the profile's [backend] section). Defaults match the
+// hard-coded MVP behavior so code that ignores these is unaffected.
+struct BackendConfig {
+    std::string bwrap_path;             // empty => auto-locate via PATH
+    bool unshare_user   = false;        // reserved: off by default (can break some tools)
+    bool unshare_pid    = true;
+    bool unshare_ipc    = true;
+    bool unshare_uts    = true;
+    bool unshare_cgroup = false;
+    bool unshare_net_when_off = true;   // honor NetMode::Off with --unshare-net
+    bool mount_proc     = true;
+    bool mount_dev      = true;
+    bool mount_tmpfs_tmp = true;
+    bool die_with_parent = true;
+    bool seccomp        = false;        // reserved (not implemented)
+};
+
+// The rich, forward-compatible profile options that go BEYOND the flat MVP schema. These are
+// populated by the profile layer from the sectioned config (docs/full-config-reference.toml)
+// and carried through merge into Config. Every field defaults to the existing MVP behavior so
+// that a flat/absent profile is unchanged. Unknown sections/keys are tolerated (never fatal);
+// sections that are configured but not yet enforced are recorded in `reserved_notes` for the
+// audit log.
+struct ExtendedConfig {
+    std::optional<std::string> profile_name;   // informational (audit)
+    std::optional<std::string> username;       // [identity].username -> generic USER/LOGNAME value
+    std::optional<std::string> hostname;       // [identity].hostname -> generic hostname
+    std::optional<std::string> home;           // [identity].home -> reserved (path remap is future/advisory)
+    std::vector<std::string> env_deny;         // [environment].deny — never allow these
+    std::vector<std::string> scrub_patterns;   // [environment].scrub_patterns — empty => built-in defaults
+    std::vector<std::string> fs_deny;          // [filesystem].deny — never mount (enforced + audited)
+    std::optional<bool> fs_deny_by_default;    // [filesystem].mode == "deny-by-default"
+    std::vector<std::string> tripwire_files;   // [filesystem.tripwire].fake_sensitive_files
+    bool tripwire_enabled = false;
+    BackendConfig backend;
+    std::vector<std::string> init_create_dirs; // [init].create_dirs
+    std::optional<bool> playful_report;        // [report].playful_summary
+    std::optional<std::string> report_log;     // [report].latest_log
+    // A RESERVED restrictive network mode ("proxy"/"bridge"/"guarded") was requested but
+    // is not yet enforced. Carries the requested mode name so resolve_config can fail
+    // CLOSED (fall back to NetMode::Off, never Full) and the runner can warn on stderr.
+    // Absent for "full"/"off"/flat profiles, so their behavior is unchanged.
+    std::optional<std::string> reserved_net_mode;
+    // Names of sections/modes that were configured but are NOT yet enforced (browser, dns,
+    // network_policy, egress bridge, guarded/bridge/proxy network modes...). Surfaced in audit
+    // so behavior is honest.
+    std::vector<std::string> reserved_notes;
 };
 
 // Raw options parsed from the CLI and/or a profile, BEFORE merge + defaults are applied.
@@ -133,6 +202,9 @@ struct Options {
 
     std::optional<bool> fontconfig_enabled;
 
+    // Rich sectioned-config options (identity/environment/filesystem/backend/init/report...).
+    ExtendedConfig ext;
+
     std::vector<std::string> command;  // target argv (everything after `--`)
 };
 
@@ -165,6 +237,10 @@ struct Config {
     std::string workdir;          // absolute directory to chdir into inside the sandbox
     std::string audit_log_path;   // resolved path for the audit log
     bool        keep_temp = false;
+
+    // Rich sectioned-config options (identity/environment/filesystem/backend/init/report...),
+    // resolved from the profile. Defaults leave MVP behavior unchanged.
+    ExtendedConfig ext;
 
     std::vector<std::string> command;  // target argv
 };

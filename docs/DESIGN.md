@@ -49,28 +49,42 @@ Leaf helpers. No raincoat-specific types.
   Matches (case-sensitive on the documented forms): suffixes `_TOKEN`, `_SECRET`, `_KEY`;
   prefixes `AWS_`, `GITHUB_`, `GOOGLE_`, `OPENAI_`, `ANTHROPIC_`; exact `KUBECONFIG`,
   `SSH_AUTH_SOCK`, `DOCKER_HOST`, `NPM_TOKEN`, `PYPI_TOKEN`.
+- `bool env_name_matches_glob(const std::string& name, const std::string& pattern);`
+  Glob-ish match (`*` = any run incl. empty, `?` = exactly one char, else literal; case-sensitive).
+- `bool is_scrubbed_name(const std::string& name, const std::vector<std::string>& patterns);`
+  `is_sensitive_env(name)` OR (patterns non-empty AND `name` matches any) — this is how
+  `ext.scrub_patterns` **EXTEND** the built-in defaults.
+- `struct EnvPolicy { std::vector<std::string> deny; std::vector<std::string> scrub_patterns;`
+  `  std::string username = "user"; };`  (config.hpp) — carries the `[identity]`/`[environment]`
+  policy from `ExtendedConfig`. Default-constructed => original MVP behavior.
 - `EnvResolution resolve_env(const std::map<std::string,std::string>& parent,`
   `  const std::vector<std::string>& allow_env,`
   `  const std::vector<std::pair<std::string,std::string>>& set_env,`
-  `  const std::map<std::string,std::string>& defaults, bool strict);`
+  `  const std::map<std::string,std::string>& defaults, bool strict,`
+  `  const EnvPolicy& policy = {});`  — the trailing `policy` is optional and defaults to the
+  MVP behavior, so the legacy 5-arg call sites/tests are unchanged.
   Semantics:
   1. Start empty.
   2. Base safe allowlist copied from parent if present: `PATH`, `TERM`. These go into `allowed`.
-  3. `USER` is set to the generic value `"user"` (do NOT leak the real username) -> `set`.
+  3. `USER` is set to the generic value `policy.username` (default `"user"`; from `[identity].username`)
+     -> `set`. The real username is never leaked.
   4. Apply `defaults` (TZ, LANG, LC_ALL, ...) as `set` values.
-  5. For each `allow_env` name: if present in parent, copy value -> `allowed`. **EXCEPT** the
-     identity-protected names `USER`, `LOGNAME`, `HOSTNAME`: these are NEVER copied from the parent,
-     even when explicitly `--allow-env`'d, so the real login/host name can never be resurrected.
-     (`USER` keeps its generic value from step 3; `LOGNAME`/`HOSTNAME` are injected generically by
-     the runner — see below.)
-  6. For each `set_env` KEY=VALUE: assign -> `set`. **`set_env` overrides `allow_env`** and defaults.
-     `--set-env USER=/LOGNAME=/HOSTNAME=` still wins (a user-chosen value is not the host's real one).
+  5. For each `allow_env` name: if present in parent, copy value -> `allowed`. **EXCEPT** names that
+     are `blocked_from_parent`: the identity-protected `USER`/`LOGNAME`/`HOSTNAME`, any name in
+     `policy.deny` (`[environment].deny` — never allowed even if allow-env'd), or (when
+     `policy.scrub_patterns` is non-empty) any name matching `is_scrubbed_name`. Blocked names are
+     refused entry and fall through to `scrubbed`. NOTE: the built-in `is_sensitive_env` heuristic
+     does NOT by itself block an explicit `--allow-env` (so a deliberate `--allow-env OPENAI_API_KEY`
+     still works); only the user's own `deny`/`scrub_patterns` policy is strong enough to veto it.
+  6. For each `set_env` KEY=VALUE: assign -> `set`. **`set_env` overrides `allow_env`**, defaults, AND
+     the deny/scrub policy (a user-chosen synthetic value is not the host's secret).
+     `--set-env USER=/LOGNAME=/HOSTNAME=` still wins.
   7. `scrubbed` = every name present in `parent` that is NOT in `resolved` (sorted). Sensitive-pattern
-     names that were not explicitly allowed MUST appear here.
+     and denied names that were not explicitly allowed MUST appear here.
   Note: HOME and TMPDIR are injected later by the runner (they depend on the sandbox dir), not here.
-  The runner also injects generic `LOGNAME="user"` and `HOSTNAME="sandbox"` (unless the user chose an
-  explicit `--set-env` value), mirroring the generic `USER`, so the three identity fingerprints stay
-  anonymized end-to-end.
+  The runner also injects generic `LOGNAME` (= `ext.username`, default "user") and `HOSTNAME`
+  (= `ext.hostname`, default "sandbox") — unless the user chose an explicit `--set-env` value —
+  mirroring the generic `USER`, so the three identity fingerprints stay anonymized end-to-end.
 
 ### fs_guard  (deps: config, util)
 - `std::optional<Mount> make_mount(const std::string& user_path, const std::string& cwd,`
@@ -85,6 +99,16 @@ Leaf helpers. No raincoat-specific types.
   instead set a warning (see below) so the runner can tell the user to pass `--allow-write` /
   `--allow-read` explicitly. In **strict** mode, never auto-add the cwd. On any missing path, set
   err and return empty. `real_home` empty => no home guard (used by pure tests that inject it).
+  plan_mounts also reads `cfg.ext` directly (no signature change): a path resolving under any
+  `ext.fs_deny` entry (`[filesystem].deny`, with a leading `~` expanded against `real_home`) is NEVER
+  mounted — an `--allow-read`/`--allow-write` targeting it is refused with
+  `"Error: refusing to mount denied path: <path> (matches filesystem deny rule '<rule>')"`, and a
+  denied cwd is not auto-mounted (warning surfaced). `ext.fs_deny_by_default` (`[filesystem].mode =
+  "deny-by-default"`) suppresses the non-strict cwd auto-mount entirely, exactly like strict mode.
+- `std::optional<std::string> fs_deny_hit(const std::string& mount_host_path,`
+  `  const std::vector<std::string>& fs_deny, const std::string& real_home);`
+  Returns the ORIGINAL spelling of the first `fs_deny` entry that IS or is an ancestor of
+  `mount_host_path` (`~` expanded against `real_home`), else nullopt. Used by plan_mounts.
 - `bool any_writable(const std::vector<Mount>& mounts);`  // used to warn in strict mode
 - `std::string audit_mask_dir(const std::string& audit_log_path, const std::vector<Mount>& mounts);`
   Returns the audit log's PARENT dir in sandbox space whenever the untrusted child could otherwise
@@ -130,17 +154,22 @@ Leaf helpers. No raincoat-specific types.
   `  const std::string& fake_home, const std::string& sandbox_tmp, bool bind_resolv_conf,`
   `  const std::string& font_dir = "", const std::string& audit_mask_dir = "",`
   `  const std::string& sandbox_out = "");`
-  Emits (argv[0] = bwrap_path):
-  - `--die-with-parent`
-  - namespace isolation: `--unshare-pid --unshare-uts --unshare-ipc`
-  - `--hostname sandbox` (generic host name; requires the `--unshare-uts` above so the real machine
-    name never leaks through the fresh UTS namespace)
-  - `--unshare-net` iff `cfg.net == NetMode::Off`
-  - base system: `--ro-bind /usr /usr`, `--symlink usr/bin /bin`, `--symlink usr/lib /lib`,
-    `--symlink usr/lib64 /lib64`, `--symlink usr/sbin /sbin`, `--proc /proc`, `--dev /dev`
+  Emits (argv[0] = bwrap_path). Every namespace/mount flag below is gated on the matching
+  `cfg.ext.backend` toggle (`BackendConfig`); the defaults reproduce the MVP argv exactly, so an
+  absent profile is unchanged:
+  - `--die-with-parent` (iff `backend.die_with_parent`, default true)
+  - `--unshare-user` (iff `backend.unshare_user`, default **false**), `--unshare-pid`
+    (`backend.unshare_pid`), `--unshare-uts` (`backend.unshare_uts`), `--unshare-ipc`
+    (`backend.unshare_ipc`), `--unshare-cgroup` (iff `backend.unshare_cgroup`, default **false**)
+  - `--hostname <cfg.ext.hostname>` (default `sandbox`) emitted **only when `--unshare-uts`** is
+    (it requires the fresh UTS namespace so the real machine name never leaks)
+  - `--unshare-net` iff `cfg.net == NetMode::Off` **and** `backend.unshare_net_when_off` (default true)
+  - base system: `--ro-bind /usr /usr`, the four `--symlink`s, `--proc /proc` (iff
+    `backend.mount_proc`), `--dev /dev` (iff `backend.mount_dev`)
   - `--ro-bind-try /etc/ssl /etc/ssl` and (iff bind_resolv_conf) `--ro-bind-try /etc/resolv.conf /etc/resolv.conf`
-  - `--bind <fake_home> <fake_home>`, `--bind <sandbox_tmp> <sandbox_tmp>`, and (iff `sandbox_out`
-    non-empty) `--bind <sandbox_out> <sandbox_out>` — the writable scratch `out` dir (SPEC `<temp>/out`)
+  - `--bind <fake_home> <fake_home>`, `--bind <sandbox_tmp> <sandbox_tmp>` (the temp scratch bind is
+    gated on `backend.mount_tmpfs_tmp`, default true), and (iff `sandbox_out` non-empty)
+    `--bind <sandbox_out> <sandbox_out>` — the writable scratch `out` dir (SPEC `<temp>/out`)
   - (iff `font_dir` non-empty) `--ro-bind <font_dir> <font_dir>` so `FONTCONFIG_FILE/PATH` resolve
   - for each Mount: `--ro-bind`/`--bind <host> <sandbox>` per mode
   - (iff `audit_mask_dir` non-empty) `--tmpfs <audit_mask_dir>` — emitted AFTER the user mounts so the
@@ -166,7 +195,14 @@ Leaf helpers. No raincoat-specific types.
 ### audit  (deps: config) — `AuditRecord` lives in audit.hpp
 - `struct AuditRecord { std::string command_line; bool strict; NetMode net; std::string fake_home;`
   `  std::string workdir; std::vector<Mount> mounts; EnvResolution env; FontStatus font;`
-  `  std::string timezone; std::string locale; std::string bwrap_command; };`
+  `  std::string timezone; std::string locale; std::string bwrap_command;`
+  `  std::optional<std::string> profile_name; std::vector<std::string> active_policy_notes;`
+  `  std::vector<std::string> reserved_notes; };`
+  The last three carry rich sectioned-config transparency (NAMES/counts only, never secrets) and are
+  printed only when non-empty: `profile_name` -> a `Profile:` line; `active_policy_notes` -> an
+  `Active policy:` section (which extended policies — env_deny/fs_deny/scrub_patterns/backend
+  overrides/tripwire — are ACTIVE this run); `reserved_notes` -> a
+  `Reserved (configured, not enforced):` section (sections parsed but not yet enforced).
 - `std::string format_audit_start(const AuditRecord& r);`  // the multi-line "Raincoat started" block
 - `std::string format_audit_end(int exit_code);`
 - `bool write_audit(const std::string& path, const std::string& content, std::string& err);` // append, mkdir -p parent
@@ -177,9 +213,12 @@ Leaf helpers. No raincoat-specific types.
   removed). Audit is defense-in-depth only for env NAME lists.
 
 ### report  (deps: none beyond std)
-- `std::string summarize_audit(const std::string& audit_text);`  // pure; playful-but-professional summary
-  Should surface: HOME hidden, count of scrubbed env vars, network mode, strict/normal. Optional
-  closing line: "Verdict: this tool did not get to see you naked."
+- `std::string summarize_audit(const std::string& audit_text, bool playful = true);`  // pure
+  Should surface: HOME hidden, count of scrubbed env vars, network mode, strict/normal. `playful`
+  (default true, honoring `[report].playful_summary`) selects the playful narrative (optional closing
+  "Verdict: this tool did not get to see you naked.") vs. a plain factual "Raincoat run summary:"
+  bullet list. `main` picks the audit path from an explicit positional, else `[report].latest_log`
+  (`ext.report_log`), else the default under cwd; `raincoat report [path] [--profile <p>]`.
 
 ### init  (deps: util)
 - `std::string default_toml();`  // the example .raincoat.toml content; MUST be parseable by our own
@@ -187,6 +226,10 @@ Leaf helpers. No raincoat-specific types.
 - `bool write_init(const std::string& path, bool force, std::string& err);`  // refuse overwrite unless force
   The refusal message must only mention `--force` because the CLI actually supports it: `raincoat
   init [--force|-f]` sets `Options.init_force`, and `main` passes it through to `write_init`.
+- `bool create_init_dirs(const std::vector<std::string>& dirs, const std::string& base_cwd,`
+  `  std::string& err);`  // mkdir -p each dir (relative -> base_cwd); existing dirs are fine.
+  `raincoat init --profile <p>` loads the profile and, after writing `.raincoat.toml`, creates the
+  profile's `[init].create_dirs` (`ext.init_create_dirs`).
 
 ### doctor  (deps: util)
 - `struct DoctorReport { bool bwrap_found=false; std::string bwrap_path; std::string bwrap_version;`
@@ -206,7 +249,40 @@ Leaf helpers. No raincoat-specific types.
     - malformed set-env (no `=`): `"Error: expected --set-env KEY=VALUE"`
     - unknown `--net` value: a clear message naming valid values (full|off)
     - Run subcommand with an empty command: `"Error: no command provided.\n\nUsage:\n  raincoat -- <command> [args...]"`
-  - `--profile <path>` records the path into `options.profile_path`.
+  - `--profile <path>` records the path into `options.profile_path`. The `init` and `report`
+    subcommands also accept `--profile <path>` (init -> `[init].create_dirs`; report ->
+    `[report].latest_log`/`playful_summary`); `report [path]` takes an optional positional audit path
+    (stored in `options.command`).
+
+### Config schema mapping (phase 1.5 — rich sectioned profile)
+The profile layer accepts BOTH the flat MVP schema AND the rich sectioned schema shown in
+`docs/full-config-reference.toml` (a directional demo — field names may change; tolerate unknown
+keys/sections, never fatal). Nested sections take precedence over flat top-level keys; the flat
+schema still loads (backward compatible). These options are not merely carried — the runner now
+WIRES `Config.ext` into the live sandbox (identity/env policy in resolve_env, backend toggles +
+hostname in bwrap, fs_deny in plan_mounts, tripwire + bwrap_path + audit notes in run()). Mapping
+into `Options`/`Config`+`Config.ext` (`ExtendedConfig`, see config.hpp):
+- top-level: `profile_name`→ext.profile_name; `strict`; `network` off|full→NetMode, and
+  proxy|bridge|guarded→record an `ext.reserved_notes` entry + fall back to the safe net default
+  (Off if strict else Full); `keep_temp`; `workdir`.
+- `[identity]`: `username`→ext.username (generic USER/LOGNAME value), `hostname`→ext.hostname
+  (drives `--hostname` + HOSTNAME env), `home`→ext.home (reserved/advisory), `timezone`→env TZ,
+  `locale`→env LANG+LC_ALL, `language`→env LANGUAGE.
+- `[environment]`: `allow`→allow_env, `deny`→ext.env_deny (never allowed, even via allow_env),
+  `scrub_patterns`→ext.scrub_patterns (empty ⇒ built-in defaults), `[environment.set]`→set_env,
+  `clear` (always true; warn if false).
+- `[filesystem]`: `allow_read`/`allow_write`, `deny`→ext.fs_deny (never mounted; audited),
+  `mode`="deny-by-default"→ext.fs_deny_by_default (strict-like no-auto-cwd), `create_standard_dirs`,
+  `fake_home` (always true), `[filesystem.tripwire]`→ext.tripwire_*.
+- `[fontconfig]`: `enabled`→fontconfig_enabled; mode/paths/hide_host_fonts/fontset advisory.
+- `[audit]`: `log_file`→audit_log; redact/format/log_* mostly advisory (redaction always on).
+- `[backend]`: →ext.backend (bwrap_path, unshare_*, mount_*, die_with_parent; seccomp reserved).
+- `[init]`: `create_dirs`→ext.init_create_dirs. `[report]`: `latest_log`→ext.report_log,
+  `playful_summary`→ext.playful_report. `[proxy]`: if enabled, inject http/https/all/no_proxy → set_env.
+- RESERVED (parse + `ext.reserved_notes` + audit line "configured, not yet enforced", NOT
+  enforced): `[browser]`, `[dns]`, `[network_policy]`, `[egress]`/`[[egress.bridge]]` (phase 2),
+  network modes bridge/guarded/proxy-as-mode, `[backend].seccomp`.
+The `toml` module must support `[[array-of-tables]]` and nested `[a.b.c]` tables for this.
 
 ### profile  (deps: toml, config)
 - `std::optional<Options> load_profile(const std::string& path, std::string& err);`
@@ -250,11 +326,17 @@ Leaf helpers. No raincoat-specific types.
 - `int run(const Config& cfg, const std::map<std::string,std::string>& parent_env,`
   `  const std::string& cwd, const std::string& assets_dir, std::string& err);`
   Orchestrates: mkdtemp sandbox; create home/user, tmp, out (out is bound writable into the sandbox);
-  resolve_env (+ inject HOME, TMPDIR, generic USER, and generic LOGNAME/HOSTNAME unless `--set-env`
-  chose them); font setup (merge env, incl. XDG_DATA_DIRS); plan_mounts (validate; propagate the exact
-  missing-path error); pick workdir; compute `audit_mask_dir`; build_bwrap_argv (font dir bound RO,
-  out dir bound RW, audit dir tmpfs-masked); locate bwrap (missing -> the bubblewrap error text);
-  write audit start; fork/exec bwrap; wait; write audit end; cleanup temp unless keep_temp.
+  resolve_env (passing an `EnvPolicy` built from `cfg.ext` — env_deny/scrub_patterns/username; +
+  inject HOME, TMPDIR, generic USER, and generic LOGNAME/HOSTNAME from `ext.username`/`ext.hostname`
+  unless `--set-env` chose them); font setup (merge env, incl. XDG_DATA_DIRS); plant `ext.tripwire_files`
+  as inert bait UNDER the fake home when `ext.tripwire_enabled` (a leading `~/` maps to the fake-home
+  root; writes can never escape it; the real home is never touched); plan_mounts (validate; enforce
+  `ext.fs_deny`/`ext.fs_deny_by_default`; propagate the exact missing-path/denied-path error); pick
+  workdir; compute `audit_mask_dir`; build_bwrap_argv (font dir bound RO, out dir bound RW, audit dir
+  tmpfs-masked; hostname + backend toggles read from `cfg.ext`); locate bwrap — an executable
+  `ext.backend.bwrap_path` (must contain a `/` and be X_OK) overrides auto-find, else `find_bwrap`
+  (missing -> the bubblewrap error text); populate the AuditRecord's profile_name/active_policy_notes/
+  reserved_notes; write audit start; fork/exec bwrap; wait; write audit end; cleanup temp unless keep_temp.
   A SIGINT/SIGTERM/SIGHUP handler forwards the signal to the bwrap child so `waitpid` returns and the
   normal `cleanup_root()` still removes the temp tree (no leak on interruption). Returns the child's
   exit code (128+signal on signal death).

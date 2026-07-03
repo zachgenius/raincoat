@@ -88,7 +88,7 @@ bool looks_sensitive_path(const std::string& path) {
 
 }  // namespace
 
-std::string summarize_audit(const std::string& audit_text) {
+std::string summarize_audit(const std::string& audit_text, bool playful) {
     std::string mode;       // strict | normal
     std::string network;    // full | off
     std::string fake_home;
@@ -154,6 +154,27 @@ std::string summarize_audit(const std::string& audit_text) {
     const std::string mode_word = strict ? "strict" : "normal";
 
     std::string net_word = network.empty() ? "unknown" : network;
+
+    // Plain-mode summary (profile [report].playful_summary = false): the same facts,
+    // stated flatly as labeled lines with no persona/verdict flourish.
+    if (!playful) {
+        std::ostringstream p;
+        p << "Raincoat run summary:\n";
+        p << "  Mode: " << (strict ? "strict" : "normal") << "\n";
+        p << "  Network: " << net_word << "\n";
+        p << "  Real HOME: "
+          << (sensitive_mount ? "hidden, but a sensitive path was explicitly mounted"
+                              : "hidden behind a fake home");
+        if (!fake_home.empty()) p << " (" << fake_home << ")";
+        p << "\n";
+        if (have_scrubbed) {
+            p << "  Environment variables scrubbed: " << scrubbed_count << "\n";
+        } else {
+            p << "  Environment variables scrubbed: not recorded\n";
+        }
+        return p.str();
+    }
+
     std::string net_phrase;
     if (net_word == "off") {
         net_phrase = "network access was cut off (off)";

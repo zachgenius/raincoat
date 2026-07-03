@@ -12,6 +12,7 @@
 #include "config.hpp"
 #include "doctor.hpp"
 #include "init.hpp"
+#include "profile.hpp"
 #include "report.hpp"
 #include "runner.hpp"
 #include "util.hpp"
@@ -88,14 +89,50 @@ int main(int argc, char** argv, char** envp) {
                 std::cerr << err << "\n";
                 return 1;
             }
+            // Honor a profile's [init].create_dirs: `raincoat init --profile <path>`
+            // also creates those directories (relative to the cwd) alongside the
+            // generated .raincoat.toml.
+            if (inv.options.profile_path.has_value()) {
+                std::string perr;
+                std::optional<Options> prof = load_profile(*inv.options.profile_path, perr);
+                if (!prof.has_value()) {
+                    std::cerr << perr << "\n";
+                    return 1;
+                }
+                std::string derr;
+                if (!create_init_dirs(prof->ext.init_create_dirs, current_working_dir(),
+                                      derr)) {
+                    std::cerr << derr << "\n";
+                    return 1;
+                }
+            }
             return 0;
         }
         case Subcommand::Report: {
             std::string cwd = current_working_dir();
-            // Optional positional path: `raincoat report [path]`.
+
+            // A profile (if given) can supply the default audit path via
+            // [report].latest_log and the output style via [report].playful_summary.
+            bool playful = true;
+            std::optional<std::string> profile_log;
+            if (inv.options.profile_path.has_value()) {
+                std::string perr;
+                std::optional<Options> prof = load_profile(*inv.options.profile_path, perr);
+                if (!prof.has_value()) {
+                    std::cerr << perr << "\n";
+                    return 1;
+                }
+                playful = prof->ext.playful_report.value_or(true);
+                profile_log = prof->ext.report_log;
+            }
+
+            // Resolution order for the audit path: an explicit positional path wins,
+            // else the profile's [report].latest_log, else the default under the cwd.
             std::string path;
-            if (args.size() >= 2 && !args[1].empty() && args[1][0] != '-') {
-                path = args[1];
+            if (!inv.options.command.empty() && !inv.options.command.front().empty()) {
+                path = inv.options.command.front();
+            } else if (profile_log.has_value() && !profile_log->empty()) {
+                path = absolutize(*profile_log, cwd);
             } else {
                 path = cwd + "/.raincoat/audit.log";
             }
@@ -106,7 +143,7 @@ int main(int argc, char** argv, char** envp) {
             }
             std::ostringstream buf;
             buf << ifs.rdbuf();
-            std::cout << summarize_audit(buf.str());
+            std::cout << summarize_audit(buf.str(), playful);
             return 0;
         }
         case Subcommand::Run: {

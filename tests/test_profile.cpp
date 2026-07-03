@@ -76,6 +76,203 @@ bool contains(const std::vector<std::string>& v, const std::string& s) {
     return false;
 }
 
+// True if ANY element of `v` contains `needle` as a substring.
+bool any_contains(const std::vector<std::string>& v, const std::string& needle) {
+    for (const auto& x : v)
+        if (x.find(needle) != std::string::npos) return true;
+    return false;
+}
+
+// A verbatim copy of docs/full-config-reference.toml — the directional DEMO config the
+// profile layer must ACCEPT without error (phase 1.5). Embedded (rather than read from
+// the repo) so the test is self-contained and cwd-independent under both the standalone
+// g++ build and ctest.
+const char* kFullConfigToml = R"TOML(profile_name = "default-agent-sandbox"
+strict = true
+
+network = "bridge"
+keep_temp = false
+workdir = "/workspace"
+
+[identity]
+username = "user"
+hostname = "workstation"
+home = "/home/user"
+timezone = "UTC"
+locale = "en_US.UTF-8"
+language = "en-US"
+platform_label = "generic-linux"
+persona = "generic-ci"
+
+[filesystem]
+fake_home = true
+create_standard_dirs = true
+mode = "deny-by-default"
+allow_read = [
+  "./README.md",
+  "./package.json",
+  "./Cargo.toml",
+  "./src"
+]
+allow_write = [
+  "./out",
+  "./target",
+  "./.raincoat-work"
+]
+deny = [
+  "~/.ssh",
+  "~/.aws",
+  "~/.azure",
+  "~/.config/gcloud",
+  "~/.kube",
+  "~/.gnupg",
+  "~/.docker",
+  "~/.npmrc",
+  "~/.pypirc",
+  "~/.git-credentials",
+  "~/.gitconfig",
+  "~/.config/gh"
+]
+
+[filesystem.tripwire]
+enabled = false
+fake_sensitive_files = [
+  "~/.ssh/id_rsa",
+  "~/.aws/credentials"
+]
+
+[environment]
+clear = true
+allow = [
+  "PATH",
+  "TERM"
+]
+deny = [
+  "SSH_AUTH_SOCK",
+  "KUBECONFIG",
+  "DOCKER_HOST",
+  "NPM_TOKEN",
+  "PYPI_TOKEN"
+]
+scrub_patterns = [
+  "*_TOKEN",
+  "*_SECRET",
+  "*_KEY",
+  "AWS_*",
+  "GITHUB_*",
+  "OPENAI_*",
+  "ANTHROPIC_*",
+  "AZURE_*"
+]
+
+[environment.set]
+HOME = "/home/user"
+TMPDIR = "/tmp"
+USER = "user"
+LOGNAME = "user"
+HOSTNAME = "workstation"
+TZ = "UTC"
+LANG = "en_US.UTF-8"
+LC_ALL = "en_US.UTF-8"
+LANGUAGE = "en-US"
+XDG_CONFIG_HOME = "/home/user/.config"
+XDG_CACHE_HOME = "/home/user/.cache"
+XDG_DATA_HOME = "/home/user/.local/share"
+
+[fontconfig]
+enabled = true
+hide_host_fonts = true
+mode = "minimal"
+
+[browser]
+enabled = false
+isolate_profile = true
+
+[egress]
+mode = "bridge"
+hide_upstreams_from_child = true
+timeout_seconds = 120
+
+[[egress.bridge]]
+name = "primary-api"
+env = "SOME_BASE_URL"
+child_endpoint = "http://127.0.0.1:18080"
+upstream_endpoint = "https://real-upstream.example.com"
+preserve_host = false
+
+[[egress.bridge]]
+name = "secondary-api"
+env = "SECONDARY_BASE_URL"
+child_endpoint = "http://127.0.0.1:18081"
+upstream_endpoint = "https://secondary-upstream.example.com"
+preserve_host = false
+
+[proxy]
+enabled = false
+http_proxy = "http://127.0.0.1:18080"
+https_proxy = "http://127.0.0.1:18080"
+all_proxy = "socks5://127.0.0.1:18080"
+no_proxy = ""
+
+[dns]
+enabled = false
+
+[[dns.map]]
+host = "example.com"
+ip = "203.0.113.10"
+
+[network_policy]
+enabled = true
+default_action = "allow"
+allow_hosts = [
+  "github.com",
+  "api.github.com"
+]
+block_hosts = [
+  "ipinfo.io"
+]
+
+[audit]
+enabled = true
+log_file = ".raincoat/audit.log"
+format = "text"
+redact_secrets = true
+
+[backend]
+type = "bubblewrap"
+bwrap_path = "bwrap"
+unshare_user = true
+unshare_pid = true
+unshare_ipc = true
+unshare_uts = true
+unshare_cgroup = true
+unshare_net_when_off = true
+mount_proc = true
+mount_dev = true
+mount_tmpfs_tmp = true
+die_with_parent = true
+seccomp = false
+
+[init]
+create_dirs = [
+  ".raincoat",
+  ".raincoat-work",
+  "out"
+]
+
+[report]
+latest_log = ".raincoat/audit.log"
+playful_summary = true
+)TOML";
+
+// Look up a KEY in a vector<pair> set_env list; returns nullptr when absent.
+const std::string* find_set_env(
+    const std::vector<std::pair<std::string, std::string>>& v, const std::string& key) {
+    for (const auto& kv : v)
+        if (kv.first == key) return &kv.second;
+    return nullptr;
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -740,4 +937,282 @@ TEST(Profile, LoadThenMergeAppliesCliOverrides) {
     EXPECT_TRUE(*m.fontconfig_enabled);
     ASSERT_TRUE(m.audit_log.has_value());
     EXPECT_EQ(*m.audit_log, ".raincoat/audit.log");
+}
+
+// ===========================================================================
+// Phase 1.5: the full rich sectioned config (docs/full-config-reference.toml)
+// must LOAD without error and map every implemented section correctly, while
+// gracefully RESERVING the not-yet-enforced sections.
+// ===========================================================================
+
+TEST(Profile, LoadFullReferenceConfigMapsEverySection) {
+    std::string path = write_temp_file(kFullConfigToml);
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    EXPECT_TRUE(err.empty());
+    const Options& o = *opt;
+
+    // ---- top-level ----
+    EXPECT_TRUE(o.strict);
+    ASSERT_TRUE(o.ext.profile_name.has_value());
+    EXPECT_EQ(*o.ext.profile_name, "default-agent-sandbox");
+    ASSERT_TRUE(o.workdir.has_value());
+    EXPECT_EQ(*o.workdir, "/workspace");
+
+    // network = "bridge" is a RESERVED mode: net left UNSET (safe fallback) and a
+    // reserved note recorded that mentions "network".
+    EXPECT_FALSE(o.net.has_value());
+    EXPECT_TRUE(any_contains(o.ext.reserved_notes, "network"))
+        << "expected a reserved note for the unenforced network mode";
+
+    // ---- identity -> env defaults + ext ----
+    EXPECT_EQ(o.env_defaults.at("TZ"), "UTC");
+    EXPECT_EQ(o.env_defaults.at("LANG"), "en_US.UTF-8");
+    EXPECT_EQ(o.env_defaults.at("LC_ALL"), "en_US.UTF-8");
+    EXPECT_EQ(o.env_defaults.at("LANGUAGE"), "en-US");
+    ASSERT_TRUE(o.ext.hostname.has_value());
+    EXPECT_EQ(*o.ext.hostname, "workstation");
+    ASSERT_TRUE(o.ext.username.has_value());
+    EXPECT_EQ(*o.ext.username, "user");
+    ASSERT_TRUE(o.ext.home.has_value());
+    EXPECT_EQ(*o.ext.home, "/home/user");
+
+    // ---- environment ----
+    // allow -> allow_env (nested overrides flat).
+    EXPECT_EQ(o.allow_env, (std::vector<std::string>{"PATH", "TERM"}));
+    // deny -> ext.env_deny.
+    EXPECT_TRUE(contains(o.ext.env_deny, "SSH_AUTH_SOCK"));
+    EXPECT_TRUE(contains(o.ext.env_deny, "KUBECONFIG"));
+    // scrub_patterns -> ext.scrub_patterns.
+    EXPECT_TRUE(contains(o.ext.scrub_patterns, "AWS_*"));
+    EXPECT_TRUE(contains(o.ext.scrub_patterns, "*_TOKEN"));
+    // [environment.set] -> set_env.
+    ASSERT_NE(find_set_env(o.set_env, "HOME"), nullptr);
+    EXPECT_EQ(*find_set_env(o.set_env, "HOME"), "/home/user");
+    ASSERT_NE(find_set_env(o.set_env, "USER"), nullptr);
+    EXPECT_EQ(*find_set_env(o.set_env, "USER"), "user");
+    EXPECT_NE(find_set_env(o.set_env, "XDG_CONFIG_HOME"), nullptr);
+    EXPECT_NE(find_set_env(o.set_env, "XDG_CACHE_HOME"), nullptr);
+    EXPECT_NE(find_set_env(o.set_env, "XDG_DATA_HOME"), nullptr);
+
+    // ---- filesystem ----
+    EXPECT_TRUE(contains(o.allow_read, "./src"));
+    EXPECT_TRUE(contains(o.allow_read, "./README.md"));
+    EXPECT_TRUE(contains(o.allow_write, "./out"));
+    EXPECT_TRUE(contains(o.allow_write, "./target"));
+    EXPECT_TRUE(contains(o.ext.fs_deny, "~/.ssh"));
+    EXPECT_TRUE(contains(o.ext.fs_deny, "~/.aws"));
+    ASSERT_TRUE(o.ext.fs_deny_by_default.has_value());
+    EXPECT_TRUE(*o.ext.fs_deny_by_default);
+    EXPECT_FALSE(o.ext.tripwire_enabled);
+    EXPECT_TRUE(contains(o.ext.tripwire_files, "~/.ssh/id_rsa"));
+
+    // ---- fontconfig / audit ----
+    ASSERT_TRUE(o.fontconfig_enabled.has_value());
+    EXPECT_TRUE(*o.fontconfig_enabled);
+    ASSERT_TRUE(o.audit_log.has_value());
+    EXPECT_EQ(*o.audit_log, ".raincoat/audit.log");
+
+    // ---- backend toggles ----
+    EXPECT_EQ(o.ext.backend.bwrap_path, "bwrap");
+    EXPECT_TRUE(o.ext.backend.unshare_user);
+    EXPECT_TRUE(o.ext.backend.unshare_cgroup);
+    EXPECT_TRUE(o.ext.backend.unshare_net_when_off);
+    EXPECT_TRUE(o.ext.backend.die_with_parent);
+    EXPECT_FALSE(o.ext.backend.seccomp);
+
+    // ---- init / report ----
+    EXPECT_EQ(o.ext.init_create_dirs,
+              (std::vector<std::string>{".raincoat", ".raincoat-work", "out"}));
+    ASSERT_TRUE(o.ext.report_log.has_value());
+    EXPECT_EQ(*o.ext.report_log, ".raincoat/audit.log");
+    ASSERT_TRUE(o.ext.playful_report.has_value());
+    EXPECT_TRUE(*o.ext.playful_report);
+
+    // ---- proxy disabled here -> no proxy env injected ----
+    EXPECT_EQ(find_set_env(o.set_env, "http_proxy"), nullptr);
+    EXPECT_EQ(find_set_env(o.set_env, "https_proxy"), nullptr);
+    EXPECT_EQ(find_set_env(o.set_env, "all_proxy"), nullptr);
+
+    // ---- reserved sections recorded ----
+    EXPECT_TRUE(any_contains(o.ext.reserved_notes, "egress"));
+    EXPECT_TRUE(any_contains(o.ext.reserved_notes, "browser"));
+    EXPECT_TRUE(any_contains(o.ext.reserved_notes, "dns"));
+    EXPECT_TRUE(any_contains(o.ext.reserved_notes, "network_policy"));
+    // The egress note mentions the bridge count (2 configured).
+    EXPECT_TRUE(any_contains(o.ext.reserved_notes, "2 bridge"));
+}
+
+// The reserved network mode leaves net unset; resolve_config's value_or then picks
+// the safe default. Verified here at the profile layer: strict=true + reserved mode
+// => net unset (so downstream falls back to Off).
+TEST(Profile, FullReferenceReservedNetworkLeavesNetUnset) {
+    std::string path = write_temp_file(kFullConfigToml);
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    EXPECT_TRUE(opt->strict);
+    EXPECT_FALSE(opt->net.has_value());
+}
+
+// BUG (attack round 1, honesty): `[backend].seccomp` is a RESERVED knob — bwrap
+// emits no seccomp filter for it and DESIGN.md ("RESERVED ... [backend].seccomp")
+// requires it to be recorded in ext.reserved_notes so the audit says
+// "configured, not yet enforced". Instead load_profile stores the bool into
+// ext.backend.seccomp and records NOTHING: a profile that asks for `seccomp = true`
+// gets no syscall filtering AND no honest disclosure, so the audit silently implies
+// a hardening feature that does not exist. This test asserts the honest note is
+// emitted; it FAILS today (reserved_notes is empty for a seccomp-only profile).
+TEST(Profile, SeccompEnabledIsDisclosedAsReservedNotEnforced) {
+    std::string path = write_temp_file("[backend]\nseccomp = true\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    // The value is carried (fine), but because it is NOT enforced it MUST be
+    // disclosed as reserved so the audit is honest.
+    EXPECT_TRUE(any_contains(opt->ext.reserved_notes, "seccomp"))
+        << "seccomp = true is accepted but never enforced and never disclosed as "
+           "reserved; the audit would silently imply syscall filtering that is not "
+           "applied. reserved_notes = "
+        << opt->ext.reserved_notes.size() << " entries";
+}
+
+// Proxy MECHANISM: when [proxy].enabled = true, the non-empty proxy vars are injected
+// into set_env; empty ones (no_proxy = "") are skipped.
+TEST(Profile, ProxyEnabledInjectsNonEmptyProxyEnv) {
+    std::string path = write_temp_file(
+        "[proxy]\n"
+        "enabled = true\n"
+        "http_proxy = \"http://127.0.0.1:18080\"\n"
+        "https_proxy = \"http://127.0.0.1:18080\"\n"
+        "all_proxy = \"socks5://127.0.0.1:18080\"\n"
+        "no_proxy = \"\"\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    ASSERT_NE(find_set_env(opt->set_env, "http_proxy"), nullptr);
+    EXPECT_EQ(*find_set_env(opt->set_env, "http_proxy"), "http://127.0.0.1:18080");
+    EXPECT_NE(find_set_env(opt->set_env, "https_proxy"), nullptr);
+    EXPECT_NE(find_set_env(opt->set_env, "all_proxy"), nullptr);
+    // no_proxy is empty -> not injected.
+    EXPECT_EQ(find_set_env(opt->set_env, "no_proxy"), nullptr);
+}
+
+// Reserved network modes must NOT be fatal (unlike allowlist/ask/banana): they load,
+// leave net unset, and record a note.
+TEST(Profile, ReservedNetworkModesLoadWithNote) {
+    for (const char* mode : {"proxy", "bridge", "guarded"}) {
+        std::string path =
+            write_temp_file(std::string("network = \"") + mode + "\"\n");
+        std::string err;
+        auto opt = load_profile(path, err);
+        ASSERT_TRUE(opt.has_value()) << "mode=" << mode << " err=" << err;
+        EXPECT_FALSE(opt->net.has_value()) << "mode=" << mode;
+        EXPECT_TRUE(any_contains(opt->ext.reserved_notes, "network")) << "mode=" << mode;
+    }
+}
+
+// ===========================================================================
+// Backward compatibility: a FLAT MVP profile still loads exactly as before,
+// and populates NO ext (rich) fields.
+// ===========================================================================
+
+TEST(Profile, FlatMvpProfileStillLoadsUnchanged) {
+    std::string path = write_temp_file(kSpecExampleToml);
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    const Options& o = *opt;
+
+    EXPECT_FALSE(o.strict);
+    ASSERT_TRUE(o.net.has_value());
+    EXPECT_EQ(*o.net, NetMode::Full);
+    EXPECT_EQ(o.allow_read, (std::vector<std::string>{"./src"}));
+    EXPECT_EQ(o.allow_write, (std::vector<std::string>{"./out"}));
+    EXPECT_EQ(o.allow_env, (std::vector<std::string>{"OPENAI_API_KEY"}));
+    EXPECT_EQ(o.env_defaults.at("TZ"), "UTC");
+    ASSERT_TRUE(o.fontconfig_enabled.has_value());
+    EXPECT_TRUE(*o.fontconfig_enabled);
+    ASSERT_TRUE(o.audit_log.has_value());
+    EXPECT_EQ(*o.audit_log, ".raincoat/audit.log");
+
+    // No rich sections present -> ext stays at defaults, set_env empty.
+    EXPECT_TRUE(o.set_env.empty());
+    EXPECT_FALSE(o.ext.profile_name.has_value());
+    EXPECT_FALSE(o.ext.hostname.has_value());
+    EXPECT_FALSE(o.ext.username.has_value());
+    EXPECT_TRUE(o.ext.env_deny.empty());
+    EXPECT_TRUE(o.ext.scrub_patterns.empty());
+    EXPECT_TRUE(o.ext.fs_deny.empty());
+    EXPECT_FALSE(o.ext.fs_deny_by_default.has_value());
+    EXPECT_TRUE(o.ext.init_create_dirs.empty());
+    EXPECT_FALSE(o.ext.report_log.has_value());
+    EXPECT_TRUE(o.ext.reserved_notes.empty());
+}
+
+// The nested [filesystem].allow_read/[environment].allow take precedence over the
+// flat top-level allow_read/allow_env when BOTH are present.
+TEST(Profile, NestedSectionTakesPrecedenceOverFlatKey) {
+    std::string path = write_temp_file(
+        "allow_read = [\"./flat-read\"]\n"
+        "allow_env = [\"FLAT_ENV\"]\n"
+        "[filesystem]\n"
+        "allow_read = [\"./nested-read\"]\n"
+        "[environment]\n"
+        "allow = [\"NESTED_ENV\"]\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    EXPECT_EQ(opt->allow_read, (std::vector<std::string>{"./nested-read"}));
+    EXPECT_EQ(opt->allow_env, (std::vector<std::string>{"NESTED_ENV"}));
+}
+
+// ===========================================================================
+// Unknown keys/sections must be TOLERATED (never fatal).
+// ===========================================================================
+
+TEST(Profile, UnknownSectionsAndKeysAreTolerated) {
+    std::string path = write_temp_file(
+        "strict = true\n"
+        "some_future_top_level_key = \"whatever\"\n"
+        "another_number = 42\n"
+        "[totally_unknown_section]\n"
+        "flag = true\n"
+        "value = \"x\"\n"
+        "list = [\"a\", \"b\"]\n"
+        "[identity]\n"
+        "username = \"user\"\n"
+        "unknown_identity_field = \"ignored\"\n"
+        "[[unknown.array.of.tables]]\n"
+        "k = \"v\"\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    EXPECT_TRUE(err.empty());
+    EXPECT_TRUE(opt->strict);
+    ASSERT_TRUE(opt->ext.username.has_value());
+    EXPECT_EQ(*opt->ext.username, "user");
+}
+
+// merge() must carry the profile's ext through unchanged (the CLI has no ext today).
+TEST(Profile, MergeCarriesProfileExt) {
+    std::string path = write_temp_file(kFullConfigToml);
+    std::string err;
+    auto profile = load_profile(path, err);
+    ASSERT_TRUE(profile.has_value()) << "err=" << err;
+
+    Options cli;  // no ext
+    Options m = merge(*profile, cli);
+
+    ASSERT_TRUE(m.ext.profile_name.has_value());
+    EXPECT_EQ(*m.ext.profile_name, "default-agent-sandbox");
+    EXPECT_TRUE(contains(m.ext.env_deny, "SSH_AUTH_SOCK"));
+    EXPECT_TRUE(contains(m.ext.fs_deny, "~/.ssh"));
+    ASSERT_TRUE(m.ext.fs_deny_by_default.has_value());
+    EXPECT_TRUE(*m.ext.fs_deny_by_default);
+    EXPECT_FALSE(m.ext.reserved_notes.empty());
+    EXPECT_EQ(m.ext.backend.bwrap_path, "bwrap");
+    // Profile-derived set_env ([environment.set]) survives the merge.
+    EXPECT_NE(find_set_env(m.set_env, "HOME"), nullptr);
 }

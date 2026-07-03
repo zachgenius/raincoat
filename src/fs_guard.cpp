@@ -45,7 +45,59 @@ bool is_ancestor_or_equal(const fs::path& ancestor, const fs::path& descendant) 
     return true;
 }
 
+// Expand a leading "~" in an fs_deny entry against the real home, then reduce it to
+// a canonical-or-lexical absolute path for ancestor comparison. "~" alone and "~/x"
+// are expanded; a bare "~user" form is left untouched (we only know the current home).
+fs::path resolve_deny_entry(const std::string& entry, const std::string& real_home) {
+    std::string e = entry;
+    if (!real_home.empty()) {
+        if (e == "~") {
+            e = real_home;
+        } else if (e.size() >= 2 && e[0] == '~' && e[1] == '/') {
+            e = real_home + e.substr(1);
+        }
+    }
+    return canon_or_lexical(fs::path(e));
+}
+
 }  // namespace
+
+std::optional<std::string> fs_deny_hit(const std::string& mount_host_path,
+                                       const std::vector<std::string>& fs_deny,
+                                       const std::string& real_home,
+                                       MountMode mount_mode) {
+    fs::path target = canon_or_lexical(fs::path(mount_host_path));
+    for (const auto& d : fs_deny) {
+        if (d.empty()) continue;
+        fs::path denied = resolve_deny_entry(d, real_home);
+        if (denied.empty()) continue;
+        // (1) The mount root IS a denied path or lives beneath one — refuse outright.
+        if (is_ancestor_or_equal(denied, target)) {
+            return d;  // return the ORIGINAL spelling for a legible error
+        }
+        // (2) The mount root is a PROPER ANCESTOR of a denied path: bind-mounting the
+        // parent would let the sandbox reach the denied child, so the deny guarantee
+        // ("must NEVER be mounted, even when the user explicitly --allow-read/
+        // --allow-write's it") requires refusing this mount too.
+        if (is_ancestor_or_equal(target, denied)) {
+            // For a READ-WRITE bind the denied descendant does NOT need to exist yet:
+            // a writable ancestor grants the child creation rights, so it can mkdir +
+            // write the denied path straight into the REAL filesystem through the bind.
+            // Refuse regardless of current existence. For a READ-ONLY bind a
+            // non-existent descendant has nothing to expose, so keep the existence gate
+            // there — that also preserves "an ancestor of a not-yet-existing deny entry
+            // is not a hit" for read mounts.
+            if (mount_mode == MountMode::ReadWrite) {
+                return d;
+            }
+            std::error_code ec;
+            if (fs::exists(denied, ec)) {
+                return d;
+            }
+        }
+    }
+    return std::nullopt;
+}
 
 bool cwd_is_home(const std::string& cwd, const std::string& real_home) {
     if (real_home.empty()) {
@@ -83,9 +135,24 @@ std::vector<Mount> plan_mounts(const Config& cfg, const std::string& cwd,
     warning.clear();
     std::vector<Mount> mounts;
 
+    // A path that resolves under any [filesystem].deny entry must NEVER be mounted —
+    // even when the user explicitly --allow-read/--allow-write's it. Refuse with a
+    // clear error naming the offending deny rule rather than silently exposing it.
+    auto refuse_if_denied = [&](const Mount& m, const std::string& user_path) -> bool {
+        if (auto hit = fs_deny_hit(m.host_path, cfg.ext.fs_deny, real_home, m.mode)) {
+            err = "Error: refusing to mount denied path: " + user_path +
+                  " (matches filesystem deny rule '" + *hit + "')";
+            return true;
+        }
+        return false;
+    };
+
     for (const auto& r : cfg.allow_read) {
         auto m = make_mount(r, cwd, MountMode::ReadOnly, err);
         if (!m) {
+            return {};
+        }
+        if (refuse_if_denied(*m, r)) {
             return {};
         }
         mounts.push_back(*m);
@@ -96,11 +163,19 @@ std::vector<Mount> plan_mounts(const Config& cfg, const std::string& cwd,
         if (!m) {
             return {};
         }
+        if (refuse_if_denied(*m, w)) {
+            return {};
+        }
         mounts.push_back(*m);
     }
 
-    // Non-strict: auto-add the cwd as ReadWrite unless it's already covered.
-    if (!cfg.strict) {
+    // Non-strict: auto-add the cwd as ReadWrite unless it's already covered. A profile
+    // with [filesystem].mode = "deny-by-default" (ext.fs_deny_by_default) suppresses the
+    // auto-mount entirely, exactly like strict mode, so ONLY explicit allow paths are
+    // exposed.
+    const bool suppress_auto_cwd =
+        cfg.strict || cfg.ext.fs_deny_by_default.value_or(false);
+    if (!suppress_auto_cwd) {
         std::error_code ec;
         fs::path cwd_canon = fs::canonical(fs::path(cwd), ec);
         std::string cwd_key = ec ? cwd : cwd_canon.string();
@@ -120,6 +195,13 @@ std::vector<Mount> plan_mounts(const Config& cfg, const std::string& cwd,
                 warning =
                     "Warning: refusing to auto-mount your home directory (" + cwd_key +
                     "); pass --allow-read/--allow-write to expose specific paths.";
+            } else if (auto deny_hit = fs_deny_hit(cwd_key, cfg.ext.fs_deny, real_home,
+                                                   MountMode::ReadWrite)) {
+                // The cwd itself resolves under a deny rule: never auto-mount it.
+                warning =
+                    "Warning: refusing to auto-mount the working directory (" + cwd_key +
+                    "); it matches filesystem deny rule '" + *deny_hit +
+                    "'. Pass --allow-read/--allow-write to expose specific paths.";
             } else {
                 auto m = make_mount(cwd, cwd, MountMode::ReadWrite, err);
                 if (!m) {

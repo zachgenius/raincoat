@@ -491,3 +491,67 @@ TEST_F(AuditWrite, FailsGracefullyWhenParentIsAFile) {
     EXPECT_FALSE(ok);
     EXPECT_FALSE(err.empty()) << "failure should report a non-empty err";
 }
+
+// ---------------------------------------------------------------------------
+// format_audit_start — rich sectioned-config transparency (profile name,
+// active policy notes, reserved-but-not-enforced notes).
+// ---------------------------------------------------------------------------
+
+TEST(Audit, StartShowsProfileNameWhenSet) {
+    AuditRecord r = sample_record();
+    r.profile_name = "default-agent-sandbox";
+    const std::string out = format_audit_start(r);
+    EXPECT_TRUE(contains(out, "Profile:"));
+    EXPECT_TRUE(contains(out, "default-agent-sandbox"));
+}
+
+TEST(Audit, StartOmitsProfileLineWhenUnset) {
+    AuditRecord r = sample_record();  // profile_name defaults to nullopt
+    const std::string line = line_with_label(format_audit_start(r), "Profile:");
+    EXPECT_TRUE(line.empty()) << "should not print a Profile line without a profile name";
+}
+
+TEST(Audit, StartListsReservedNotes) {
+    AuditRecord r = sample_record();
+    r.reserved_notes = {
+        "network mode \"bridge\" is not yet enforced (phase 2)",
+        "browser isolation configured — not yet enforced (phase 2)",
+    };
+    const std::string out = format_audit_start(r);
+    EXPECT_TRUE(contains(out, "Reserved (configured, not enforced):"));
+    EXPECT_TRUE(contains(out, "network mode \"bridge\""));
+    EXPECT_TRUE(contains(out, "browser isolation configured"));
+}
+
+TEST(Audit, StartOmitsReservedSectionWhenEmpty) {
+    AuditRecord r = sample_record();  // reserved_notes empty
+    EXPECT_FALSE(contains(format_audit_start(r), "Reserved (configured, not enforced):"));
+}
+
+TEST(Audit, StartListsActivePolicyNotes) {
+    AuditRecord r = sample_record();
+    r.active_policy_notes = {
+        "env deny list active (5 name(s) never passed through)",
+        "filesystem deny list active (20 path(s) never mounted)",
+    };
+    const std::string out = format_audit_start(r);
+    EXPECT_TRUE(contains(out, "Active policy:"));
+    EXPECT_TRUE(contains(out, "env deny list active"));
+    EXPECT_TRUE(contains(out, "filesystem deny list active"));
+}
+
+TEST(Audit, StartOmitsActivePolicySectionWhenEmpty) {
+    AuditRecord r = sample_record();  // active_policy_notes empty
+    EXPECT_FALSE(contains(format_audit_start(r), "Active policy:"));
+}
+
+// The new sections must not leak any secret VALUE either (they carry names/counts).
+TEST(Audit, StartRichSectionsLeakNoSecretValues) {
+    AuditRecord r = sample_record();
+    r.profile_name = "p";
+    r.active_policy_notes = {"env deny list active (1 name(s) never passed through)"};
+    r.reserved_notes = {"dns override configured — not yet enforced (phase 2)"};
+    const std::string out = format_audit_start(r);
+    EXPECT_FALSE(contains(out, "sk-SECRETVALUE123"));
+    EXPECT_FALSE(contains(out, "supersecretset"));
+}

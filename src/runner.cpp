@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -101,7 +102,58 @@ Config resolve_config(const CliInvocation& inv,
 
     Config cfg;
     cfg.strict = options.strict;
-    cfg.net = options.net.value_or(cfg.strict ? NetMode::Off : NetMode::Full);
+    // Network resolution + reserved fallback.
+    //   * An explicit net (CLI --net or profile network=full|off) always wins.
+    //   * A reserved restrictive mode (proxy/bridge/guarded) leaves options.net unset but
+    //     sets ext.reserved_net_mode (see load_profile). It is NOT yet enforced, so fail
+    //     CLOSED: fall back to NetMode::Off regardless of strict — never Full. The user
+    //     asked to CONSTRAIN egress; defaulting to unrestricted networking would be the
+    //     exact opposite of that intent (a fail-OPEN downgrade). run() also warns on
+    //     stderr so a user who never reads the audit still learns the mode was unapplied.
+    //   * Otherwise (flat/absent profile) keep the MVP default: Off in strict, Full else.
+    if (options.net.has_value()) {
+        cfg.net = *options.net;
+    } else if (options.ext.reserved_net_mode.has_value()) {
+        cfg.net = NetMode::Off;
+    } else {
+        cfg.net = cfg.strict ? NetMode::Off : NetMode::Full;
+    }
+
+    // Carry the merged rich sectioned config through to Config. run() wires ext into
+    // the live sandbox (identity, env policy, backend toggles, fs deny, tripwire, audit).
+    cfg.ext = options.ext;
+
+    // Reconcile the reserved network-mode note with the RESOLVED network. The note was
+    // recorded at profile-load time, BEFORE resolution knew whether an explicit --net
+    // would override the fail-closed fallback (options.net wins above). Rewriting it from
+    // the actual cfg.net keeps the tamper-proof audit honest: it must never simultaneously
+    // headline "Network: full" AND swear the network fails closed to off. Only assert
+    // fail-closed-to-off when cfg.net is genuinely Off; otherwise state the real outcome.
+    if (cfg.ext.reserved_net_mode.has_value()) {
+        const std::string& mode = *cfg.ext.reserved_net_mode;
+        std::string reconciled;
+        if (cfg.net == NetMode::Off) {
+            reconciled = "network mode \"" + mode +
+                         "\" is not yet enforced (phase 2); egress fails closed to "
+                         "\"off\" (all networking blocked)";
+        } else {
+            reconciled = "network mode \"" + mode +
+                         "\" is not yet enforced (phase 2); network resolved to \"" +
+                         std::string(to_string(cfg.net)) +
+                         "\" (e.g. via an explicit --net), so the configured egress "
+                         "restriction is NOT applied and egress is unrestricted";
+        }
+        const std::string prefix = "network mode \"" + mode + "\"";
+        bool replaced = false;
+        for (auto& note : cfg.ext.reserved_notes) {
+            if (note.rfind(prefix, 0) == 0) {
+                note = reconciled;
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) cfg.ext.reserved_notes.push_back(reconciled);
+    }
 
     cfg.allow_read = options.allow_read;
     cfg.allow_write = options.allow_write;
@@ -206,8 +258,16 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     if (auto it = parent_env.find("HOME"); it != parent_env.end()) real_home = it->second;
 
     // ---- 3. Environment resolution + fake HOME/TMPDIR --------------------
-    EnvResolution env =
-        resolve_env(parent_env, cfg.allow_env, cfg.set_env, cfg.env_defaults, cfg.strict);
+    // Generic identity values come from the profile ([identity]); defaults preserve
+    // the MVP behavior (USER/LOGNAME "user", hostname "sandbox").
+    const std::string identity_user = cfg.ext.username.value_or("user");
+    const std::string identity_host = cfg.ext.hostname.value_or("sandbox");
+    EnvPolicy env_policy;
+    env_policy.deny = cfg.ext.env_deny;
+    env_policy.scrub_patterns = cfg.ext.scrub_patterns;
+    env_policy.username = identity_user;
+    EnvResolution env = resolve_env(parent_env, cfg.allow_env, cfg.set_env,
+                                    cfg.env_defaults, cfg.strict, env_policy);
     env.resolved["HOME"] = fake_home;
     env.resolved["TMPDIR"] = sandbox_tmp;
 
@@ -244,7 +304,7 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
                         return kv.first == "USER";
                     });
     if (!user_set_explicitly) {
-        env.resolved["USER"] = "user";
+        env.resolved["USER"] = identity_user;
         record_set("USER");
     }
 
@@ -259,14 +319,14 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
                         return kv.first == "LOGNAME";
                     });
     if (!logname_set_explicitly) {
-        env.resolved["LOGNAME"] = "user";
+        env.resolved["LOGNAME"] = identity_user;
         record_set("LOGNAME");
     }
 
     // HOSTNAME is a machine fingerprint the child can trivially read to learn the
-    // real host name. The UTS namespace already carries a generic `--hostname
-    // sandbox`, so mirror that in the environment: force HOSTNAME to the same
-    // generic value unless the user explicitly chose one via `--set-env HOSTNAME`.
+    // real host name. The UTS namespace already carries the generic `--hostname
+    // <ext.hostname>` (default "sandbox"), so mirror that same value in the
+    // environment unless the user explicitly chose one via `--set-env HOSTNAME`.
     // Combined with env_guard never copying HOSTNAME through --allow-env, the real
     // host name can never reach the child.
     bool hostname_set_explicitly =
@@ -275,7 +335,7 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
                         return kv.first == "HOSTNAME";
                     });
     if (!hostname_set_explicitly) {
-        env.resolved["HOSTNAME"] = "sandbox";
+        env.resolved["HOSTNAME"] = identity_host;
         record_set("HOSTNAME");
     }
 
@@ -286,6 +346,38 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     for (const auto& kv : font.env) {
         env.resolved[kv.first] = kv.second;
         record_set(kv.first);
+    }
+
+    // ---- 4b. Tripwire bait files (inside the FAKE home only) -------------
+    // When [filesystem.tripwire] is enabled, plant harmless decoy "credential" files
+    // inside the fake home so a probing tool that goes looking for ~/.ssh/id_rsa,
+    // ~/.aws/credentials, etc. finds inert bait instead of nothing. A leading "~/" (or
+    // "/") maps to the fake home root; every write is normalized to stay UNDER the fake
+    // home — the real home is never touched. Best-effort: a failure to plant one bait
+    // file is noted but never fatal.
+    std::size_t tripwire_planted = 0;
+    if (cfg.ext.tripwire_enabled) {
+        namespace fs = std::filesystem;
+        const fs::path home_root = fs::path(fake_home).lexically_normal();
+        for (const auto& spec : cfg.ext.tripwire_files) {
+            std::string rel = spec;
+            if (rel.rfind("~/", 0) == 0) rel = rel.substr(2);
+            else if (!rel.empty() && rel[0] == '~') rel = rel.substr(1);
+            while (!rel.empty() && rel[0] == '/') rel = rel.substr(1);
+            if (rel.empty()) continue;
+            fs::path target = (home_root / rel).lexically_normal();
+            // Containment guard: never escape the fake home (e.g. a "../" spec).
+            const std::string ts = target.string();
+            const std::string hs = home_root.string();
+            if (ts.size() < hs.size() || ts.compare(0, hs.size(), hs) != 0) continue;
+            std::string derr;
+            if (!make_dirs(target.parent_path().string(), derr)) continue;
+            std::ofstream bait(target, std::ios::binary | std::ios::trunc);
+            if (!bait) continue;
+            // Inert content — decidedly NOT a real credential.
+            bait << "# raincoat tripwire decoy — not a real credential\n";
+            if (bait) ++tripwire_planted;
+        }
     }
 
     // ---- 5. Filesystem mount planning ------------------------------------
@@ -331,8 +423,72 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     Config cfg_copy = cfg;
     cfg_copy.workdir = effective_workdir;
 
+    // Fail-safe + honesty: network=off MUST actually isolate the network. A profile
+    // that pairs `network = "off"` with `[backend].unshare_net_when_off = false` would
+    // otherwise suppress the ONLY isolation mechanism (--unshare-net), leaving the child
+    // in the HOST network namespace with full connectivity while the audit still
+    // headlines "Network: off". Rather than emit that dishonest audit (or silently grant
+    // unintended network), force the isolation back on and tell the user their backend
+    // toggle was overridden. The audit backend-overrides note below reads cfg_copy, so
+    // it reflects the forced (honest) value.
+    if (cfg.net == NetMode::Off && !cfg.ext.backend.unshare_net_when_off) {
+        cfg_copy.ext.backend.unshare_net_when_off = true;
+        if (!warning.empty()) warning += "\n";
+        warning +=
+            "Warning: network=off requires network isolation; overriding "
+            "[backend].unshare_net_when_off=false so the sandbox is genuinely offline "
+            "(the child would otherwise share the host network namespace).";
+    }
+
+    // Fail-safe + honesty: raincoat ALWAYS masks the host name from the child. Step 3
+    // unconditionally injects a generic HOSTNAME (cfg.ext.hostname.value_or("sandbox"))
+    // into the env and the audit asserts the real host name can never reach the child.
+    // But the ONLY mechanism that hides the kernel/UTS host name — what gethostname(),
+    // `hostname`, and `uname -n` return — is bwrap's --hostname, which build_bwrap_argv
+    // gates on --unshare-uts. A profile with [backend].unshare_uts=false would therefore
+    // inherit the HOST UTS namespace and leak the real host name while $HOSTNAME says
+    // "sandbox": a dishonest false assurance. This applies to BOTH a configured
+    // [identity].hostname AND the plain default-hostname case (no [identity].hostname),
+    // so the override must NOT be gated on cfg.ext.hostname.has_value(). Mirror the
+    // net=off override: force the UTS namespace back on so the generic hostname genuinely
+    // takes effect, and disclose the forced toggle. build_bwrap_argv and the backend-
+    // overrides audit note both read cfg_copy, so both reflect the forced (honest) value.
+    if (!cfg.ext.backend.unshare_uts) {
+        cfg_copy.ext.backend.unshare_uts = true;
+        if (!warning.empty()) warning += "\n";
+        warning +=
+            "Warning: the sandbox masks the host name (HOSTNAME=" + identity_host +
+            ") but [backend].unshare_uts=false would leave the child in the host UTS "
+            "namespace, leaking the real host name via gethostname()/hostname/uname; "
+            "overriding it to true so the generic hostname is genuinely applied.";
+    }
+
+    // Fail-safe + honesty: a reserved restrictive network mode (proxy/bridge/guarded) is
+    // not yet enforced. resolve_config already failed CLOSED (net forced to Off unless a
+    // CLI --net overrode it), but that only shows in the audit log. Surface it on stderr
+    // too so a user who never opens the audit still learns their egress restriction was
+    // not applied and what networking they actually got.
+    if (cfg.ext.reserved_net_mode.has_value()) {
+        if (!warning.empty()) warning += "\n";
+        warning +=
+            "Warning: network mode \"" + *cfg.ext.reserved_net_mode +
+            "\" is not yet enforced; the configured egress restriction was NOT applied. "
+            "Networking fell back to \"" + std::string(to_string(cfg.net)) +
+            "\" (fail-closed to off unless overridden with --net).";
+    }
+
     // ---- 7. Locate the bubblewrap backend --------------------------------
-    std::optional<std::string> bwrap_path = find_bwrap();
+    // An explicit [backend].bwrap_path (ext.backend.bwrap_path) overrides auto-find,
+    // but only when it names an actual executable — otherwise fall back to the PATH
+    // search so a stale profile path does not hard-fail a runnable host.
+    std::optional<std::string> bwrap_path;
+    if (!cfg.ext.backend.bwrap_path.empty()) {
+        const std::string& bp = cfg.ext.backend.bwrap_path;
+        if (bp.find('/') != std::string::npos && ::access(bp.c_str(), X_OK) == 0) {
+            bwrap_path = bp;  // absolute/relative path to a real executable
+        }
+    }
+    if (!bwrap_path.has_value()) bwrap_path = find_bwrap();
     if (!bwrap_path.has_value()) {
         std::cerr << kBwrapMissing;
         cleanup_root();
@@ -378,6 +534,74 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     rec.timezone = default_or_empty(env.resolved, "TZ");
     rec.locale = default_or_empty(env.resolved, "LANG");
     rec.bwrap_command = redact_argv_for_audit(argv, cfg.command.size());
+
+    // Rich sectioned-config transparency. NAMES/counts only — never a secret VALUE.
+    rec.profile_name = cfg.ext.profile_name;
+    rec.reserved_notes = cfg.ext.reserved_notes;
+    if (!cfg.ext.env_deny.empty()) {
+        rec.active_policy_notes.push_back(
+            "env deny list active (" + std::to_string(cfg.ext.env_deny.size()) +
+            " name(s) never passed through)");
+    }
+    if (!cfg.ext.scrub_patterns.empty()) {
+        rec.active_policy_notes.push_back(
+            "custom env scrub patterns active (" +
+            std::to_string(cfg.ext.scrub_patterns.size()) +
+            " glob(s) extending the built-in sensitive-name rules)");
+    }
+    if (!cfg.ext.fs_deny.empty()) {
+        rec.active_policy_notes.push_back(
+            "filesystem deny list active (" + std::to_string(cfg.ext.fs_deny.size()) +
+            " path(s) never mounted)");
+    }
+    if (cfg.ext.fs_deny_by_default.value_or(false)) {
+        rec.active_policy_notes.push_back(
+            "filesystem deny-by-default: the working directory is not auto-mounted");
+    }
+    {
+        // Backend overrides relative to the safe defaults (BackendConfig defaults).
+        const BackendConfig def;  // MVP defaults
+        // Read the EFFECTIVE backend (cfg_copy), which reflects the net=off isolation
+        // override above, so the note never lists a toggle we silently forced back on.
+        const BackendConfig& b = cfg_copy.ext.backend;
+        std::vector<std::string> flags;
+        if (b.unshare_user != def.unshare_user)
+            flags.push_back(std::string("unshare_user=") + (b.unshare_user ? "on" : "off"));
+        if (b.unshare_cgroup != def.unshare_cgroup)
+            flags.push_back(std::string("unshare_cgroup=") + (b.unshare_cgroup ? "on" : "off"));
+        if (b.unshare_pid != def.unshare_pid)
+            flags.push_back(std::string("unshare_pid=") + (b.unshare_pid ? "on" : "off"));
+        if (b.unshare_ipc != def.unshare_ipc)
+            flags.push_back(std::string("unshare_ipc=") + (b.unshare_ipc ? "on" : "off"));
+        if (b.unshare_uts != def.unshare_uts)
+            flags.push_back(std::string("unshare_uts=") + (b.unshare_uts ? "on" : "off"));
+        if (b.unshare_net_when_off != def.unshare_net_when_off)
+            flags.push_back(std::string("unshare_net_when_off=") +
+                            (b.unshare_net_when_off ? "on" : "off"));
+        if (b.mount_proc != def.mount_proc)
+            flags.push_back(std::string("mount_proc=") + (b.mount_proc ? "on" : "off"));
+        if (b.mount_dev != def.mount_dev)
+            flags.push_back(std::string("mount_dev=") + (b.mount_dev ? "on" : "off"));
+        if (b.mount_tmpfs_tmp != def.mount_tmpfs_tmp)
+            flags.push_back(std::string("mount_tmpfs_tmp=") + (b.mount_tmpfs_tmp ? "on" : "off"));
+        if (b.die_with_parent != def.die_with_parent)
+            flags.push_back(std::string("die_with_parent=") + (b.die_with_parent ? "on" : "off"));
+        if (!b.bwrap_path.empty())
+            flags.push_back("bwrap_path set");
+        if (!flags.empty()) {
+            std::string note = "backend overrides: ";
+            for (std::size_t i = 0; i < flags.size(); ++i) {
+                if (i) note += ", ";
+                note += flags[i];
+            }
+            rec.active_policy_notes.push_back(note);
+        }
+    }
+    if (cfg.ext.tripwire_enabled) {
+        rec.active_policy_notes.push_back(
+            "tripwire bait planted in the fake home (" +
+            std::to_string(tripwire_planted) + " file(s))");
+    }
 
     // ---- 10. Write the audit "start" block (+ any warnings) --------------
     if (!warning.empty()) std::cerr << warning << "\n";
