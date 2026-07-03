@@ -238,6 +238,65 @@ TEST(EnvGuard, UserGenericEvenWhenAbsentFromParent) {
 }
 
 // ===========================================================================
+// resolve_env — identity-protected vars are never copied from parent via allow_env
+// ===========================================================================
+
+// --allow-env USER must NOT resurrect the real login name: USER stays generic.
+TEST(EnvGuard, AllowEnvCannotResurrectRealUser) {
+    std::map<std::string, std::string> parent{{"USER", "realuser"}};
+    std::vector<std::string> allow{"USER"};
+    auto r = resolve_env(parent, allow, kNoSet, kNoDefaults, false);
+
+    EXPECT_EQ(resolvedValue(r, "USER"), "user");
+    EXPECT_NE(resolvedValue(r, "USER"), "realuser");
+    EXPECT_TRUE(has(r.set, "USER"));       // synthetic value => set
+    EXPECT_FALSE(has(r.allowed, "USER"));  // never copied from parent
+    for (const auto& kv : r.resolved) EXPECT_NE(kv.second, "realuser");
+}
+
+// --allow-env LOGNAME must NOT copy the parent's login name. env_guard does not
+// itself inject a generic LOGNAME (the runner does), so the protected name is
+// simply refused entry and lands in scrubbed instead of allowed/resolved.
+TEST(EnvGuard, AllowEnvCannotResurrectRealLogname) {
+    std::map<std::string, std::string> parent{{"LOGNAME", "realuser"}};
+    std::vector<std::string> allow{"LOGNAME"};
+    auto r = resolve_env(parent, allow, kNoSet, kNoDefaults, false);
+
+    EXPECT_FALSE(has(r.allowed, "LOGNAME"));           // never copied from parent
+    EXPECT_NE(resolvedValue(r, "LOGNAME"), "realuser");
+    EXPECT_TRUE(has(r.scrubbed, "LOGNAME"));           // dropped, runner re-injects
+    for (const auto& kv : r.resolved) EXPECT_NE(kv.second, "realuser");
+}
+
+// --allow-env HOSTNAME must NOT copy the parent's host name.
+TEST(EnvGuard, AllowEnvCannotResurrectRealHostname) {
+    std::map<std::string, std::string> parent{{"HOSTNAME", "pop-os"}};
+    std::vector<std::string> allow{"HOSTNAME"};
+    auto r = resolve_env(parent, allow, kNoSet, kNoDefaults, false);
+
+    EXPECT_FALSE(has(r.allowed, "HOSTNAME"));          // never copied from parent
+    EXPECT_NE(resolvedValue(r, "HOSTNAME"), "pop-os");
+    EXPECT_TRUE(has(r.scrubbed, "HOSTNAME"));          // dropped, runner re-injects
+    for (const auto& kv : r.resolved) EXPECT_NE(kv.second, "pop-os");
+}
+
+// --set-env still wins over the identity guard: an explicit value the user chose
+// is honored (it is not the host's real value).
+TEST(EnvGuard, SetEnvStillOverridesIdentityGuard) {
+    std::map<std::string, std::string> parent{{"LOGNAME", "realuser"},
+                                              {"HOSTNAME", "pop-os"}};
+    std::vector<std::string> allow{"LOGNAME", "HOSTNAME"};
+    std::vector<std::pair<std::string, std::string>> set{{"LOGNAME", "ci"},
+                                                         {"HOSTNAME", "ci-box"}};
+    auto r = resolve_env(parent, allow, set, kNoDefaults, false);
+
+    EXPECT_EQ(resolvedValue(r, "LOGNAME"), "ci");
+    EXPECT_EQ(resolvedValue(r, "HOSTNAME"), "ci-box");
+    EXPECT_TRUE(has(r.set, "LOGNAME"));
+    EXPECT_TRUE(has(r.set, "HOSTNAME"));
+}
+
+// ===========================================================================
 // resolve_env — defaults applied as `set`
 // ===========================================================================
 

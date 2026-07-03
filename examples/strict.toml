@@ -1,11 +1,27 @@
 # Raincoat profile — strict isolation.
-# Deny the CWD by default; only the paths listed below are exposed. Network is
-# forced off. Use this for running fully untrusted tools.
+#
+# Deny the working directory by default; network is forced off. Nothing on the
+# host is exposed unless you list it below. Use this for running fully untrusted
+# tools that should not touch your project at all.
+#
+# This file is SAFE TO RUN AS-IS (it grants no paths):
+#   raincoat --profile examples/strict.toml -- true
+# It will warn that no writable paths were allowed and fall back to the fake
+# home. To actually give the tool something, uncomment and ADJUST the paths
+# below to point at real directories in your project.
+
 strict = true
 network = "off"
 
-allow_read = ["./src"]
-allow_write = ["./out"]
+# allow_read  — mounted read-only  at the same absolute path inside the sandbox.
+# allow_write — mounted read-write at the same absolute path inside the sandbox.
+# Every listed path MUST exist or Raincoat will refuse to start.
+allow_read = []
+allow_write = []
+# Example (adjust to your project, then create the dirs):
+#   allow_read = ["/home/you/project/input"]
+#   allow_write = ["/home/you/project/output"]
+
 allow_env = []
 
 [env]

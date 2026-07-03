@@ -58,11 +58,19 @@ Leaf helpers. No raincoat-specific types.
   2. Base safe allowlist copied from parent if present: `PATH`, `TERM`. These go into `allowed`.
   3. `USER` is set to the generic value `"user"` (do NOT leak the real username) -> `set`.
   4. Apply `defaults` (TZ, LANG, LC_ALL, ...) as `set` values.
-  5. For each `allow_env` name: if present in parent, copy value -> `allowed`.
+  5. For each `allow_env` name: if present in parent, copy value -> `allowed`. **EXCEPT** the
+     identity-protected names `USER`, `LOGNAME`, `HOSTNAME`: these are NEVER copied from the parent,
+     even when explicitly `--allow-env`'d, so the real login/host name can never be resurrected.
+     (`USER` keeps its generic value from step 3; `LOGNAME`/`HOSTNAME` are injected generically by
+     the runner — see below.)
   6. For each `set_env` KEY=VALUE: assign -> `set`. **`set_env` overrides `allow_env`** and defaults.
+     `--set-env USER=/LOGNAME=/HOSTNAME=` still wins (a user-chosen value is not the host's real one).
   7. `scrubbed` = every name present in `parent` that is NOT in `resolved` (sorted). Sensitive-pattern
      names that were not explicitly allowed MUST appear here.
   Note: HOME and TMPDIR are injected later by the runner (they depend on the sandbox dir), not here.
+  The runner also injects generic `LOGNAME="user"` and `HOSTNAME="sandbox"` (unless the user chose an
+  explicit `--set-env` value), mirroring the generic `USER`, so the three identity fingerprints stay
+  anonymized end-to-end.
 
 ### fs_guard  (deps: config, util)
 - `std::optional<Mount> make_mount(const std::string& user_path, const std::string& cwd,`
@@ -78,6 +86,24 @@ Leaf helpers. No raincoat-specific types.
   `--allow-read` explicitly. In **strict** mode, never auto-add the cwd. On any missing path, set
   err and return empty. `real_home` empty => no home guard (used by pure tests that inject it).
 - `bool any_writable(const std::vector<Mount>& mounts);`  // used to warn in strict mode
+- `std::string audit_mask_dir(const std::string& audit_log_path, const std::vector<Mount>& mounts);`
+  Returns the audit log's PARENT dir in sandbox space whenever the untrusted child could otherwise
+  write it, so the runner can `--tmpfs`-mask it and keep the child away from the host audit log.
+  **Guiding invariant (attack rounds 1 & 2): the mask may shadow a dir ONLY when doing so loses no
+  user data — i.e. the audit dir is raincoat's own `.raincoat`** (raincoat creates/owns it, so an
+  empty overlay hides nothing the user placed there and discards no legitimate child output). The
+  "raincoat-owned" test is keyed on the dir's basename being `.raincoat` (the default audit dir is
+  `<cwd>/.raincoat`). So masking applies to a raincoat-owned `.raincoat` that is child-writable, whether
+  reached as a **proper descendant** of a read-write mount (normally the auto-mounted cwd) or exposed
+  as its own **lone** read-write mount root (e.g. `--strict --allow-write <cwd>/.raincoat`).
+  Returns `""` when no masking is needed/wanted: the audit dir is not inside any writable mount; only a
+  read-only mount covers it; the audit dir is **NOT** raincoat-owned (a custom `--audit-log` pointed
+  into a user data dir the user `--allow-write`'d, e.g.
+  `--strict --allow-write <dir> --audit-log <dir>/run.log`) — masking it would hide the user's real
+  files and discard the child's legitimate writes, so we drop tamper-protection for that one custom log
+  rather than ever destroy user data; or the user redundantly exposed the exact `.raincoat` as its own
+  read-write mount root **while a broader writable mount (the cwd) also covers it** — that deliberate
+  mount overrides the default mask so the child sees the dir's real contents.
 - The cwd==home refusal should be surfaced to the user; expose it via a `std::string& warning`
   out-param on plan_mounts OR a companion `bool cwd_is_home(cwd, real_home)` predicate the runner
   checks — implementer's choice, but the warning MUST reach the user and the audit log.
@@ -91,23 +117,35 @@ Leaf helpers. No raincoat-specific types.
   `  const std::string& fonts_conf_source, std::string& err);`
   If `!enabled`: return {status=Disabled}. Else create `<sandbox_dir>/fontconfig/`, write
   `fonts.conf` (copy `fonts_conf_source` if it exists and is readable, otherwise write a minimal
-  embedded fallback), and set env: `FONTCONFIG_PATH=<dir>`, `FONTCONFIG_FILE=<dir>/fonts.conf`.
-  Status Enabled on full success, BestEffort if the file could be created but the source copy
-  failed, Unavailable if the directory could not be created. Fill `note` for the audit log.
+  embedded fallback), and set env: `FONTCONFIG_PATH=<dir>`, `FONTCONFIG_FILE=<dir>/fonts.conf`,
+  and a minimal `XDG_DATA_DIRS=/usr/local/share:/usr/share` (system dirs under the read-only `/usr`
+  bind, so the child never inherits the host's data-dir list). Status Enabled on full success,
+  BestEffort if the file could be created but the source copy failed, Unavailable if the directory
+  could not be created. Fill `note` for the audit log. The runner binds `<dir>` read-only into the
+  sandbox (see bwrap) so `FONTCONFIG_FILE` actually resolves inside the namespace.
 
 ### bwrap  (deps: config, util) — PURE argv assembly, no side effects
 - `std::vector<std::string> build_bwrap_argv(const std::string& bwrap_path, const Config& cfg,`
   `  const std::vector<Mount>& mounts, const EnvResolution& env,`
-  `  const std::string& fake_home, const std::string& sandbox_tmp, bool bind_resolv_conf);`
+  `  const std::string& fake_home, const std::string& sandbox_tmp, bool bind_resolv_conf,`
+  `  const std::string& font_dir = "", const std::string& audit_mask_dir = "",`
+  `  const std::string& sandbox_out = "");`
   Emits (argv[0] = bwrap_path):
   - `--die-with-parent`
   - namespace isolation: `--unshare-pid --unshare-uts --unshare-ipc`
+  - `--hostname sandbox` (generic host name; requires the `--unshare-uts` above so the real machine
+    name never leaks through the fresh UTS namespace)
   - `--unshare-net` iff `cfg.net == NetMode::Off`
   - base system: `--ro-bind /usr /usr`, `--symlink usr/bin /bin`, `--symlink usr/lib /lib`,
     `--symlink usr/lib64 /lib64`, `--symlink usr/sbin /sbin`, `--proc /proc`, `--dev /dev`
   - `--ro-bind-try /etc/ssl /etc/ssl` and (iff bind_resolv_conf) `--ro-bind-try /etc/resolv.conf /etc/resolv.conf`
-  - `--bind <fake_home> <fake_home>`, `--bind <sandbox_tmp> <sandbox_tmp>`
+  - `--bind <fake_home> <fake_home>`, `--bind <sandbox_tmp> <sandbox_tmp>`, and (iff `sandbox_out`
+    non-empty) `--bind <sandbox_out> <sandbox_out>` — the writable scratch `out` dir (SPEC `<temp>/out`)
+  - (iff `font_dir` non-empty) `--ro-bind <font_dir> <font_dir>` so `FONTCONFIG_FILE/PATH` resolve
   - for each Mount: `--ro-bind`/`--bind <host> <sandbox>` per mode
+  - (iff `audit_mask_dir` non-empty) `--tmpfs <audit_mask_dir>` — emitted AFTER the user mounts so the
+    parent (writable cwd) mount already exists; shadows the audit-log dir so the untrusted child
+    cannot read/forge/erase the host audit log. The runner computes this via `fs_guard::audit_mask_dir`.
   - `--clearenv` then a `--setenv <K> <V>` pair for **every** entry in `env.resolved`
     (iterate deterministically — std::map is ordered — so tests are stable)
   - `--chdir <cfg.workdir>`
@@ -207,14 +245,19 @@ Leaf helpers. No raincoat-specific types.
   net default = `Off` if strict else `Full`; env_defaults gains TZ=UTC, LANG/LC_ALL=en_US.UTF-8
   when not already present; fontconfig default true; workdir default = cwd (non-strict) or a
   sentinel resolved to the fake home at run time (strict, when cwd is not mounted); audit_log
-  default = `.raincoat/audit.log` under cwd (or temp dir when no project dir is writable).
+  default = `.raincoat/audit.log` under cwd (best-effort: skipped with a non-fatal note when that
+  directory is not writable — the MVP has no temp-dir fallback).
 - `int run(const Config& cfg, const std::map<std::string,std::string>& parent_env,`
   `  const std::string& cwd, const std::string& assets_dir, std::string& err);`
-  Orchestrates: mkdtemp sandbox; create home/user, tmp, out; resolve_env (+ inject HOME, TMPDIR,
-  generic USER); font setup (merge env); plan_mounts (validate; propagate the exact missing-path
-  error); pick workdir; build_bwrap_argv; locate bwrap (missing -> the bubblewrap error text);
-  write audit start; fork/exec bwrap; wait; write audit end; cleanup temp unless keep_temp;
-  return the child's exit code (128+signal on signal death).
+  Orchestrates: mkdtemp sandbox; create home/user, tmp, out (out is bound writable into the sandbox);
+  resolve_env (+ inject HOME, TMPDIR, generic USER, and generic LOGNAME/HOSTNAME unless `--set-env`
+  chose them); font setup (merge env, incl. XDG_DATA_DIRS); plan_mounts (validate; propagate the exact
+  missing-path error); pick workdir; compute `audit_mask_dir`; build_bwrap_argv (font dir bound RO,
+  out dir bound RW, audit dir tmpfs-masked); locate bwrap (missing -> the bubblewrap error text);
+  write audit start; fork/exec bwrap; wait; write audit end; cleanup temp unless keep_temp.
+  A SIGINT/SIGTERM/SIGHUP handler forwards the signal to the bwrap child so `waitpid` returns and the
+  normal `cleanup_root()` still removes the temp tree (no leak on interruption). Returns the child's
+  exit code (128+signal on signal death).
 
 ### main  (deps: cli, runner, doctor, init, report)
 Parse argv -> dispatch. Prints help/version. Returns the child exit code for Run; 0/nonzero for

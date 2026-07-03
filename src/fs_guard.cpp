@@ -143,4 +143,104 @@ bool any_writable(const std::vector<Mount>& mounts) {
     return false;
 }
 
+std::string audit_mask_dir(const std::string& audit_log_path,
+                           const std::vector<Mount>& mounts) {
+    fs::path parent = fs::path(audit_log_path).parent_path();
+    if (parent.empty()) {
+        return {};
+    }
+    // The audit dir usually does not exist yet when this runs (the runner writes
+    // the log after building argv), so fall back to a lexically-normal absolute
+    // form. cwd is already canonical on Linux, so this matches the mount host_path.
+    fs::path parent_canon = canon_or_lexical(parent);
+
+    // Classify every mount that COVERS the audit dir (its root is the audit dir or
+    // a proper ancestor of it). We need the full picture before deciding, because
+    // the mask/no-mask choice depends on the *combination* of covering mounts, not
+    // just the first one found.
+    const Mount* rw_exact = nullptr;   // a RW mount rooted EXACTLY at the audit dir
+    const Mount* rw_proper = nullptr;  // a RW mount that is a PROPER ancestor of it
+    for (const auto& m : mounts) {
+        if (m.mode != MountMode::ReadWrite) {
+            // Read-only mounts: the child cannot write through them, so they never
+            // create a tamper path and never need a mask.
+            continue;
+        }
+        fs::path host = canon_or_lexical(fs::path(m.host_path));
+        if (!is_ancestor_or_equal(host, parent_canon)) {
+            continue;  // does not cover the audit dir
+        }
+        if (host == parent_canon) {
+            rw_exact = &m;
+        } else {
+            rw_proper = &m;
+        }
+    }
+
+    // No writable mount reaches the audit dir: the child cannot tamper (it is
+    // outside every RW mount, or only a read-only mount covers it). Nothing to do.
+    if (rw_exact == nullptr && rw_proper == nullptr) {
+        return {};
+    }
+
+    // Guiding invariant (attack rounds 1 & 2): the tmpfs mask may shadow a directory
+    // ONLY when doing so loses no user data -- i.e. the audit dir is raincoat's own
+    // `.raincoat` (raincoat creates/owns it, so an empty overlay hides nothing the
+    // user put there and discards no legitimate child output). For ANY other directory
+    // the user pointed a custom --audit-log into, masking would tmpfs-hide the user's
+    // real files and silently discard the child's writes on teardown, so we must NOT
+    // mask it -- we drop tamper-protection for that one custom log rather than destroy
+    // data. The default audit dir is `<cwd>/.raincoat`, so "raincoat-owned" is keyed on
+    // the dir's basename being `.raincoat`.
+    const bool raincoat_owned = (parent_canon.filename() == ".raincoat");
+
+    // Carve-out: the user explicitly exposed the exact audit dir as its own RW mount
+    // root WHILE a broader writable mount (typically the auto-mounted cwd) also covers
+    // it. That redundant, deliberate exact mount is the user overriding the default
+    // mask to see the dir's real contents -- honor the intent and do NOT shadow it.
+    if (rw_exact != nullptr && rw_proper != nullptr) {
+        return {};
+    }
+
+    // Mask ONLY raincoat-owned `.raincoat`. Any other directory the user pointed a
+    // custom --audit-log into -- whether it is its own explicit RW mount root
+    // (rw_exact) or merely a proper descendant of the auto-mounted cwd (rw_proper) --
+    // holds the user's own files, so tmpfs-shadowing it would hide those files and
+    // discard the child's legitimate writes on teardown. Drop tamper-protection for
+    // that one custom log rather than destroy user data.
+    if (!raincoat_owned) {
+        return {};
+    }
+
+    // Raincoat-owned audit dir that the child could otherwise tamper with: return it
+    // in sandbox space so the runner can tmpfs-shadow it. Masking loses no user data
+    // (raincoat owns the dir) and keeps the host audit log tamper-proof. Translate
+    // through the covering mount (the exact root if the dir is itself a mount, else the
+    // proper-ancestor mount).
+    const Mount* via = (rw_exact != nullptr) ? rw_exact : rw_proper;
+    fs::path host = canon_or_lexical(fs::path(via->host_path));
+    fs::path rel = parent_canon.lexically_relative(host);
+    fs::path sandbox = fs::path(via->sandbox_path) / rel;
+    return sandbox.lexically_normal().string();
+}
+
+bool audit_dir_child_writable(const std::string& audit_log_path,
+                              const std::vector<Mount>& mounts) {
+    fs::path parent = fs::path(audit_log_path).parent_path();
+    if (parent.empty()) {
+        return false;
+    }
+    fs::path parent_canon = canon_or_lexical(parent);
+    for (const auto& m : mounts) {
+        if (m.mode != MountMode::ReadWrite) {
+            continue;  // child cannot write through a read-only mount
+        }
+        fs::path host = canon_or_lexical(fs::path(m.host_path));
+        if (is_ancestor_or_equal(host, parent_canon)) {
+            return true;  // a writable mount roots at or above the audit dir
+        }
+    }
+    return false;
+}
+
 }  // namespace raincoat

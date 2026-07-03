@@ -1,11 +1,27 @@
 # Raincoat profile — AI coding agent.
-# Non-strict: the CWD is mounted read-write so the agent can edit the project,
-# network is on for model/API access, and a single API key is passed through.
+#
+# Non-strict: the current working directory is mounted read-write so the agent
+# can read and edit your project, network is on for model/API access, and one or
+# more API keys are passed through explicitly.
+#
+# This file is SAFE TO RUN AS-IS from inside a project directory:
+#   cd /path/to/your/project
+#   raincoat --profile /path/to/ai-agent.toml -- your-agent ...
+# "." resolves to the directory you run from, which always exists. ADJUST the
+# allow_env list to the credential names your agent actually needs — only the
+# names listed here are copied from your real environment; everything else
+# (other tokens, keys, secrets) is scrubbed.
+
 strict = false
 network = "full"
 
-allow_read = ["./"]
-allow_write = ["./", "./out"]
+# "." = the directory you launch Raincoat from (your project). Add more absolute
+# paths here if the agent needs to reach directories outside the project.
+allow_read = ["."]
+allow_write = ["."]
+
+# Only these env vars are forwarded from the parent (if present). Trim to match
+# the one provider you use; drop any you do not need.
 allow_env = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]
 
 [env]

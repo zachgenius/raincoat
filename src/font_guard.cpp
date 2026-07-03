@@ -121,6 +121,12 @@ FontSetup setup_fontconfig(const std::string& sandbox_dir, bool enabled,
 
     result.env["FONTCONFIG_PATH"] = dir;
     result.env["FONTCONFIG_FILE"] = conf;
+    // Pin XDG_DATA_DIRS to a minimal, known-good value (SPEC "Fonts / fontconfig").
+    // The host's XDG_DATA_DIRS is scrubbed from the child env, and fontconfig (plus
+    // other toolkits) consults these dirs for font/data lookups. We point only at the
+    // system data dirs under the read-only /usr bind, so the child never inherits the
+    // host's (potentially fingerprinting) data-dir list.
+    result.env["XDG_DATA_DIRS"] = "/usr/local/share:/usr/share";
     return result;
 }
 

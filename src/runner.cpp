@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -63,6 +64,21 @@ std::string default_or_empty(const std::map<std::string, std::string>& m,
     return it == m.end() ? std::string() : it->second;
 }
 
+// Terminating-signal handling for sandbox cleanup. When raincoat is interrupted
+// while the bwrap child is running (Ctrl-C, `kill`, terminal hangup), the default
+// disposition would kill raincoat before cleanup_root() runs, leaking the whole
+// sandbox tree under /tmp. Instead we catch SIGINT/SIGTERM/SIGHUP and forward the
+// signal to the bwrap child: that makes waitpid() return, so the normal cleanup
+// path (remove the sandbox root) still executes. remove_all() is NOT async-signal-
+// safe, so it is deliberately kept out of the handler.
+volatile std::sig_atomic_t g_child_pid = 0;
+volatile std::sig_atomic_t g_pending_signal = 0;
+
+void forward_terminating_signal(int sig) {
+    g_pending_signal = sig;
+    if (g_child_pid > 0) ::kill(static_cast<pid_t>(g_child_pid), sig);
+}
+
 }  // namespace
 
 Config resolve_config(const CliInvocation& inv,
@@ -116,6 +132,34 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         const std::string& cwd, const std::string& assets_dir, std::string& err) {
     err.clear();
 
+    // ---- 0. Install terminating-signal handlers FIRST -------------------
+    // These MUST be armed before mkdtemp() creates the sandbox root: a SIGINT/
+    // SIGTERM/SIGHUP arriving in the window between root creation and the fork below
+    // would otherwise hit the default (process-killing) disposition and leak the whole
+    // /tmp/raincoat-* tree because cleanup_root() never runs. With the handlers armed
+    // here, such a signal is merely recorded (g_pending_signal) — every code path from
+    // mkdtemp onward funnels through cleanup_root(), and once the child exists the
+    // signal is forwarded to it (see the fork section) so waitpid() returns and the
+    // normal teardown still runs. No process-terminating disposition can fire between
+    // root creation and teardown.
+    g_child_pid = 0;
+    g_pending_signal = 0;
+    struct sigaction sa;
+    std::memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = forward_terminating_signal;
+    ::sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;  // no SA_RESTART: let waitpid() return EINTR so we re-check.
+    struct sigaction old_int, old_term, old_hup;
+    ::sigaction(SIGINT, &sa, &old_int);
+    ::sigaction(SIGTERM, &sa, &old_term);
+    ::sigaction(SIGHUP, &sa, &old_hup);
+    auto restore_signals = [&]() {
+        ::sigaction(SIGINT, &old_int, nullptr);
+        ::sigaction(SIGTERM, &old_term, nullptr);
+        ::sigaction(SIGHUP, &old_hup, nullptr);
+        g_child_pid = 0;
+    };
+
     // ---- 1. Create the sandbox root + fixed sub-tree ---------------------
     const char* tmpdir_env = std::getenv("TMPDIR");
     std::string base = (tmpdir_env && *tmpdir_env) ? tmpdir_env : "/tmp";
@@ -125,12 +169,15 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     if (::mkdtemp(tbuf.data()) == nullptr) {
         err = "Error: could not create sandbox directory: " +
               std::string(std::strerror(errno));
+        restore_signals();
         return 1;
     }
     const std::string root(tbuf.data());
 
     const std::string fake_home = root + "/home/user";
     const std::string sandbox_tmp = root + "/tmp";
+    // Dedicated writable scratch dir (SPEC `<temp>/out`), bound into the sandbox so
+    // the child has a private output area that is destroyed with the sandbox root.
     const std::string sandbox_out = root + "/out";
 
     // Remove the sandbox root unless the user asked to keep it.
@@ -149,6 +196,7 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             !make_dirs(sandbox_out, derr)) {
             err = "Error: could not set up sandbox: " + derr;
             cleanup_root();
+            restore_signals();
             return 1;
         }
     }
@@ -200,6 +248,37 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         record_set("USER");
     }
 
+    // LOGNAME is the other common source of the login name (many programs derive
+    // the username from it), so it needs the same guard as USER: force the generic
+    // value unless the user explicitly chose one via `--set-env LOGNAME=...`.
+    // Without this, `--allow-env LOGNAME` would copy the real login name verbatim
+    // and defeat the never-leak-the-real-username invariant.
+    bool logname_set_explicitly =
+        std::any_of(cfg.set_env.begin(), cfg.set_env.end(),
+                    [](const std::pair<std::string, std::string>& kv) {
+                        return kv.first == "LOGNAME";
+                    });
+    if (!logname_set_explicitly) {
+        env.resolved["LOGNAME"] = "user";
+        record_set("LOGNAME");
+    }
+
+    // HOSTNAME is a machine fingerprint the child can trivially read to learn the
+    // real host name. The UTS namespace already carries a generic `--hostname
+    // sandbox`, so mirror that in the environment: force HOSTNAME to the same
+    // generic value unless the user explicitly chose one via `--set-env HOSTNAME`.
+    // Combined with env_guard never copying HOSTNAME through --allow-env, the real
+    // host name can never reach the child.
+    bool hostname_set_explicitly =
+        std::any_of(cfg.set_env.begin(), cfg.set_env.end(),
+                    [](const std::pair<std::string, std::string>& kv) {
+                        return kv.first == "HOSTNAME";
+                    });
+    if (!hostname_set_explicitly) {
+        env.resolved["HOSTNAME"] = "sandbox";
+        record_set("HOSTNAME");
+    }
+
     // ---- 4. Fontconfig isolation (best-effort) ---------------------------
     std::string ferr;
     FontSetup font = setup_fontconfig(root, cfg.fontconfig_enabled,
@@ -217,6 +296,7 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         std::cerr << err << "\n";
         err.clear();  // already surfaced; don't let the caller double-print.
         cleanup_root();
+        restore_signals();
         return 1;
     }
     if (cfg.strict && !any_writable(mounts)) {
@@ -256,13 +336,31 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     if (!bwrap_path.has_value()) {
         std::cerr << kBwrapMissing;
         cleanup_root();
+        restore_signals();
         return 127;
     }
 
     // ---- 8. Assemble the bwrap argv --------------------------------------
+    // Mask the audit-log directory inside the sandbox when it lands in a writable
+    // mount (normally the auto-mounted cwd), so the untrusted child cannot forge or
+    // erase the log raincoat writes. Empty when the audit dir is unreachable by the
+    // child (no masking needed).
+    std::string mask_dir = audit_mask_dir(cfg.audit_log_path, mounts);
+    // Footgun guard: the child CAN write the audit dir (a writable mount reaches it)
+    // but we are NOT masking it — either a custom --audit-log points into a user
+    // --allow-write'd data dir, or the user redundantly --allow-write'd .raincoat. The
+    // log is not tamper-proof for this run, so surface that instead of failing silently.
+    if (mask_dir.empty() && audit_dir_child_writable(cfg.audit_log_path, mounts)) {
+        if (!warning.empty()) warning += "\n";
+        warning +=
+            "Warning: the audit log (" + cfg.audit_log_path +
+            ") is inside a writable path the sandboxed command can reach; it is NOT "
+            "tamper-protected and the command could forge or erase it. Use the default "
+            "--audit-log location (.raincoat/) to keep the log tamper-proof.";
+    }
     std::vector<std::string> argv =
         build_bwrap_argv(*bwrap_path, cfg_copy, mounts, env, fake_home, sandbox_tmp,
-                         binds_resolv_conf(cfg.net));
+                         binds_resolv_conf(cfg.net), font.dir, mask_dir, sandbox_out);
 
     // ---- 9. Audit record -------------------------------------------------
     AuditRecord rec;
@@ -293,6 +391,18 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     }
 
     // ---- 11. Fork + exec the sandboxed command ---------------------------
+    // If a terminating signal already arrived during startup (handlers were armed in
+    // step 0, before mkdtemp), abort before launching the child: tear down the sandbox
+    // and exit with the conventional 128+signo code. Without this the child would spawn
+    // only to be immediately killed by the forwarded signal below; bailing here is
+    // cleaner and skips the pointless bwrap launch.
+    if (g_pending_signal != 0) {
+        int sig = static_cast<int>(g_pending_signal);
+        cleanup_root();
+        restore_signals();
+        return 128 + sig;
+    }
+
     std::vector<char*> cargv;
     cargv.reserve(argv.size() + 1);
     for (auto& s : argv) cargv.push_back(const_cast<char*>(s.c_str()));
@@ -301,6 +411,7 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     pid_t pid = ::fork();
     if (pid < 0) {
         err = "Error: fork failed: " + std::string(std::strerror(errno));
+        restore_signals();
         cleanup_root();
         return 1;
     }
@@ -311,14 +422,26 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         _exit(127);
     }
 
+    // Publish the child pid to the handler; if a signal already fired in the tiny
+    // window before this assignment, forward it now so we don't swallow it.
+    g_child_pid = pid;
+    if (g_pending_signal != 0) ::kill(pid, static_cast<int>(g_pending_signal));
+
     int status = 0;
     while (::waitpid(pid, &status, 0) < 0) {
         if (errno != EINTR) {
             err = "Error: waitpid failed: " + std::string(std::strerror(errno));
+            restore_signals();
             cleanup_root();
             return 1;
         }
     }
+    // The child has been reaped: clear the published pid as the VERY FIRST action so
+    // a terminating signal arriving before restore_signals() re-installs the default
+    // dispositions cannot make the handler kill() a now-reaped (possibly kernel-
+    // recycled) pid. forward_terminating_signal only signals when g_child_pid > 0.
+    g_child_pid = 0;
+    restore_signals();
 
     int exit_code;
     if (WIFEXITED(status)) {

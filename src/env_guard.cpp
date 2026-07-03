@@ -17,6 +17,17 @@ bool has_suffix(const std::string& s, const std::string& suffix) {
            s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
+// Identity fingerprints whose REAL value must never reach the child, regardless
+// of what the user requests. resolve_env forces USER to a generic value; LOGNAME
+// and HOSTNAME are injected with generic values later by the runner (it owns the
+// synthetic host/login identity). For all three we additionally refuse to copy the
+// parent's value through --allow-env, so an explicit `--allow-env USER` (etc.)
+// can never resurrect the real login/host name. `--set-env NAME=...` is still
+// honored — that is a value the user deliberately chose, not the host's.
+bool is_identity_protected(const std::string& name) {
+    return name == "USER" || name == "LOGNAME" || name == "HOSTNAME";
+}
+
 }  // namespace
 
 bool is_sensitive_env(const std::string& name) {
@@ -75,8 +86,13 @@ EnvResolution resolve_env(const std::map<std::string, std::string>& parent,
         put_set(kv.first, kv.second);
     }
 
-    // 5. --allow-env: copy from parent only if present -> allowed.
+    // 5. --allow-env: copy from parent only if present -> allowed. Identity-
+    //    protected names (USER/LOGNAME/HOSTNAME) are NEVER copied from the parent,
+    //    even when explicitly allow-env'd — the real login/host name must not leak.
+    //    USER keeps its generic value from step 3; LOGNAME/HOSTNAME are injected by
+    //    the runner. A later --set-env for one of these still wins (step 6).
     for (const auto& name : allow_env) {
+        if (is_identity_protected(name)) continue;
         auto it = parent.find(name);
         if (it != parent.end()) {
             put_allowed(name, it->second);

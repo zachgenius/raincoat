@@ -26,7 +26,10 @@ std::vector<std::string> build_bwrap_argv(const std::string& bwrap_path, const C
                                           const EnvResolution& env,
                                           const std::string& fake_home,
                                           const std::string& sandbox_tmp,
-                                          bool bind_resolv_conf) {
+                                          bool bind_resolv_conf,
+                                          const std::string& font_dir,
+                                          const std::string& audit_mask_dir,
+                                          const std::string& sandbox_out) {
     std::vector<std::string> a;
     auto p1 = [&](const std::string& x) { a.push_back(x); };
     auto p2 = [&](const std::string& x, const std::string& y) {
@@ -46,6 +49,9 @@ std::vector<std::string> build_bwrap_argv(const std::string& bwrap_path, const C
     p1("--die-with-parent");
     p1("--unshare-pid");
     p1("--unshare-uts");
+    // Give the sandbox a generic hostname so the real host name (a trivially-read
+    // machine fingerprint) never leaks in through the fresh UTS namespace.
+    p2("--hostname", "sandbox");
     p1("--unshare-ipc");
     if (cfg.net == NetMode::Off) p1("--unshare-net");
 
@@ -65,12 +71,29 @@ std::vector<std::string> build_bwrap_argv(const std::string& bwrap_path, const C
     // Sandbox-writable dirs.
     p3("--bind", fake_home, fake_home);
     p3("--bind", sandbox_tmp, sandbox_tmp);
+    // Dedicated writable scratch area (SPEC `<temp>/out`). Bound identity so the
+    // child has a private, disposable place to write output that lives on the host
+    // temp tree and is torn down with the sandbox.
+    if (!sandbox_out.empty()) p3("--bind", sandbox_out, sandbox_out);
+
+    // Curated fontconfig dir (read-only). It lives outside fake_home/sandbox_tmp,
+    // so without an explicit bind the FONTCONFIG_FILE/PATH we hand the child would
+    // point at a path that does not exist inside the namespace.
+    if (!font_dir.empty()) p3("--ro-bind", font_dir, font_dir);
 
     // User-requested mounts, in order.
     for (const auto& m : mounts) {
         const char* flag = (m.mode == MountMode::ReadWrite) ? "--bind" : "--ro-bind";
         p3(flag, m.host_path, m.sandbox_path);
     }
+
+    // Shadow the audit-log directory with a fresh tmpfs so the untrusted child
+    // cannot read, forge, or erase the host audit log that raincoat writes. This
+    // MUST come after the user mounts (its parent mount must already exist) — the
+    // tmpfs then hides the real audit dir that would otherwise sit in the writable
+    // cwd mount. The genuine log lives on the host and is written by the raincoat
+    // parent process, which is outside this namespace.
+    if (!audit_mask_dir.empty()) p2("--tmpfs", audit_mask_dir);
 
     // Environment: clear then set each resolved entry (std::map => sorted order).
     p1("--clearenv");

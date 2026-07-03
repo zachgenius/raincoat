@@ -169,6 +169,19 @@ TEST(FontGuard, EnabledSetsFontconfigEnvVars) {
     EXPECT_EQ(r.env.at("FONTCONFIG_FILE"), (fs::path(r.dir) / "fonts.conf").string());
 }
 
+// XDG_DATA_DIRS is pinned to a minimal, system-only value (SPEC) so the child
+// never inherits the host's data-dir list; it points under the read-only /usr bind.
+TEST(FontGuard, EnabledSetsMinimalXdgDataDirs) {
+    TmpSandbox sb;
+    ASSERT_FALSE(sb.dir.empty());
+    std::string err;
+
+    FontSetup r = setup_fontconfig(sb.dir, true, "", err);
+
+    ASSERT_EQ(r.env.count("XDG_DATA_DIRS"), 1u);
+    EXPECT_EQ(r.env.at("XDG_DATA_DIRS"), "/usr/local/share:/usr/share");
+}
+
 // The written file must actually exist where the env says it does.
 TEST(FontGuard, EnabledEnvFilePointsAtRealFile) {
     TmpSandbox sb;

@@ -1,0 +1,503 @@
+# .raincoat.toml — configuration DEMO (illustrative params, NOT a final/frozen schema)
+#
+# This file DEMONSTRATES the breadth of config-driven "what to cover" that Raincoat is
+# designed around. Field names and sections here are directional examples and may change;
+# do not treat any single key as a hard contract. The design goal is a forward-compatible,
+# config-driven profile layer that ACCEPTS a rich sectioned config like this WITHOUT error,
+# applies the sections that map to implemented behavior, and gracefully RESERVES (parses +
+# tolerates, does not enforce) sections that are future/not-yet-implemented. Unknown keys
+# should be tolerated, not fatal.
+#
+# Support status (see docs/PROGRESS.md for the live tracker):
+#   APPLIED NOW (phase 1.5): profile_name, strict, network(off|full), keep_temp, workdir,
+#     [identity], [filesystem] (allow_read/allow_write/deny/mode/fake_home/create_standard_dirs),
+#     [environment] (clear/allow/deny/scrub_patterns/[environment.set]), [fontconfig],
+#     [audit] (log_file/redact_*/log_*/format), [backend] (bwrap_path/unshare_*/mount_*/
+#     die_with_parent; seccomp reserved), [init], [report].
+#   PARSED + RESERVED (honest "configured, not yet enforced"): [filesystem.tripwire], [browser],
+#     [dns], [network_policy], [proxy] mechanism, network modes "proxy"/"bridge"/"guarded".
+#   PHASE 2 (egress bridge forwarding): [egress] + [[egress.bridge]] actual HTTP forwarding.
+#
+# Backward compatible: the flat MVP schema (top-level allow_read/allow_write/allow_env,
+# [env], [fontconfig].enabled, [audit].log_file) still loads.
+
+profile_name = "default-agent-sandbox"
+strict = true
+
+# Network mode:
+# - "off"      : no network access
+# - "full"     : normal network access
+# - "proxy"    : inject proxy env vars only
+# - "bridge"   : start Raincoat egress bridge and expose child endpoints
+# - "guarded"  : future built-in allow/block policy mode
+network = "bridge"
+
+# Whether Raincoat should keep temporary sandbox directories after exit.
+# Useful for debugging. Should normally be false.
+keep_temp = false
+
+# Working directory inside the sandbox.
+# In strict mode, the real current directory is not automatically mounted.
+workdir = "/workspace"
+
+
+# --------------------------------------------------------------------
+# Identity / fingerprint shaping
+# --------------------------------------------------------------------
+
+[identity]
+# Generic identity values exposed to the child process.
+username = "user"
+hostname = "workstation"
+home = "/home/user"
+
+# Prefer low-information, generic values.
+timezone = "UTC"
+locale = "en_US.UTF-8"
+language = "en-US"
+
+# Optional future fields.
+platform_label = "generic-linux"
+persona = "generic-ci"
+
+
+# --------------------------------------------------------------------
+# Filesystem policy
+# --------------------------------------------------------------------
+
+[filesystem]
+# In strict mode, do not mount the real HOME.
+fake_home = true
+
+# If true, Raincoat should create:
+#   /home/user
+#   /tmp
+#   /workspace
+# inside the sandbox.
+create_standard_dirs = true
+
+# Default mount strategy:
+# - "deny-by-default": only explicit allow_read / allow_write paths are mounted
+# - "project-rw": current project mounted read-write by default
+mode = "deny-by-default"
+
+# Read-only mounts from host into sandbox.
+#
+# Recommended:
+# - Mount only the project files the tool needs.
+# - Avoid mounting your whole home directory.
+allow_read = [
+  "./README.md",
+  "./package.json",
+  "./Cargo.toml",
+  "./src"
+]
+
+# Read-write mounts from host into sandbox.
+#
+# Recommended:
+# - Put generated output in a dedicated folder.
+# - Avoid allowing writes to your whole project unless needed.
+allow_write = [
+  "./out",
+  "./target",
+  "./.raincoat-work"
+]
+
+# Paths that should never be mounted by default.
+# These are mostly documentation/policy hints for Raincoat and audit output.
+deny = [
+  "~/.ssh",
+  "~/.aws",
+  "~/.azure",
+  "~/.config/gcloud",
+  "~/.kube",
+  "~/.gnupg",
+  "~/.docker",
+  "~/.npmrc",
+  "~/.pypirc",
+  "~/.git-credentials",
+  "~/.gitconfig",
+  "~/.config/gh",
+  "~/.config/google-chrome",
+  "~/.config/chromium",
+  "~/.mozilla",
+  "~/Library/Application Support/Google/Chrome",
+  "~/Library/Application Support/Firefox",
+  "~/Documents",
+  "~/Desktop",
+  "~/Downloads"
+]
+
+# Optional future feature:
+# Create fake bait files inside fake HOME to detect probing.
+[filesystem.tripwire]
+enabled = false
+fake_sensitive_files = [
+  "~/.ssh/id_rsa",
+  "~/.aws/credentials",
+  "~/.config/gcloud/application_default_credentials.json"
+]
+
+
+# --------------------------------------------------------------------
+# Environment policy
+# --------------------------------------------------------------------
+
+[environment]
+# Do not inherit the parent environment wholesale.
+clear = true
+
+# Safe-ish environment variables allowed from the host.
+# Keep this list small.
+allow = [
+  "PATH",
+  "TERM"
+]
+
+# Variables explicitly denied even if matching broad allow rules.
+deny = [
+  "SSH_AUTH_SOCK",
+  "KUBECONFIG",
+  "DOCKER_HOST",
+  "NPM_TOKEN",
+  "PYPI_TOKEN"
+]
+
+# Pattern-based scrub rules.
+# These are intentionally broad; users can opt specific variables back in.
+scrub_patterns = [
+  "*_TOKEN",
+  "*_SECRET",
+  "*_KEY",
+  "AWS_*",
+  "GITHUB_*",
+  "GOOGLE_*",
+  "OPENAI_*",
+  "ANTHROPIC_*",
+  "AZURE_*"
+]
+
+# Synthetic values set inside the sandbox.
+# These are visible to the child process.
+[environment.set]
+HOME = "/home/user"
+TMPDIR = "/tmp"
+USER = "user"
+LOGNAME = "user"
+HOSTNAME = "workstation"
+TZ = "UTC"
+LANG = "en_US.UTF-8"
+LC_ALL = "en_US.UTF-8"
+LANGUAGE = "en-US"
+XDG_CONFIG_HOME = "/home/user/.config"
+XDG_CACHE_HOME = "/home/user/.cache"
+XDG_DATA_HOME = "/home/user/.local/share"
+
+
+# --------------------------------------------------------------------
+# Font and emoji fingerprint reduction
+# --------------------------------------------------------------------
+
+[fontconfig]
+enabled = true
+
+# Hide host fontconfig where practical.
+hide_host_fonts = true
+
+# Raincoat should expose a minimal generic font set.
+# For MVP, this can be best-effort.
+mode = "minimal"
+
+fontconfig_path = "/raincoat/fontconfig"
+fontconfig_file = "/raincoat/fontconfig/fonts.conf"
+font_dir = "/raincoat/fonts"
+cache_dir = "/tmp/fontconfig-cache"
+
+# Future intended generic set.
+fontset = [
+  "Noto Sans",
+  "Noto Serif",
+  "Noto Sans Mono",
+  "Noto Color Emoji",
+  "DejaVu Sans"
+]
+
+
+# --------------------------------------------------------------------
+# Browser isolation
+# --------------------------------------------------------------------
+
+[browser]
+# Future feature, but useful to reserve config now.
+enabled = false
+
+# Never expose the real browser profile by default.
+isolate_profile = true
+
+# Temporary browser profile visible only inside sandbox.
+profile_dir = "/tmp/raincoat-browser-profile"
+
+# Browser shaping defaults.
+timezone = "UTC"
+locale = "en-US"
+viewport = "1280x720"
+disable_gpu = true
+disable_extensions = true
+disable_sync = true
+
+# Future shim support:
+# Raincoat may place browser launch wrappers before the real browser in PATH.
+use_launch_shims = false
+
+
+# --------------------------------------------------------------------
+# Egress bridge
+# --------------------------------------------------------------------
+
+[egress]
+# Modes:
+# - "disabled"
+# - "proxy"
+# - "bridge"
+# - "guarded"
+mode = "bridge"
+
+# Do not expose real upstream endpoints to the child process.
+hide_upstreams_from_child = true
+
+# Do not log upstream URLs by default.
+redact_upstreams_in_audit = true
+
+# Do not log request bodies.
+log_request_bodies = false
+
+# Do not log response bodies.
+log_response_bodies = false
+
+# Default timeout in seconds.
+timeout_seconds = 120
+
+# Whether to preserve streaming responses where possible.
+# Important for agent/LLM-style APIs.
+streaming = true
+
+# Multiple bridges can be configured.
+#
+# The child process sees only the child endpoint.
+# Raincoat privately forwards to the upstream endpoint outside the sandbox.
+#
+# Replace SOME_BASE_URL and upstream_endpoint with your own generic profile values.
+# Keep this config file outside paths mounted into the sandbox.
+
+[[egress.bridge]]
+name = "primary-api"
+
+# Environment variable injected into the child process.
+# Use a generic variable name here; do not hard-code agent-specific assumptions
+# in Raincoat itself.
+env = "SOME_BASE_URL"
+
+# Endpoint visible to the child process.
+child_endpoint = "http://127.0.0.1:18080"
+
+# Real upstream known only to Raincoat.
+# Do not mount this config file into the sandbox.
+upstream_endpoint = "https://real-upstream.example.com"
+
+# If false, Raincoat should send Host for the upstream endpoint.
+# If true, Raincoat preserves the child-visible Host header.
+# Usually false is correct for normal API forwarding.
+preserve_host = false
+
+# Forward method, path, query string, headers, and body.
+preserve_path = true
+preserve_query = true
+preserve_method = true
+
+# Header policy.
+strip_headers = [
+  "Proxy-Authorization",
+  "Forwarded",
+  "X-Forwarded-For",
+  "X-Real-IP"
+]
+
+# Optional headers to inject into upstream requests.
+# Do not put real secrets in examples.
+[egress.bridge.inject_headers]
+# "X-Raincoat-Bridge" = "primary-api"
+
+# Optional child-visible headers can be configured later if needed.
+# Avoid exposing upstream metadata to the child.
+
+
+[[egress.bridge]]
+name = "secondary-api"
+
+env = "SECONDARY_BASE_URL"
+child_endpoint = "http://127.0.0.1:18081"
+upstream_endpoint = "https://secondary-upstream.example.com"
+
+preserve_host = false
+preserve_path = true
+preserve_query = true
+preserve_method = true
+
+strip_headers = [
+  "Proxy-Authorization",
+  "Forwarded",
+  "X-Forwarded-For",
+  "X-Real-IP"
+]
+
+
+# --------------------------------------------------------------------
+# Proxy injection
+# --------------------------------------------------------------------
+
+[proxy]
+# This is separate from egress bridge.
+# Use this when you want the child process to use an external proxy directly.
+enabled = false
+
+http_proxy = "http://127.0.0.1:18080"
+https_proxy = "http://127.0.0.1:18080"
+all_proxy = "socks5://127.0.0.1:18080"
+no_proxy = ""
+
+
+# --------------------------------------------------------------------
+# DNS override
+# --------------------------------------------------------------------
+
+[dns]
+# Future feature.
+enabled = false
+
+# DNS overrides only affect name resolution.
+# They do not solve HTTPS certificate/SNI validation by themselves.
+[[dns.map]]
+host = "example.com"
+ip = "203.0.113.10"
+
+
+# --------------------------------------------------------------------
+# Network policy
+# --------------------------------------------------------------------
+
+[network_policy]
+# Future guarded mode.
+enabled = true
+
+# Allow/block is mainly useful for guarded egress.
+default_action = "allow"
+
+allow_hosts = [
+  "github.com",
+  "api.github.com"
+]
+
+block_hosts = [
+  "ipinfo.io",
+  "ifconfig.me",
+  "api.ipify.org",
+  "checkip.amazonaws.com",
+  "browserleaks.com"
+]
+
+block_private_metadata_endpoints = true
+
+metadata_endpoints = [
+  "169.254.169.254",
+  "metadata.google.internal"
+]
+
+
+# --------------------------------------------------------------------
+# Audit
+# --------------------------------------------------------------------
+
+[audit]
+enabled = true
+
+# Host-side audit log.
+# Do not mount this into sandbox unless explicitly needed.
+log_file = ".raincoat/audit.log"
+
+# Prefer structured logs for future tooling.
+format = "text"
+
+# Do not log secrets.
+redact_secrets = true
+
+# Do not log real upstream endpoint values unless debug is explicitly enabled.
+redact_upstreams = true
+
+# Log high-level sandbox decisions.
+log_environment = true
+log_filesystem = true
+log_network = true
+log_egress = true
+log_fontconfig = true
+log_browser = true
+
+# Avoid logging child process stdout/stderr by default.
+capture_child_output = false
+
+
+# --------------------------------------------------------------------
+# Bubblewrap backend
+# --------------------------------------------------------------------
+
+[backend]
+type = "bubblewrap"
+
+# Bubblewrap executable name.
+bwrap_path = "bwrap"
+
+# Linux namespace settings.
+#
+# NOTE: unshare_user is NOT currently wired into the bubblewrap backend. Raincoat
+# invokes bwrap WITHOUT --unshare-user, so the sandboxed child runs under — and can
+# read — the real uid/gid (`id -u` == your real uid). This is intentional: a fresh
+# user namespace with a uid/gid map is not required for Raincoat's privacy model
+# (which masks the hostname, username, HOME, and filesystem), and enabling it would
+# change how mounts and ownership appear to the child. Do NOT assume the real uid is
+# hidden; Raincoat masks identity via hostname/username/HOME, not the numeric uid.
+unshare_user = true
+unshare_pid = true
+unshare_ipc = true
+unshare_uts = true
+unshare_cgroup = true
+
+# Network is controlled by Raincoat's network mode.
+# In strict/off mode, Raincoat may unshare network.
+unshare_net_when_off = true
+
+# Mount basic virtual filesystems.
+mount_proc = true
+mount_dev = true
+mount_tmpfs_tmp = true
+
+# Whether to die when parent exits.
+die_with_parent = true
+
+# Best-effort seccomp support for future versions.
+seccomp = false
+
+
+# --------------------------------------------------------------------
+# Init / report behavior
+# --------------------------------------------------------------------
+
+[init]
+create_dirs = [
+  ".raincoat",
+  ".raincoat-work",
+  "out"
+]
+
+[report]
+latest_log = ".raincoat/audit.log"
+playful_summary = true

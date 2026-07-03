@@ -22,13 +22,16 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <csignal>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
 
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -341,6 +344,60 @@ TEST(Integration, AuditLogWrittenWithoutSecretValues) {
 }
 
 // ---------------------------------------------------------------------------
+// SECURITY (attack round 1): the untrusted child must never be able to tamper
+// with the host audit log. The tmpfs mask (audit_mask_dir + build_bwrap_argv)
+// is supposed to shadow `.raincoat/` inside the sandbox so the child sees an
+// empty dir instead of the real log.
+//
+// INCOMPLETE-FIX REPRO: in STRICT mode the cwd is NOT auto-mounted, so when the
+// user grants `--allow-write <cwd>/.raincoat` (the audit log's own parent dir)
+// that directory becomes the ONLY writable mount — and it is a mount ROOT.
+// audit_mask_dir refuses to mask a mount root (masking it would hide the whole
+// mount), so NO tmpfs is emitted and the child gets a real read-write bind of
+// the genuine audit dir. Verified live against ./build/raincoat: the child both
+// forged a fake "=== Raincoat finished ===" line into, and rm'd, the real host
+// audit.log.
+//
+// Detection is tamper-proof against verbatim-argv logging: the child TRUNCATES
+// the log mid-run. The runner writes the "=== Raincoat started ===" block BEFORE
+// the child runs and the "finished" block AFTER, so if the truncation reached the
+// real file the started-block is gone from the final on-disk log. The child's
+// argv contains no "Raincoat started" text, so this cannot false-positive.
+//
+// This test currently FAILS (the started-block is truncated away), exposing that
+// the audit-tamper hardening does not hold for `--strict --allow-write <auditdir>`.
+TEST(Integration, StrictAllowWriteAuditDirCannotTamperHostLog) {
+    SKIP_UNLESS_SANDBOXABLE(bin);
+
+    std::string real_home = make_temp_dir("realhome");
+    std::string cwd = make_temp_dir("cwd");
+    // The audit dir must exist before the run: strict-mode --allow-write
+    // canonicalizes + exist-checks the path.
+    std::string audit_dir = (fs::path(cwd) / ".raincoat").string();
+    fs::create_directories(audit_dir);
+    std::string audit_path = (fs::path(audit_dir) / "audit.log").string();
+
+    auto env = base_env(real_home);
+    // Child truncates the (masked-or-not) audit log from inside the sandbox.
+    RunResult r = run_proc(
+        bin,
+        {"--strict", "--allow-write", audit_dir, "--", "/usr/bin/env", "sh", "-c",
+         ": > " + audit_path},
+        env, cwd);
+    ASSERT_TRUE(r.spawn_ok);
+
+    ASSERT_TRUE(fs::exists(audit_path)) << r.output;
+    std::string audit = read_file(audit_path);
+    // If the tmpfs mask held, the child truncated only its private tmpfs overlay
+    // and the genuine start block survives on the host log.
+    EXPECT_NE(audit.find("=== Raincoat started ==="), std::string::npos)
+        << "the sandboxed child truncated the REAL host audit log (start block "
+           "gone); the audit-tamper tmpfs mask did not cover an explicitly "
+           "--allow-write'd audit dir in strict mode. Log now:\n"
+        << audit;
+}
+
+// ---------------------------------------------------------------------------
 // 5. Missing command prints the exact error and exits nonzero
 // ---------------------------------------------------------------------------
 
@@ -490,7 +547,9 @@ TEST(Integration, ReportDoesNotOverCountRemappedVarsAsScrubbed) {
     ASSERT_TRUE(rep.spawn_ok);
     EXPECT_EQ(rep.exit_code, 0) << rep.output;
     // The playful headline must reflect the true count (1), singular phrasing.
-    EXPECT_NE(rep.output.find("1 sensitive environment variable was"),
+    // (The wording avoids calling every dropped var "sensitive" — see finding on
+    // report over-claiming — but must still surface the accurate singular count.)
+    EXPECT_NE(rep.output.find("1 environment variable was"),
               std::string::npos)
         << "report over-counts remapped HOME/TMPDIR as scrubbed secrets:\n"
         << rep.output;
@@ -708,4 +767,301 @@ TEST(Integration, AllowEnvUserDoesNotLeakRealUsername) {
         << r.output;
     // And USER should still be the anonymized value.
     EXPECT_NE(r.output.find("USER=user"), std::string::npos) << r.output;
+}
+
+// ---------------------------------------------------------------------------
+// 13. BUG: fontconfig isolation is non-functional — the config file the runner
+//     hands the child (FONTCONFIG_FILE / FONTCONFIG_PATH) is never reachable
+//     inside the sandbox.
+//
+// runner.cpp writes the generated fonts.conf under `<root>/fontconfig/` and sets
+// FONTCONFIG_FILE=<root>/fontconfig/fonts.conf, FONTCONFIG_PATH=<root>/fontconfig
+// in the child env. But build_bwrap_argv only bind-mounts <root>/home/user and
+// <root>/tmp into the sandbox — it never binds <root>/fontconfig. Because the
+// sandbox does not mount the raincoat root itself, that directory simply does not
+// exist inside the namespace, so the child's FONTCONFIG_FILE points at a dangling
+// path. The whole point of the fontconfig guard (present a curated fonts.conf that
+// hides the host's font list) therefore never takes effect: fontconfig cannot open
+// the file it is told to use. The audit still advertises "Fontconfig: enabled".
+//
+// This is a real correctness defect: the env var is set to a path guaranteed not
+// to exist in the child. A working guard requires the config to be readable inside
+// the sandbox (e.g. bind <root>/fontconfig, or place it under the fake home/tmp).
+TEST(Integration, FontconfigConfigIsReachableInsideSandbox) {
+    SKIP_UNLESS_SANDBOXABLE(bin);
+
+    std::string real_home = make_temp_dir("realhome");
+    std::string cwd = make_temp_dir("cwd");
+    auto env = base_env(real_home);
+
+    RunResult r = run_proc(
+        bin,
+        {"--", "sh", "-c",
+         "if [ -r \"$FONTCONFIG_FILE\" ]; then echo FC_OK; else echo FC_MISSING; fi"},
+        env, cwd);
+    ASSERT_TRUE(r.spawn_ok);
+    EXPECT_EQ(r.exit_code, 0) << r.output;
+
+    // The config the child is told to use must actually be readable inside the
+    // sandbox; otherwise fontconfig isolation silently does nothing.
+    EXPECT_NE(r.output.find("FC_OK"), std::string::npos)
+        << "FONTCONFIG_FILE points to a path that is not mounted into the sandbox, "
+           "so the fontconfig guard has no effect:\n"
+        << r.output;
+    EXPECT_EQ(r.output.find("FC_MISSING"), std::string::npos) << r.output;
+}
+
+// ---------------------------------------------------------------------------
+// 14. BUG: a terminating signal (SIGTERM/SIGINT/SIGHUP) leaks the sandbox root.
+//
+// run() creates <TMPDIR>/raincoat-XXXXXX (fake home, tmp, out, fontconfig) and
+// removes it via cleanup_root() only on the normal return paths. There is no
+// signal handler, so when raincoat is interrupted while the child runs (Ctrl-C,
+// a `kill`, a terminal hangup) the process dies on the default disposition BEFORE
+// cleanup_root() runs, and the whole sandbox tree is left behind under /tmp. The
+// bwrap child itself is reaped (bwrap --die-with-parent), so this is purely a
+// host-side temp-dir leak that accumulates one directory per interrupted run.
+//
+// This spawns raincoat on a short-lived child, waits for its sandbox dir to
+// appear, sends SIGTERM, and asserts the directory is gone afterwards.
+TEST(Integration, TempDirCleanedUpOnTerminatingSignal) {
+    SKIP_UNLESS_SANDBOXABLE(bin);
+
+    const fs::path tmp_root = "/tmp";
+
+    auto raincoat_dirs = [&]() {
+        std::set<std::string> out;
+        std::error_code ec;
+        for (fs::directory_iterator it(tmp_root, ec), end; !ec && it != end;
+             it.increment(ec)) {
+            std::string name = it->path().filename().string();
+            if (name.rfind("raincoat-", 0) == 0) out.insert(it->path().string());
+        }
+        return out;
+    };
+
+    std::string real_home = make_temp_dir("realhome");
+    std::string cwd = make_temp_dir("cwd");
+    auto env = base_env(real_home);  // no TMPDIR => raincoat uses /tmp
+
+    std::set<std::string> before = raincoat_dirs();
+
+    pid_t pid = ::fork();
+    ASSERT_GE(pid, 0);
+    if (pid == 0) {
+        // child: run `raincoat run -- sleep 10` with the controlled env/cwd.
+        if (::chdir(cwd.c_str()) != 0) _exit(126);
+        int devnull = ::open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            ::dup2(devnull, STDOUT_FILENO);
+            ::dup2(devnull, STDERR_FILENO);
+        }
+        std::vector<std::string> as = {bin, "run", "--", "sleep", "10"};
+        std::vector<char*> argv;
+        for (auto& s : as) argv.push_back(const_cast<char*>(s.c_str()));
+        argv.push_back(nullptr);
+        std::vector<std::string> es;
+        for (const auto& kv : env) es.push_back(kv.first + "=" + kv.second);
+        std::vector<char*> envp;
+        for (auto& s : es) envp.push_back(const_cast<char*>(s.c_str()));
+        envp.push_back(nullptr);
+        ::execve(bin.c_str(), argv.data(), envp.data());
+        _exit(127);
+    }
+
+    // parent: wait (poll) for a NEW raincoat-* dir to appear.
+    std::string new_dir;
+    for (int i = 0; i < 200 && new_dir.empty(); ++i) {  // up to ~4s
+        for (const auto& d : raincoat_dirs())
+            if (!before.count(d)) { new_dir = d; break; }
+        if (new_dir.empty()) ::usleep(20 * 1000);
+    }
+    ASSERT_FALSE(new_dir.empty())
+        << "raincoat never created its sandbox dir; cannot exercise cleanup";
+
+    // Interrupt raincoat mid-run with a terminating signal.
+    ::kill(pid, SIGTERM);
+    int status = 0;
+    while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+
+    // Give any cleanup a moment, then check the dir is gone.
+    bool gone = false;
+    for (int i = 0; i < 100; ++i) {  // up to ~2s
+        std::error_code ec;
+        if (!fs::exists(new_dir, ec)) { gone = true; break; }
+        ::usleep(20 * 1000);
+    }
+
+    // Best-effort: don't let this test itself pollute /tmp if the bug is present.
+    std::error_code ec;
+    fs::remove_all(new_dir, ec);
+
+    EXPECT_TRUE(gone)
+        << "raincoat leaked its sandbox dir on SIGTERM (no signal cleanup): "
+        << new_dir;
+}
+
+// ---------------------------------------------------------------------------
+// 15. BUG (security / audit integrity): the sandboxed process can forge the
+//     audit log, because the default audit path lives inside the read-write
+//     bind-mounted cwd.
+//
+// In normal (non-strict) mode the runner auto-mounts the cwd READ-WRITE, and
+// resolve_config defaults the audit log to `<cwd>/.raincoat/audit.log` — i.e.
+// squarely inside that writable mount. The runner writes the truthful "start"
+// block (Mode/Network/Allowed paths/Env categories) BEFORE fork/exec, then hands
+// control to the untrusted command. That command can freely open the same file
+// and overwrite it: raincoat only appends the one-line "end" block afterwards.
+//
+// The audit log is the tool's core security-transparency artifact (see the
+// SECURITY INVARIANT banner in src/audit.cpp): `raincoat report` summarizes it
+// and a user trusts it to learn what the sandboxed tool was actually permitted
+// to do. If the sandboxed tool can silently rewrite that record — e.g. to claim
+// "Network: off" when it was full, or to erase the whole start block — the audit
+// guarantee is defeated. The genuine start block the runner wrote must survive
+// the run; a malicious child inside the sandbox must not be able to destroy it.
+//
+// This test runs a benign command that overwrites .raincoat/audit.log from
+// inside the sandbox, then asserts the genuine start block is still present. It
+// currently FAILS: the child's write wins and the real record is gone.
+TEST(Integration, AuditLogCannotBeForgedBySandboxedChild) {
+    SKIP_UNLESS_SANDBOXABLE(bin);
+
+    std::string real_home = make_temp_dir("realhome");
+    std::string cwd = make_temp_dir("cwd");
+    auto env = base_env(real_home);
+
+    // The sandboxed command clobbers the audit log the runner just wrote.
+    //
+    // The contiguous forgery marker is ASSEMBLED BY THE SHELL from split literals
+    // ("FORGED-BY" + "-" + "SANDBOXED-CHILD") on purpose: raincoat logs the command
+    // it ran VERBATIM in the audit's "Command:" line and bwrap command tail (a
+    // SPEC-mandated, honest-boundary behaviour), so the raw argv must NOT itself
+    // contain the contiguous marker — otherwise the marker would appear in the
+    // genuine log regardless of any forgery and the "forged content absent" check
+    // could never pass. Only a successful forgery writes the joined marker to the
+    // file, so finding it below unambiguously means the child overwrote the log.
+    RunResult r = run_proc(
+        bin,
+        {"--", "sh", "-c",
+         "echo 'FORGED-BY''-''SANDBOXED-CHILD' > .raincoat/audit.log"},
+        env, cwd);
+    ASSERT_TRUE(r.spawn_ok);
+    EXPECT_EQ(r.exit_code, 0) << r.output;
+
+    std::string audit_path = (fs::path(cwd) / ".raincoat" / "audit.log").string();
+    ASSERT_TRUE(fs::exists(audit_path)) << audit_path;
+    std::string audit = read_file(audit_path);
+
+    // The genuine start block the runner recorded before exec must survive: the
+    // sandboxed process must not be able to erase the record of what it was
+    // permitted to do.
+    EXPECT_NE(audit.find("Mode:"), std::string::npos)
+        << "sandboxed child erased the audit start block (audit log lives in the "
+           "writable cwd mount and can be forged):\n"
+        << audit;
+    EXPECT_NE(audit.find("Network:"), std::string::npos) << audit;
+    EXPECT_EQ(audit.find("FORGED-BY-SANDBOXED-CHILD"), std::string::npos)
+        << "the sandboxed child's forged content is present in the audit log:\n"
+        << audit;
+}
+
+// ---------------------------------------------------------------------------
+// 16. Hostname leak: the child must see a generic host name, never the host's.
+//     `/bin/hostname` reads the UTS namespace (set via --hostname sandbox), and
+//     $HOSTNAME in the env is pinned to the same generic value.
+// ---------------------------------------------------------------------------
+
+TEST(Integration, HostnameIsGenericNotHostMachineName) {
+    SKIP_UNLESS_SANDBOXABLE(bin);
+
+    // The real host name the sandbox must NOT expose.
+    char host_buf[256] = {0};
+    ::gethostname(host_buf, sizeof(host_buf) - 1);
+    std::string real_host(host_buf);
+
+    std::string real_home = make_temp_dir("realhome");
+    std::string cwd = make_temp_dir("cwd");
+    auto env = base_env(real_home);
+
+    RunResult r = run_proc(bin, {"--", "/bin/hostname"}, env, cwd);
+    ASSERT_TRUE(r.spawn_ok);
+    EXPECT_EQ(r.exit_code, 0) << r.output;
+
+    EXPECT_NE(r.output.find("sandbox"), std::string::npos)
+        << "hostname inside the sandbox should be the generic 'sandbox':\n"
+        << r.output;
+    if (!real_host.empty() && real_host != "sandbox") {
+        EXPECT_EQ(r.output.find(real_host), std::string::npos)
+            << "the real host name leaked into the sandbox:\n"
+            << r.output;
+    }
+}
+
+// `id` still runs inside the sandbox (a common identity probe): the run must
+// succeed even though USER/LOGNAME are anonymized.
+TEST(Integration, IdCommandStillRuns) {
+    SKIP_UNLESS_SANDBOXABLE(bin);
+
+    std::string real_home = make_temp_dir("realhome");
+    std::string cwd = make_temp_dir("cwd");
+    auto env = base_env(real_home);
+
+    RunResult r = run_proc(bin, {"--", "id"}, env, cwd);
+    ASSERT_TRUE(r.spawn_ok);
+    EXPECT_EQ(r.exit_code, 0) << r.output;
+    EXPECT_NE(r.output.find("uid="), std::string::npos) << r.output;
+}
+
+// 17. Identity-protected env vars stay generic even when explicitly allow-env'd.
+//     The real login name / host name must never reach the child, and the child
+//     sees the anonymized LOGNAME=user / HOSTNAME=sandbox.
+TEST(Integration, LognameAndHostnameGenericEvenWithAllowEnv) {
+    SKIP_UNLESS_SANDBOXABLE(bin);
+
+    std::string real_home = make_temp_dir("realhome");
+    std::string cwd = make_temp_dir("cwd");
+    auto env = base_env(real_home);
+    const std::string secret_login = "topsecretlogin42";
+    const std::string secret_host = "topsecrethost42";
+    env["USER"] = secret_login;
+    env["LOGNAME"] = secret_login;
+    env["HOSTNAME"] = secret_host;
+
+    RunResult r = run_proc(
+        bin,
+        {"--allow-env", "LOGNAME", "--allow-env", "HOSTNAME", "--", "sh", "-c",
+         "echo \"L=$LOGNAME H=$HOSTNAME\""},
+        env, cwd);
+    ASSERT_TRUE(r.spawn_ok);
+    EXPECT_EQ(r.exit_code, 0) << r.output;
+
+    EXPECT_NE(r.output.find("L=user"), std::string::npos) << r.output;
+    EXPECT_NE(r.output.find("H=sandbox"), std::string::npos) << r.output;
+    // Neither real value may appear anywhere in the child's environment.
+    EXPECT_EQ(r.output.find(secret_login), std::string::npos)
+        << "--allow-env LOGNAME leaked the real login name:\n"
+        << r.output;
+    EXPECT_EQ(r.output.find(secret_host), std::string::npos)
+        << "--allow-env HOSTNAME leaked the real host name:\n"
+        << r.output;
+}
+
+// 18. Fontconfig: the file FONTCONFIG_FILE names is genuinely readable inside the
+//     sandbox (the SPEC-shaped `cat $FONTCONFIG_FILE >/dev/null && echo ok` probe).
+TEST(Integration, FontconfigFileIsCatReadableInsideSandbox) {
+    SKIP_UNLESS_SANDBOXABLE(bin);
+
+    std::string real_home = make_temp_dir("realhome");
+    std::string cwd = make_temp_dir("cwd");
+    auto env = base_env(real_home);
+
+    RunResult r = run_proc(
+        bin, {"--", "sh", "-c", "cat \"$FONTCONFIG_FILE\" >/dev/null && echo ok"}, env, cwd);
+    ASSERT_TRUE(r.spawn_ok);
+    EXPECT_EQ(r.exit_code, 0) << r.output;
+    EXPECT_NE(r.output.find("ok"), std::string::npos)
+        << "FONTCONFIG_FILE was not a readable file inside the sandbox:\n"
+        << r.output;
 }

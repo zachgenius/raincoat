@@ -564,4 +564,79 @@ TEST_F(FsGuard, PlanMountsExplicitAllowOfHomeItselfIsHonoredNoWarning) {
   EXPECT_EQ(mounts[0].mode, MountMode::ReadWrite);
 }
 
+// ---------------------------------------------------------------------------
+// audit_mask_dir — regression coverage for the audit-tamper tmpfs mask.
+//
+// DESIGN.md contract: "a user who explicitly --allow-read/--allow-write's the
+// exact audit dir (making it its own mount root, or a read-only mount) is NOT
+// masked." The mask must protect the host audit log from the untrusted child,
+// but it must NOT shadow a directory the user legitimately asked to expose.
+// ---------------------------------------------------------------------------
+
+// Baseline: default audit dir under an auto-mounted cwd IS masked (this is the
+// feature working as intended — the child cannot forge/erase the host log).
+TEST(FsGuardAuditMask, DefaultAuditDirUnderCwdIsMasked) {
+  std::vector<Mount> mounts{
+      Mount{"/prj", "/prj", MountMode::ReadWrite},  // auto-mounted cwd
+  };
+  EXPECT_EQ(audit_mask_dir("/prj/.raincoat/audit.log", mounts), "/prj/.raincoat");
+}
+
+// A read-only mount of the audit dir must NOT be masked (child can't write it).
+TEST(FsGuardAuditMask, AuditDirAsReadOnlyMountRootIsNotMasked) {
+  std::vector<Mount> mounts{
+      Mount{"/prj/.raincoat", "/prj/.raincoat", MountMode::ReadOnly},
+  };
+  EXPECT_EQ(audit_mask_dir("/prj/.raincoat/audit.log", mounts), "");
+}
+
+// REGRESSION (exposing): the user explicitly --allow-write's the exact audit
+// dir, making it its own RW mount root. Per the contract that dir must NOT be
+// masked. But because the cwd is ALSO auto-mounted RW (the default non-strict
+// behavior) and is a proper ancestor, audit_mask_dir returns the dir anyway and
+// the runner tmpfs-shadows a path the user legitimately allowed to write — the
+// child sees an empty .raincoat instead of the user's files.
+//
+// Mount order mirrors plan_mounts: explicit allow_write first, auto-cwd last.
+TEST(FsGuardAuditMask, ExplicitlyAllowedAuditDirIsNotMaskedEvenWhenCwdMounted) {
+  std::vector<Mount> mounts{
+      Mount{"/prj/.raincoat", "/prj/.raincoat", MountMode::ReadWrite},  // explicit --allow-write, mount root
+      Mount{"/prj", "/prj", MountMode::ReadWrite},                      // auto-mounted cwd
+  };
+  // Contract: an explicitly-allowed audit dir (its own mount root) is NOT masked.
+  EXPECT_EQ(audit_mask_dir("/prj/.raincoat/audit.log", mounts), "")
+      << "audit-tamper mask shadowed a directory the user explicitly --allow-write'd";
+}
+
+// REGRESSION (exposing, attack round 2): the audit-tamper mask assumes the audit
+// dir is always raincoat-owned `.raincoat` ("shadowing it loses no user data").
+// That premise breaks when the user points a CUSTOM `--audit-log` into a directory
+// they explicitly `--allow-write` and that holds real files — e.g.
+//   raincoat --strict --allow-write /prj/out --audit-log /prj/out/run.log -- ...
+// Here /prj/out is the LONE read-write mount root that covers the audit dir, so
+// audit_mask_dir hits the "lone RW root" branch and returns it. The runner then
+// `--tmpfs`-masks /prj/out inside the sandbox: the child sees an EMPTY out dir
+// (its real files, incl. data.txt, vanish) and every write the child makes there is
+// silently discarded when the sandbox is torn down. This is exactly the failure
+// the round-2 task flags: the mask hides a path the user legitimately allowed.
+//
+// Reproduced against the real binary: `cat out/data.txt` -> "No such file or
+// directory" inside the sandbox, and the child's out/child.txt never lands on host.
+//
+// Correct behavior: a user-allowed data directory (not raincoat's own `.raincoat`)
+// must NOT be shadowed even when it happens to host the audit log. Masking may drop
+// tamper-protection for that one custom log, but it must never destroy user data /
+// discard the child's legitimate writes into an allow-write path.
+TEST(FsGuardAuditMask, CustomAuditLogInsideUserAllowedDirIsNotMasked) {
+  std::vector<Mount> mounts{
+      // strict mode: user's explicit --allow-write of a real data dir; no auto-cwd
+      // mount, so this is the LONE read-write mount root covering the audit dir.
+      Mount{"/prj/out", "/prj/out", MountMode::ReadWrite},
+  };
+  EXPECT_EQ(audit_mask_dir("/prj/out/run.log", mounts), "")
+      << "audit-tamper mask tmpfs-shadowed /prj/out — a user --allow-write'd data "
+         "directory — hiding its files from the child and discarding the child's "
+         "writes; only raincoat-owned dirs may be masked without losing user data";
+}
+
 }  // namespace

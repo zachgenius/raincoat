@@ -237,3 +237,43 @@ Process exit code: 0
 )";
     EXPECT_NO_THROW({ (void)summarize_audit(audit); });
 }
+
+// --- honesty guarantees ------------------------------------------------------
+
+// When the user deliberately mounts a credential directory (e.g. ~/.ssh), the
+// summary must NOT keep cheerfully claiming the tool never saw the real home —
+// it did get a window into a private path. Locks the report to honest wording.
+TEST(Report, SensitiveMountDoesNotClaimHomeStayedHidden) {
+    const std::string audit = R"(Raincoat started
+Mode: normal
+Network: full
+Fake HOME: /tmp/raincoat.xy/home/user
+Allowed read paths:
+  - /home/you/.ssh
+Allowed write paths:
+  (none)
+Env scrubbed: GITHUB_TOKEN, AWS_SECRET_ACCESS_KEY
+Process exit code: 0
+)";
+    const std::string out = summarize_audit(audit);
+    EXPECT_FALSE(icontains(out, "never got to see your actual home"))
+        << "must not claim home stayed hidden when ~/.ssh was mounted in:\n" << out;
+    EXPECT_TRUE(icontains(out, "credentials") || icontains(out, "private data"))
+        << "should acknowledge the deliberately mounted sensitive path:\n" << out;
+}
+
+// Withheld env vars are simply the ones outside the safe allowlist — not
+// necessarily secrets. The scrub summary must describe them neutrally as
+// "environment variables ... scrubbed", never brand them all "sensitive" or
+// assert they were "secrets".
+TEST(Report, ScrubbedVarsDescribedNeutrallyNotAsSecrets) {
+    const std::string out = summarize_audit(kStrictAudit);
+    EXPECT_TRUE(icontains(out, "environment variable"))
+        << "scrubbed vars should be described as environment variables:\n" << out;
+    EXPECT_TRUE(icontains(out, "scrub"))
+        << "scrubbed vars should be described as scrubbed:\n" << out;
+    EXPECT_FALSE(icontains(out, "sensitive environment"))
+        << "must not brand all withheld env vars 'sensitive':\n" << out;
+    EXPECT_FALSE(icontains(out, "secret"))
+        << "must not claim the withheld env vars were secrets:\n" << out;
+}

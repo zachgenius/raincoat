@@ -264,6 +264,85 @@ TEST(Bwrap, SandboxTmpBind) {
 }
 
 // ---------------------------------------------------------------------------
+// Generic hostname: a fresh UTS namespace must carry a generic host name so the
+// real machine name never leaks through.
+// ---------------------------------------------------------------------------
+
+TEST(Bwrap, GenericHostnameSet) {
+    Argv a = buildTypical();
+    // --unshare-uts is required for --hostname to take effect.
+    EXPECT_TRUE(has(a, "--unshare-uts"));
+    EXPECT_TRUE(hasPair(a, "--hostname", "sandbox"));
+    // The host's real name must not be what we hand bwrap.
+    EXPECT_EQ(countTok(a, "--hostname"), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Writable scratch `out` dir: bound read-write when supplied, absent otherwise.
+// ---------------------------------------------------------------------------
+
+TEST(Bwrap, OutScratchDirBoundWhenSupplied) {
+    Config cfg = makeConfig(NetMode::Full, "/work", {"true"});
+    Argv a = build_bwrap_argv("/usr/bin/bwrap", cfg, {}, makeEnv({}), "/sbx/home/user",
+                              "/sbx/tmp", false, /*font_dir=*/"", /*audit_mask_dir=*/"",
+                              /*sandbox_out=*/"/sbx/out");
+    EXPECT_TRUE(hasTriple(a, "--bind", "/sbx/out", "/sbx/out"));
+    // Scratch is writable, never read-only.
+    EXPECT_FALSE(hasTriple(a, "--ro-bind", "/sbx/out", "/sbx/out"));
+}
+
+TEST(Bwrap, OutScratchDirAbsentWhenEmpty) {
+    Config cfg = makeConfig(NetMode::Full, "/work", {"true"});
+    Argv a = build_bwrap_argv("/usr/bin/bwrap", cfg, {}, makeEnv({}), "/sbx/home/user",
+                              "/sbx/tmp", false);  // sandbox_out defaults to ""
+    EXPECT_FALSE(has(a, "/sbx/out"));
+}
+
+// ---------------------------------------------------------------------------
+// Curated fontconfig dir: bound read-only when supplied so FONTCONFIG_FILE/PATH
+// actually resolve inside the sandbox.
+// ---------------------------------------------------------------------------
+
+TEST(Bwrap, FontDirBoundReadOnlyWhenSupplied) {
+    Config cfg = makeConfig(NetMode::Full, "/work", {"true"});
+    Argv a = build_bwrap_argv("/usr/bin/bwrap", cfg, {}, makeEnv({}), "/sbx/home/user",
+                              "/sbx/tmp", false, /*font_dir=*/"/sbx/fontconfig");
+    EXPECT_TRUE(hasTriple(a, "--ro-bind", "/sbx/fontconfig", "/sbx/fontconfig"));
+}
+
+TEST(Bwrap, FontDirAbsentWhenEmpty) {
+    Config cfg = makeConfig(NetMode::Full, "/work", {"true"});
+    Argv a = build_bwrap_argv("/usr/bin/bwrap", cfg, {}, makeEnv({}), "/sbx/home/user",
+                              "/sbx/tmp", false);  // font_dir defaults to ""
+    EXPECT_FALSE(has(a, "/sbx/fontconfig"));
+}
+
+// ---------------------------------------------------------------------------
+// Audit-log directory masking: a --tmpfs shadows the audit dir so the untrusted
+// child cannot read/forge/erase the host audit log. It must come AFTER the user
+// mounts (its parent mount must already exist).
+// ---------------------------------------------------------------------------
+
+TEST(Bwrap, AuditMaskTmpfsEmittedWhenSupplied) {
+    Config cfg = makeConfig(NetMode::Full, "/work", {"true"});
+    std::vector<Mount> mounts = {mnt("/host/cwd", "/host/cwd", MountMode::ReadWrite)};
+    Argv a = build_bwrap_argv("/usr/bin/bwrap", cfg, mounts, makeEnv({}), "/fh", "/tmp",
+                              false, /*font_dir=*/"", /*audit_mask_dir=*/"/host/cwd/.raincoat");
+    EXPECT_TRUE(hasPair(a, "--tmpfs", "/host/cwd/.raincoat"));
+    // The tmpfs mask must be emitted AFTER the writable cwd mount it shadows.
+    int mnt_idx = indexOfTriple(a, "--bind", "/host/cwd", "/host/cwd");
+    int mask_idx = indexOf(a, "--tmpfs");
+    ASSERT_GE(mnt_idx, 0);
+    ASSERT_GE(mask_idx, 0);
+    EXPECT_LT(mnt_idx, mask_idx);
+}
+
+TEST(Bwrap, AuditMaskAbsentWhenEmpty) {
+    Argv a = buildTypical();  // audit_mask_dir defaults to ""
+    EXPECT_FALSE(has(a, "--tmpfs"));
+}
+
+// ---------------------------------------------------------------------------
 // Per-Mount binds: RO -> --ro-bind, RW -> --bind, using host+sandbox pair
 // ---------------------------------------------------------------------------
 

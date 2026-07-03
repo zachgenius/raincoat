@@ -11,7 +11,10 @@ namespace raincoat {
 std::vector<std::string> build_bwrap_argv(const std::string& bwrap_path, const Config& cfg,
                                           const std::vector<Mount>& mounts,
                                           const EnvResolution& env, const std::string& fake_home,
-                                          const std::string& sandbox_tmp, bool bind_resolv_conf);
+                                          const std::string& sandbox_tmp, bool bind_resolv_conf,
+                                          const std::string& font_dir = "",
+                                          const std::string& audit_mask_dir = "",
+                                          const std::string& sandbox_out = "");
 
 // PURE. Render the bwrap argv as a display-safe string for the audit log. Every
 // `--setenv <NAME> <VALUE>` value is redacted to `<redacted>` (the NAME is shown)

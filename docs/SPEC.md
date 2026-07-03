@@ -105,13 +105,20 @@ raincoat --help / -h / --version / -V
 - Do NOT implement ask/allowlist yet, but design the enum for them.
 
 ## Audit log
-- Default location: `.raincoat/audit.log` (in project dir) or inside temp dir if no project dir.
+- Default location: `.raincoat/audit.log` under the working directory. Writing the audit is
+  best-effort: if that directory cannot be created/written (e.g. a read-only project dir), the
+  audit is silently skipped with a non-fatal `raincoat: note:` on stderr and the run proceeds.
+  (The MVP does NOT fall back to a temp dir; `--audit-log <path>` lets you redirect it.)
 - `--audit-log <path>` overrides.
 - Log events (human-friendly lines):
   Raincoat started; Command; Mode (normal/strict); Network (full/off); Fake HOME; Workdir;
   Allowed read paths; Allowed write paths; Env allowed; Env set; Env scrubbed; Timezone;
   Locale; Fontconfig (enabled/best-effort/unavailable); Bubblewrap command constructed;
-  Process exit code. NEVER log secret values.
+  Process exit code. NEVER log environment secret VALUES (every `--setenv` value in the logged
+  bwrap command is redacted to `<redacted>`; only NAMES appear). Note the honest boundary: the
+  `Command:` line and the command tail of the bwrap invocation are the user's own argv and are
+  logged VERBATIM — a secret passed as a command-line argument WILL appear. Secrets belong in
+  `--set-env`/`--allow-env` (redacted), never in argv. README documents this caveat.
 - `raincoat report`: read latest audit log and print a human-friendly summary. Slightly playful
   tone OK but not unprofessional. Example: "Raincoat hid your real HOME and scrubbed 12
   potentially sensitive environment variables." Optional: "Verdict: this tool did not get to

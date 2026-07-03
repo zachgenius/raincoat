@@ -116,17 +116,27 @@ Legend for "Where": module source + test file that owns the behavior.
 - [x] Integration tests invoking real `bwrap` (skip gracefully if absent) — *test_integration*
 
 ### 1.16 Docs
-- [x] SPEC / DESIGN / EGRESS / PROGRESS docs
-- [ ] README: what it is, problem, usage, protects / does-not-protect, Linux-first, bwrap dep, limitations (incl. PATH/username caveat, precedence), example profiles, roadmap — *README.md* (docs phase)
-- [ ] Honest positioning + warning text present — *README.md*
-- [ ] Example profiles runnable-or-clearly-templates note — *examples/*
+- [x] SPEC / DESIGN / EGRESS / PROGRESS docs + docs/full-config-reference.toml (config demo)
+- [x] README: what it is, problem, usage, protects / does-not-protect, Linux-first, bwrap dep, limitations (incl. PATH/username + PWD + uid/gid caveats, precedence), example profiles, roadmap — *README.md*
+- [x] Honest positioning + warning text present — *README.md*
+- [x] Example profiles documented as project-local templates — *examples/*
 
-### 1.17 Verification gate (Phase 1 done when ALL true)
+### 1.17 Hardening (post-review, verified)
+- [x] Hostname no longer leaks — `--hostname sandbox` — *bwrap/runner* (verified)
+- [x] Identity vars (USER/LOGNAME/HOSTNAME) stay generic even against `--allow-env` — *env_guard/runner* (verified)
+- [x] Fontconfig dir bind-mounted so `FONTCONFIG_FILE` resolves inside the sandbox; `XDG_DATA_DIRS` set — *bwrap/font_guard* (verified)
+- [x] Audit log tamper-proof from the child (`--tmpfs` mask over the audit dir when reachable) — *runner/bwrap* (verified: sentinel absent, not deletable)
+- [x] `out` scratch dir wired; temp cleanup on SIGINT/SIGTERM/SIGHUP — *runner*
+- [x] Honest docs on residual leaks (uid/gid, mounted absolute paths, PWD) — *README*
+
+### 1.18 Verification gate — Phase 1 MVP (ALL true = DONE)
 - [x] `cmake && cmake --build` clean under `-Wall -Wextra`
-- [x] `ctest` 100% green (15 suites / 545 tests)
-- [x] Real runs work: `raincoat -- env` (secrets hidden, fake HOME), `--net off`, `--strict`, cwd==$HOME guard, `doctor`, `init`, `report` — all verified
-- [x] Committed + pushed to master — core (848faba); integration (this commit)
-- [ ] README written (final MVP milestone)
+- [x] `ctest` 100% green (16 suites / 572 tests)
+- [x] Real runs verified: secrets hidden + fake HOME, `--net off`, `--strict`, cwd==$HOME guard, generic hostname/identity, working fontconfig, tamper-proof audit, `doctor`/`init`/`report`
+- [x] Honest README (no overclaims)
+- [x] Committed + pushed to master — core (848faba), integration (aaf7e18), MVP milestone (this commit)
+
+**PHASE 1 MVP: COMPLETE ✅**
 
 ---
 
