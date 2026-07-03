@@ -91,7 +91,7 @@ Legend for "Where": module source + test file that owns the behavior.
 - [x] `network` limited to full|off (reject allowlist/ask in MVP) — *profile / test_profile*
 - [x] `--profile <path>` load; CLI overrides profile (`merge`) — *profile / test_profile*
 - [x] Profile actually loaded + merged in the live run — *runner resolve_config* (verified)
-- [ ] Document precedence: strict's net-off is a *default* a profile's `network="full"` overrides — *README* (docs phase)
+- [x] Document precedence: strict's net-off is a *default* a profile's `network="full"` overrides — *README*
 
 ### 1.12 init  (init)
 - [x] `default_toml()` matches SPEC schema — *init / test_init*
@@ -214,4 +214,6 @@ stay honest `[-]` (a true network jail, guarded/DNS policy, transparent/MITM mod
 - [x] Unit + integration tests (7 egress suites / ~90 cases): env injection, upstream hidden from child, profile not mounted, HTTP forward + stream, audit redaction, teardown, honesty regressions
 - [x] Real demo: child hits `child_endpoint`, receives upstream response, upstream absent from child env & audit — verified against `./build/raincoat`
 - [x] EGRESS.md limitations reflected in README (Egress bridge section + roadmap)
-- [ ] Committed + pushed to master — *docs commit pending*
+- [x] Committed + pushed to master — egress module (68e702d), egress wiring (99e698e)
+
+**PHASE 2 (egress bridge MVP): COMPLETE ✅**
