@@ -1,9 +1,12 @@
 // Raincoat — main: parse argv and dispatch to the selected subcommand.
-//
-// This is a minimal real dispatch that calls into the (currently stubbed) modules.
+#include <climits>
+#include <fstream>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
+
+#include <unistd.h>
 
 #include "cli.hpp"
 #include "config.hpp"
@@ -29,6 +32,31 @@ const char* kUsage =
     "  raincoat --help | --version\n";
 
 const char* kVersion = "raincoat 0.1.0\n";
+
+// Absolute working directory of the raincoat process.
+std::string current_working_dir() {
+    char buf[PATH_MAX];
+    if (::getcwd(buf, sizeof(buf)) != nullptr) return std::string(buf);
+    return ".";
+}
+
+// Resolve the assets directory (fontconfig template, etc.) to an absolute path.
+// Try the install-relative location first (dir(argv0)/../assets), then the
+// well-known dev tree, then a bare "assets" — font_guard falls back to a minimal
+// embedded fonts.conf if none of these exist.
+std::string resolve_assets_dir(const char* argv0, const std::string& cwd) {
+    std::string a0 = argv0 ? argv0 : "";
+    if (a0.find('/') != std::string::npos) {
+        std::string abs = absolutize(a0, cwd);
+        auto slash = abs.find_last_of('/');
+        std::string dir = (slash == std::string::npos) ? abs : abs.substr(0, slash);
+        std::string cand = absolutize(dir + "/../assets", cwd);
+        if (is_dir(cand)) return cand;
+    }
+    if (is_dir("/home/zach/Develop/Raincoat/assets"))
+        return "/home/zach/Develop/Raincoat/assets";
+    return "assets";
+}
 
 }  // namespace
 
@@ -63,19 +91,35 @@ int main(int argc, char** argv, char** envp) {
             return 0;
         }
         case Subcommand::Report: {
-            std::cout << summarize_audit("");
+            std::string cwd = current_working_dir();
+            // Optional positional path: `raincoat report [path]`.
+            std::string path;
+            if (args.size() >= 2 && !args[1].empty() && args[1][0] != '-') {
+                path = args[1];
+            } else {
+                path = cwd + "/.raincoat/audit.log";
+            }
+            std::ifstream ifs(path, std::ios::binary);
+            if (!ifs) {
+                std::cerr << "no audit log found at " << path << "\n";
+                return 1;
+            }
+            std::ostringstream buf;
+            buf << ifs.rdbuf();
+            std::cout << summarize_audit(buf.str());
             return 0;
         }
         case Subcommand::Run: {
             std::map<std::string, std::string> parent = environ_to_map(envp);
-            std::string cwd;  // resolved inside runner in the real implementation
+            std::string cwd = current_working_dir();
+            std::string assets_dir = resolve_assets_dir(argv[0], cwd);
             std::string err;
             Config cfg = resolve_config(inv, parent, cwd, err);
             if (!err.empty()) {
                 std::cerr << err << "\n";
                 return 1;
             }
-            int rc = run(cfg, parent, cwd, "assets", err);
+            int rc = run(cfg, parent, cwd, assets_dir, err);
             if (!err.empty()) {
                 std::cerr << err << "\n";
                 return 1;
