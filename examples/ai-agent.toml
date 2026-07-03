@@ -1,0 +1,20 @@
+# Raincoat profile — AI coding agent.
+# Non-strict: the CWD is mounted read-write so the agent can edit the project,
+# network is on for model/API access, and a single API key is passed through.
+strict = false
+network = "full"
+
+allow_read = ["./"]
+allow_write = ["./", "./out"]
+allow_env = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]
+
+[env]
+TZ = "UTC"
+LANG = "en_US.UTF-8"
+LC_ALL = "en_US.UTF-8"
+
+[fontconfig]
+enabled = true
+
+[audit]
+log_file = ".raincoat/audit.log"

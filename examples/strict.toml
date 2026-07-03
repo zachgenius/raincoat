@@ -1,0 +1,20 @@
+# Raincoat profile — strict isolation.
+# Deny the CWD by default; only the paths listed below are exposed. Network is
+# forced off. Use this for running fully untrusted tools.
+strict = true
+network = "off"
+
+allow_read = ["./src"]
+allow_write = ["./out"]
+allow_env = []
+
+[env]
+TZ = "UTC"
+LANG = "en_US.UTF-8"
+LC_ALL = "en_US.UTF-8"
+
+[fontconfig]
+enabled = true
+
+[audit]
+log_file = ".raincoat/audit.log"

@@ -1,0 +1,743 @@
+// Comprehensive GoogleTest suite for the `profile` module (load_profile + merge).
+//
+// Derived from docs/DESIGN.md (interface contract) and docs/SPEC.md (behaviour).
+// These tests define the CONTRACT; they are written BEFORE the implementation
+// (TDD red) and are expected to FAIL against the current stub.
+//
+// Behaviours under test:
+//   load_profile(path, err) -> optional<Options>
+//     * strict(bool), network(string->NetMode)
+//     * allow_read / allow_write / allow_env (string arrays)
+//     * [env] table -> env_defaults
+//     * [fontconfig].enabled(bool) -> fontconfig_enabled (optional)
+//     * [audit].log_file(string) -> audit_log (optional)
+//     * set_env is CLI-only: NEVER read from a profile
+//     * missing file / malformed TOML / invalid enum -> nullopt + err set
+//   merge(profile, cli) -> Options   (CLI overrides profile)
+//     * lists (allow_read/write/env, set_env): unioned profile-then-cli, de-duplicated
+//     * scalars/optionals (strict, net, workdir, audit_log, keep_temp, fontconfig):
+//       take CLI when explicitly set, else profile
+//     * env_defaults: profile table overlaid by cli (cli keys win)
+
+#include <gtest/gtest.h>
+
+#include <atomic>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "profile.hpp"
+
+using raincoat::Options;
+using raincoat::NetMode;
+using raincoat::load_profile;
+using raincoat::merge;
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// Test helpers
+// ---------------------------------------------------------------------------
+
+// Write `content` to a fresh, uniquely-named temp file and return its path.
+std::string write_temp_file(const std::string& content) {
+    namespace fs = std::filesystem;
+    static std::atomic<unsigned> counter{0};
+    fs::path dir = fs::temp_directory_path() / "rc-profile-tests";
+    fs::create_directories(dir);
+    fs::path p = dir / ("profile-" + std::to_string(counter.fetch_add(1)) + ".toml");
+    std::ofstream ofs(p, std::ios::binary | std::ios::trunc);
+    ofs << content;
+    ofs.close();
+    return p.string();
+}
+
+// The canonical example profile straight out of docs/SPEC.md.
+const char* kSpecExampleToml = R"TOML(strict = false
+network = "full"
+allow_read = ["./src"]
+allow_write = ["./out"]
+allow_env = ["OPENAI_API_KEY"]
+[env]
+TZ = "UTC"
+LANG = "en_US.UTF-8"
+LC_ALL = "en_US.UTF-8"
+[fontconfig]
+enabled = true
+[audit]
+log_file = ".raincoat/audit.log"
+)TOML";
+
+bool contains(const std::vector<std::string>& v, const std::string& s) {
+    for (const auto& x : v) if (x == s) return true;
+    return false;
+}
+
+}  // namespace
+
+// ===========================================================================
+// load_profile — happy path: the exact SPEC example TOML.
+// ===========================================================================
+
+TEST(Profile, LoadSpecExampleParsesEveryField) {
+    std::string path = write_temp_file(kSpecExampleToml);
+    std::string err;
+    auto opt = load_profile(path, err);
+
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    EXPECT_TRUE(err.empty());
+
+    const Options& o = *opt;
+    EXPECT_FALSE(o.strict);
+
+    ASSERT_TRUE(o.net.has_value());
+    EXPECT_EQ(*o.net, NetMode::Full);
+
+    ASSERT_EQ(o.allow_read.size(), 1u);
+    EXPECT_EQ(o.allow_read[0], "./src");
+
+    ASSERT_EQ(o.allow_write.size(), 1u);
+    EXPECT_EQ(o.allow_write[0], "./out");
+
+    ASSERT_EQ(o.allow_env.size(), 1u);
+    EXPECT_EQ(o.allow_env[0], "OPENAI_API_KEY");
+
+    // [env] table -> env_defaults
+    EXPECT_EQ(o.env_defaults.at("TZ"), "UTC");
+    EXPECT_EQ(o.env_defaults.at("LANG"), "en_US.UTF-8");
+    EXPECT_EQ(o.env_defaults.at("LC_ALL"), "en_US.UTF-8");
+    EXPECT_EQ(o.env_defaults.size(), 3u);
+
+    // [fontconfig].enabled -> optional<bool>
+    ASSERT_TRUE(o.fontconfig_enabled.has_value());
+    EXPECT_TRUE(*o.fontconfig_enabled);
+
+    // [audit].log_file -> audit_log
+    ASSERT_TRUE(o.audit_log.has_value());
+    EXPECT_EQ(*o.audit_log, ".raincoat/audit.log");
+
+    // set_env is CLI-only; a profile never populates it.
+    EXPECT_TRUE(o.set_env.empty());
+}
+
+// ===========================================================================
+// load_profile — individual field mappings / edge cases.
+// ===========================================================================
+
+TEST(Profile, LoadStrictTrue) {
+    std::string path = write_temp_file("strict = true\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    EXPECT_TRUE(opt->strict);
+}
+
+TEST(Profile, LoadStrictFalse) {
+    std::string path = write_temp_file("strict = false\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    EXPECT_FALSE(opt->strict);
+}
+
+TEST(Profile, LoadNetworkOff) {
+    std::string path = write_temp_file("network = \"off\"\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    ASSERT_TRUE(opt->net.has_value());
+    EXPECT_EQ(*opt->net, NetMode::Off);
+}
+
+TEST(Profile, LoadNetworkFull) {
+    std::string path = write_temp_file("network = \"full\"\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    ASSERT_TRUE(opt->net.has_value());
+    EXPECT_EQ(*opt->net, NetMode::Full);
+}
+
+TEST(Profile, LoadFontconfigDisabled) {
+    std::string path = write_temp_file("[fontconfig]\nenabled = false\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    ASSERT_TRUE(opt->fontconfig_enabled.has_value());
+    EXPECT_FALSE(*opt->fontconfig_enabled);
+}
+
+TEST(Profile, LoadMultiElementArrays) {
+    std::string path = write_temp_file(
+        "allow_read = [\"./a\", \"./b\", \"/abs/c\"]\n"
+        "allow_write = [\"./out1\", \"./out2\"]\n"
+        "allow_env = [\"FOO\", \"BAR\", \"BAZ\"]\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    EXPECT_EQ(opt->allow_read, (std::vector<std::string>{"./a", "./b", "/abs/c"}));
+    EXPECT_EQ(opt->allow_write, (std::vector<std::string>{"./out1", "./out2"}));
+    EXPECT_EQ(opt->allow_env, (std::vector<std::string>{"FOO", "BAR", "BAZ"}));
+}
+
+// Keys that are absent should leave optionals empty and containers empty —
+// so that merge() can tell "not specified" apart from an explicit value.
+TEST(Profile, LoadMinimalLeavesUnspecifiedFieldsEmpty) {
+    std::string path = write_temp_file("strict = true\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    const Options& o = *opt;
+    EXPECT_FALSE(o.net.has_value());
+    EXPECT_FALSE(o.fontconfig_enabled.has_value());
+    EXPECT_FALSE(o.audit_log.has_value());
+    EXPECT_TRUE(o.allow_read.empty());
+    EXPECT_TRUE(o.allow_write.empty());
+    EXPECT_TRUE(o.allow_env.empty());
+    EXPECT_TRUE(o.env_defaults.empty());
+    EXPECT_TRUE(o.set_env.empty());
+    EXPECT_TRUE(o.command.empty());
+}
+
+TEST(Profile, LoadEmptyProfileSucceedsWithDefaults) {
+    std::string path = write_temp_file("");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    EXPECT_FALSE(opt->strict);
+    EXPECT_FALSE(opt->net.has_value());
+    EXPECT_TRUE(opt->allow_read.empty());
+}
+
+TEST(Profile, LoadCommentsAndBlankLinesIgnored) {
+    std::string path = write_temp_file(
+        "# leading comment\n"
+        "\n"
+        "strict = true   # trailing comment\n"
+        "\n"
+        "network = \"off\"\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    EXPECT_TRUE(opt->strict);
+    ASSERT_TRUE(opt->net.has_value());
+    EXPECT_EQ(*opt->net, NetMode::Off);
+}
+
+TEST(Profile, LoadAuditLogFromAuditTable) {
+    std::string path = write_temp_file("[audit]\nlog_file = \"/var/log/rc.log\"\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    ASSERT_TRUE(opt->audit_log.has_value());
+    EXPECT_EQ(*opt->audit_log, "/var/log/rc.log");
+}
+
+TEST(Profile, LoadEnvTablePreservesAllPairs) {
+    std::string path = write_temp_file(
+        "[env]\n"
+        "TZ = \"America/New_York\"\n"
+        "LANG = \"C\"\n"
+        "CUSTOM = \"hello world\"\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    EXPECT_EQ(opt->env_defaults.size(), 3u);
+    EXPECT_EQ(opt->env_defaults.at("TZ"), "America/New_York");
+    EXPECT_EQ(opt->env_defaults.at("LANG"), "C");
+    EXPECT_EQ(opt->env_defaults.at("CUSTOM"), "hello world");
+}
+
+// set_env must be ignored even if a (misguided) profile tries to declare it.
+TEST(Profile, LoadIgnoresSetEnvKeyInProfile) {
+    std::string path = write_temp_file(
+        "strict = true\n"
+        "set_env = [\"SECRET=hunter2\", \"FOO=bar\"]\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    EXPECT_TRUE(opt->set_env.empty());
+}
+
+// ===========================================================================
+// load_profile — error handling: nullopt + err populated, never crash.
+// ===========================================================================
+
+TEST(Profile, LoadMissingFileReturnsNulloptWithError) {
+    std::string err;
+    auto opt = load_profile("/nonexistent/path/does/not/exist-xyz.toml", err);
+    EXPECT_FALSE(opt.has_value());
+    EXPECT_FALSE(err.empty());
+}
+
+TEST(Profile, LoadMalformedTomlReturnsNulloptWithError) {
+    // Unterminated table header / junk — parse_toml must reject with an err.
+    std::string path = write_temp_file("this is = = not valid toml [[[\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    EXPECT_FALSE(opt.has_value());
+    EXPECT_FALSE(err.empty());
+}
+
+TEST(Profile, LoadInvalidNetworkValueReturnsError) {
+    // "banana" is valid TOML but not a valid NetMode -> profile layer rejects.
+    std::string path = write_temp_file("network = \"banana\"\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    EXPECT_FALSE(opt.has_value());
+    EXPECT_FALSE(err.empty());
+}
+
+// BUG (adversarial round 1): load_profile accepts network values that the MVP
+// does not implement. SPEC ("Network modes": "MVP implements full and off
+// only") and the loader's OWN error message ("expected full|off") say only
+// full|off are valid from a profile. But net_mode_from_string() also accepts
+// "allowlist"/"ask", and load_profile does not re-validate, so these load
+// successfully. Because net_guard::net_flags() emits NO "--unshare-net" for
+// Allowlist/Ask, a user who writes network = "allowlist" (intending RESTRICTED
+// networking) silently gets FULL open networking — a privacy leak. A profile
+// must reject these values, exactly as it rejects "banana".
+TEST(Profile, LoadRejectsUnimplementedNetworkAllowlist) {
+    std::string path = write_temp_file("network = \"allowlist\"\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    EXPECT_FALSE(opt.has_value())
+        << "network=\"allowlist\" loaded as net="
+        << (opt && opt->net ? raincoat::to_string(*opt->net) : "?")
+        << " — an unimplemented mode that yields full networking";
+    EXPECT_FALSE(err.empty());
+}
+
+TEST(Profile, LoadRejectsUnimplementedNetworkAsk) {
+    std::string path = write_temp_file("network = \"ask\"\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    EXPECT_FALSE(opt.has_value());
+    EXPECT_FALSE(err.empty());
+}
+
+// BUG (adversarial round 2): a `network` value that is a *boolean* token bypasses
+// validation entirely. The loader only inspects p.scalars["network"] (string
+// values); `network = false` / `network = true` are parsed as bools and land in
+// p.bools, so the scalar lookup misses and `net` is left UNSET with no error.
+// Contrast: `network = "banana"` and `network = 8080` are both rejected. The leak:
+// a user who writes `network = false` (a very plausible way to try to *disable*
+// networking) gets no error, `net` stays nullopt, and the runner's non-strict
+// default is FULL — i.e. the profile silently yields OPEN networking, exactly the
+// privacy failure the round-1 allowlist/ask rejection was meant to close. A
+// non-string `network` value must be rejected just like "banana".
+TEST(Profile, LoadRejectsBooleanNetworkFalse) {
+    std::string path = write_temp_file("network = false\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    EXPECT_FALSE(opt.has_value())
+        << "network=false was accepted with net="
+        << (opt && opt->net ? raincoat::to_string(*opt->net) : "<unset>")
+        << " — the runner then defaults to FULL (open networking), silently "
+           "ignoring an attempt to turn networking off";
+    EXPECT_FALSE(err.empty());
+}
+
+TEST(Profile, LoadRejectsBooleanNetworkTrue) {
+    std::string path = write_temp_file("network = true\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    EXPECT_FALSE(opt.has_value());
+    EXPECT_FALSE(err.empty());
+}
+
+// BUG (adversarial round 5): the round-2..4 wrong-type guards all lean on
+// TomlTable::contains(), which reports presence for scalar/bool/array values but
+// NOT for a TABLE. So a guarded key written as a `[table]` header slips past the
+// "present-but-wrong-type" check and is silently treated as ABSENT. `network` is
+// a top-level string key, but the config is heavy with tables (`[env]`,
+// `[fontconfig]`, `[audit]`), so writing `[network]` (intending to group the
+// networking setting, e.g. to turn it OFF) is a very plausible mistake. Trace:
+// `[network]` lands only in tables_, get_string("network") misses (it lives in
+// scalars_), and contains("network") is false because it never inspects tables_.
+// load_profile therefore returns SUCCESS with net UNSET and NO error — and the
+// runner's non-strict default is FULL. So a user who writes a `[network]` block
+// to DISABLE networking silently gets OPEN networking, exactly the leak the
+// round-2 `network = false` rejection was meant to close, merely re-expressed
+// with a type (table) that contains() cannot see. A table-typed `network` must be
+// rejected just like `network = false` is.
+TEST(Profile, LoadRejectsTableTypedNetwork) {
+    std::string path = write_temp_file("[network]\nmode = \"off\"\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    EXPECT_FALSE(opt.has_value())
+        << "[network] table was accepted with net="
+        << (opt && opt->net ? raincoat::to_string(*opt->net) : "<unset>")
+        << " — the runner then defaults to FULL (open networking), silently "
+           "ignoring a table-form attempt to configure networking off";
+    EXPECT_FALSE(err.empty());
+}
+
+// BUG (adversarial round 3): a wrong-typed `strict` value silently downgrades
+// privacy, exactly the class of bug the round-2 `network = false` fix closed —
+// but left unfixed for `strict`. The loader only inspects p.bools["strict"];
+// `strict = "true"` (a very plausible mistake: quoting the boolean) is parsed
+// as a STRING, lands in p.scalars, the bool lookup misses, and load_profile
+// returns strict=false / strict_set=false with NO error. Contrast: `strict = 1`
+// (integer) IS rejected ("Unrecognized value"). The leak: a user who writes
+// strict = "true" intending to ENABLE strict isolation silently gets NON-strict
+// mode — CWD mounted read-write, network full by default, less env scrubbing —
+// i.e. the profile silently yields the LESS protective mode. A non-bool `strict`
+// value must be rejected just like a non-string `network` value is.
+TEST(Profile, LoadRejectsStringTypedStrictTrue) {
+    std::string path = write_temp_file("strict = \"true\"\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    EXPECT_FALSE(opt.has_value())
+        << "strict=\"true\" was accepted with strict="
+        << (opt ? (opt->strict ? "true" : "false") : "<none>")
+        << " / strict_set="
+        << (opt ? (opt->strict_set ? "true" : "false") : "<none>")
+        << " — the runner then treats the profile as NON-strict, silently "
+           "ignoring an attempt to turn strict isolation ON";
+    EXPECT_FALSE(err.empty());
+}
+
+// BUG (adversarial round 4): `audit.log_file` is the one profile key that never
+// got the "present-but-wrong-type" guard that strict / network / [env] /
+// fontconfig.enabled all received. load_profile only reads
+// p.scalars["audit.log_file"] (string values); a NON-string value —
+// `audit.log_file = ["/var/log/rc.log"]` (a plausible mistake by analogy to the
+// allow_read = [...] arrays) or `audit.log_file = true` — lands in p.arrays /
+// p.bools, the scalar lookup misses, and load_profile returns SUCCESS with
+// audit_log left UNSET and NO error. Contrast: every other typed key rejects a
+// wrong-typed value. The downgrade: SPEC puts the DEFAULT audit log at
+// `.raincoat/audit.log` inside the project dir, which non-strict mode mounts
+// read-write and exposes to the untrusted child (SPEC "Default (non-strict)
+// behavior": "Mount the current working directory read-write"). A security-
+// conscious user who sets audit.log_file to a path OUTSIDE that writable area —
+// to keep the audit trail tamper-proof — but mistypes the value type silently
+// gets the child-tamperable in-project default instead of an error. A non-string
+// `audit.log_file` must be rejected, exactly as a non-bool `strict` is.
+TEST(Profile, LoadRejectsArrayTypedAuditLogFile) {
+    std::string path = write_temp_file("audit.log_file = [\"/var/log/rc.log\"]\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    EXPECT_FALSE(opt.has_value())
+        << "audit.log_file=[...] was accepted with audit_log="
+        << (opt && opt->audit_log ? *opt->audit_log : std::string("<unset>"))
+        << " — auditing silently falls back to the child-writable in-project "
+           "default, defeating the user's chosen tamper-proof location";
+    EXPECT_FALSE(err.empty());
+}
+
+TEST(Profile, LoadRejectsBoolTypedAuditLogFile) {
+    std::string path = write_temp_file("audit.log_file = true\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    EXPECT_FALSE(opt.has_value());
+    EXPECT_FALSE(err.empty());
+}
+
+// BUG (adversarial round 1): the profile's hand-rolled parser cannot read
+// multi-line arrays. DESIGN declares `profile (deps: toml)` and the toml module
+// "Must handle: ... multiline arrays", so a profile using the idiomatic
+// multi-line array form must load. Instead load_profile fails with
+// "Malformed array" because parse_toml_min only inspects a single line.
+TEST(Profile, LoadMultilineArray) {
+    std::string path = write_temp_file(
+        "allow_read = [\n"
+        "  \"./src\",\n"
+        "  \"./tests\",\n"
+        "]\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    EXPECT_EQ(opt->allow_read, (std::vector<std::string>{"./src", "./tests"}));
+}
+
+// A full SPEC-shaped profile written in the idiomatic multiline-array +
+// root dotted-key (`env.TZ = "UTC"`) style must load identically to the
+// single-line/[table] form. This only works because the profile now parses
+// through the toml module (multiline arrays + dotted keys), which the old
+// hand-rolled single-line parser could not do.
+TEST(Profile, LoadMultilineAndDottedKeyVariant) {
+    std::string path = write_temp_file(
+        "strict = false\n"
+        "network = \"full\"\n"
+        "allow_read = [\n"
+        "  \"./src\",\n"
+        "  \"./tests\",\n"
+        "]\n"
+        "allow_write = [\"./out\"]\n"
+        "allow_env = [\"OPENAI_API_KEY\"]\n"
+        "env.TZ = \"UTC\"\n"
+        "env.LANG = \"en_US.UTF-8\"\n"
+        "fontconfig.enabled = true\n"
+        "audit.log_file = \".raincoat/audit.log\"\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    const Options& o = *opt;
+    EXPECT_FALSE(o.strict);
+    ASSERT_TRUE(o.net.has_value());
+    EXPECT_EQ(*o.net, NetMode::Full);
+    EXPECT_EQ(o.allow_read, (std::vector<std::string>{"./src", "./tests"}));
+    EXPECT_EQ(o.allow_write, (std::vector<std::string>{"./out"}));
+    EXPECT_EQ(o.allow_env, (std::vector<std::string>{"OPENAI_API_KEY"}));
+    // Root dotted `env.*` keys populate env_defaults just like an [env] table.
+    EXPECT_EQ(o.env_defaults.size(), 2u);
+    EXPECT_EQ(o.env_defaults.at("TZ"), "UTC");
+    EXPECT_EQ(o.env_defaults.at("LANG"), "en_US.UTF-8");
+    ASSERT_TRUE(o.fontconfig_enabled.has_value());
+    EXPECT_TRUE(*o.fontconfig_enabled);
+    ASSERT_TRUE(o.audit_log.has_value());
+    EXPECT_EQ(*o.audit_log, ".raincoat/audit.log");
+}
+
+// ===========================================================================
+// merge — list unioning (profile entries first, then cli, de-duplicated).
+// ===========================================================================
+
+TEST(Profile, MergeUnionsAllowReadProfileFirstDeduped) {
+    Options profile;
+    profile.allow_read = {"./a", "./b"};
+    Options cli;
+    cli.allow_read = {"./b", "./c", "./a"};
+
+    Options m = merge(profile, cli);
+    // profile order preserved, cli-only appended, duplicates dropped.
+    EXPECT_EQ(m.allow_read, (std::vector<std::string>{"./a", "./b", "./c"}));
+}
+
+TEST(Profile, MergeUnionsAllowWriteAndAllowEnv) {
+    Options profile;
+    profile.allow_write = {"./out"};
+    profile.allow_env = {"PATH", "TERM"};
+    Options cli;
+    cli.allow_write = {"./out", "./extra"};
+    cli.allow_env = {"TERM", "FOO"};
+
+    Options m = merge(profile, cli);
+    EXPECT_EQ(m.allow_write, (std::vector<std::string>{"./out", "./extra"}));
+    EXPECT_EQ(m.allow_env, (std::vector<std::string>{"PATH", "TERM", "FOO"}));
+}
+
+TEST(Profile, MergeEmptyProfileListsYieldsCliLists) {
+    Options profile;  // empty
+    Options cli;
+    cli.allow_read = {"./x"};
+    Options m = merge(profile, cli);
+    EXPECT_EQ(m.allow_read, (std::vector<std::string>{"./x"}));
+}
+
+TEST(Profile, MergeEmptyCliListsYieldsProfileLists) {
+    Options profile;
+    profile.allow_read = {"./p"};
+    Options cli;  // empty
+    Options m = merge(profile, cli);
+    EXPECT_EQ(m.allow_read, (std::vector<std::string>{"./p"}));
+}
+
+// ===========================================================================
+// merge — set_env (CLI-only in practice, but merge is a general function).
+// ===========================================================================
+
+TEST(Profile, MergeSetEnvComesFromCli) {
+    Options profile;  // profiles never carry set_env
+    Options cli;
+    cli.set_env = {{"FOO", "1"}, {"BAR", "2"}};
+
+    Options m = merge(profile, cli);
+    ASSERT_EQ(m.set_env.size(), 2u);
+    EXPECT_EQ(m.set_env[0], (std::pair<std::string, std::string>{"FOO", "1"}));
+    EXPECT_EQ(m.set_env[1], (std::pair<std::string, std::string>{"BAR", "2"}));
+}
+
+TEST(Profile, MergeSetEnvUnionedProfileFirst) {
+    // Even though load never fills profile.set_env, merge must union deterministically.
+    Options profile;
+    profile.set_env = {{"A", "1"}};
+    Options cli;
+    cli.set_env = {{"B", "2"}};
+
+    Options m = merge(profile, cli);
+    ASSERT_EQ(m.set_env.size(), 2u);
+    EXPECT_EQ(m.set_env[0].first, "A");
+    EXPECT_EQ(m.set_env[1].first, "B");
+}
+
+// ===========================================================================
+// merge — scalar/optional precedence: CLI wins when explicitly set.
+// ===========================================================================
+
+TEST(Profile, MergeCliStrictWinsOverProfileStrictFalse) {
+    Options profile;
+    profile.strict = false;
+    profile.strict_set = true;
+    Options cli;
+    cli.strict = true;
+    cli.strict_set = true;  // --strict was passed on the CLI
+
+    Options m = merge(profile, cli);
+    EXPECT_TRUE(m.strict);
+}
+
+TEST(Profile, MergeProfileStrictUsedWhenCliDidNotSet) {
+    Options profile;
+    profile.strict = true;
+    profile.strict_set = true;
+    Options cli;
+    cli.strict = false;
+    cli.strict_set = false;  // CLI did not pass --strict
+
+    Options m = merge(profile, cli);
+    EXPECT_TRUE(m.strict);
+}
+
+TEST(Profile, MergeCliNetWinsOverProfileNet) {
+    Options profile;
+    profile.net = NetMode::Full;
+    Options cli;
+    cli.net = NetMode::Off;
+
+    Options m = merge(profile, cli);
+    ASSERT_TRUE(m.net.has_value());
+    EXPECT_EQ(*m.net, NetMode::Off);
+}
+
+TEST(Profile, MergeProfileNetUsedWhenCliNetUnset) {
+    Options profile;
+    profile.net = NetMode::Off;
+    Options cli;  // cli.net == nullopt
+
+    Options m = merge(profile, cli);
+    ASSERT_TRUE(m.net.has_value());
+    EXPECT_EQ(*m.net, NetMode::Off);
+}
+
+TEST(Profile, MergeCliWorkdirWinsElseProfile) {
+    {
+        Options profile; profile.workdir = "/p/dir";
+        Options cli;     cli.workdir = "/c/dir";
+        Options m = merge(profile, cli);
+        ASSERT_TRUE(m.workdir.has_value());
+        EXPECT_EQ(*m.workdir, "/c/dir");
+    }
+    {
+        Options profile; profile.workdir = "/p/dir";
+        Options cli;  // unset
+        Options m = merge(profile, cli);
+        ASSERT_TRUE(m.workdir.has_value());
+        EXPECT_EQ(*m.workdir, "/p/dir");
+    }
+}
+
+TEST(Profile, MergeCliAuditLogWinsElseProfile) {
+    {
+        Options profile; profile.audit_log = "/p/a.log";
+        Options cli;     cli.audit_log = "/c/a.log";
+        Options m = merge(profile, cli);
+        ASSERT_TRUE(m.audit_log.has_value());
+        EXPECT_EQ(*m.audit_log, "/c/a.log");
+    }
+    {
+        Options profile; profile.audit_log = "/p/a.log";
+        Options cli;
+        Options m = merge(profile, cli);
+        ASSERT_TRUE(m.audit_log.has_value());
+        EXPECT_EQ(*m.audit_log, "/p/a.log");
+    }
+}
+
+TEST(Profile, MergeFontconfigCliWinsElseProfile) {
+    {
+        Options profile; profile.fontconfig_enabled = true;
+        Options cli;     cli.fontconfig_enabled = false;
+        Options m = merge(profile, cli);
+        ASSERT_TRUE(m.fontconfig_enabled.has_value());
+        EXPECT_FALSE(*m.fontconfig_enabled);
+    }
+    {
+        Options profile; profile.fontconfig_enabled = true;
+        Options cli;  // unset
+        Options m = merge(profile, cli);
+        ASSERT_TRUE(m.fontconfig_enabled.has_value());
+        EXPECT_TRUE(*m.fontconfig_enabled);
+    }
+}
+
+TEST(Profile, MergeKeepTempCliWinsElseProfile) {
+    {
+        Options profile; profile.keep_temp = true; profile.keep_temp_set = true;
+        Options cli;     cli.keep_temp = false;    cli.keep_temp_set = true;
+        Options m = merge(profile, cli);
+        EXPECT_FALSE(m.keep_temp);
+    }
+    {
+        Options profile; profile.keep_temp = true; profile.keep_temp_set = true;
+        Options cli;  // keep_temp_set == false
+        Options m = merge(profile, cli);
+        EXPECT_TRUE(m.keep_temp);
+    }
+}
+
+// ===========================================================================
+// merge — env_defaults: profile table overlaid by cli (cli keys win).
+// ===========================================================================
+
+TEST(Profile, MergeEnvDefaultsCliOverlaysProfile) {
+    Options profile;
+    profile.env_defaults = {{"TZ", "UTC"}, {"LANG", "en_US.UTF-8"}};
+    Options cli;
+    cli.env_defaults = {{"LANG", "C"}, {"EXTRA", "1"}};
+
+    Options m = merge(profile, cli);
+    EXPECT_EQ(m.env_defaults.at("TZ"), "UTC");     // profile-only survives
+    EXPECT_EQ(m.env_defaults.at("LANG"), "C");     // cli overrides
+    EXPECT_EQ(m.env_defaults.at("EXTRA"), "1");    // cli-only added
+    EXPECT_EQ(m.env_defaults.size(), 3u);
+}
+
+// ===========================================================================
+// Integration: load the SPEC profile then merge with a realistic CLI.
+// ===========================================================================
+
+TEST(Profile, LoadThenMergeAppliesCliOverrides) {
+    std::string path = write_temp_file(kSpecExampleToml);
+    std::string err;
+    auto profile = load_profile(path, err);
+    ASSERT_TRUE(profile.has_value()) << "err=" << err;
+
+    // Simulate: raincoat run --strict --net off --allow-read ./tests
+    //           --set-env TOKEN=abc --net off -- cmd
+    Options cli;
+    cli.strict = true;
+    cli.strict_set = true;
+    cli.net = NetMode::Off;
+    cli.allow_read = {"./tests"};
+    cli.set_env = {{"TOKEN", "abc"}};
+    cli.env_defaults = {{"LANG", "C"}};
+
+    Options m = merge(*profile, cli);
+
+    // CLI --strict wins over profile strict=false.
+    EXPECT_TRUE(m.strict);
+    // CLI --net off wins over profile network="full".
+    ASSERT_TRUE(m.net.has_value());
+    EXPECT_EQ(*m.net, NetMode::Off);
+    // Lists unioned: profile ./src then cli ./tests.
+    EXPECT_EQ(m.allow_read, (std::vector<std::string>{"./src", "./tests"}));
+    EXPECT_EQ(m.allow_write, (std::vector<std::string>{"./out"}));
+    EXPECT_TRUE(contains(m.allow_env, "OPENAI_API_KEY"));
+    // set_env is CLI-only.
+    ASSERT_EQ(m.set_env.size(), 1u);
+    EXPECT_EQ(m.set_env[0], (std::pair<std::string, std::string>{"TOKEN", "abc"}));
+    // env_defaults: cli LANG overrides profile LANG; TZ/LC_ALL survive.
+    EXPECT_EQ(m.env_defaults.at("LANG"), "C");
+    EXPECT_EQ(m.env_defaults.at("TZ"), "UTC");
+    EXPECT_EQ(m.env_defaults.at("LC_ALL"), "en_US.UTF-8");
+    // fontconfig + audit_log come from the profile (CLI left them unset).
+    ASSERT_TRUE(m.fontconfig_enabled.has_value());
+    EXPECT_TRUE(*m.fontconfig_enabled);
+    ASSERT_TRUE(m.audit_log.has_value());
+    EXPECT_EQ(*m.audit_log, ".raincoat/audit.log");
+}

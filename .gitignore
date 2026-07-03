@@ -1,0 +1,26 @@
+# Build directories
+build/
+build-*/
+cmake-build-*/
+
+# CMake artifacts
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+compile_commands.json
+*.cmake.stamp
+
+# Compiled objects / libs / binaries
+*.o
+*.a
+*.so
+raincoat
+
+# Test binaries
+test_*
+!tests/test_*.cpp
+
+# Runtime artifacts
+.raincoat/
