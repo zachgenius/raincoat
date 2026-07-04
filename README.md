@@ -303,7 +303,8 @@ Verdict: this tool did not get to see you naked.
   decoys plant inert bait files in the fake home. Optional `[filesystem].remap_cwd = "/work"`
   presents the working directory at a neutral path instead of its real host path, so the child
   can't read your username/layout via `pwd`/`realpath`/`$PWD` (opt-in; breaks absolute-host-path
-  arguments, and is a *partial* fix — see `docs/MOUNT-REMAP.md`).
+  arguments, and is a *partial* fix — see `docs/MOUNT-REMAP.md`). `[[filesystem.mount]]` entries
+  (`host`/`sandbox`/`mode`) do the same for arbitrary allow-style paths.
 - **The network (optional).** `--net off` (the default in strict mode) isolates networking. Beyond
   all-or-nothing, Raincoat also ships an opt-in filtering egress layer — an endpoint-hiding
   **egress bridge**, an isolated-netns **jail** (`pasta`), and a domain-level **guarded proxy**

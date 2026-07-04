@@ -269,6 +269,21 @@ TEST_F(FsGuard, PlanMountsRemapCwdMovesSandboxPathOnly) {
   EXPECT_EQ(mounts[0].mode, MountMode::ReadWrite);
 }
 
+TEST_F(FsGuard, PlanMountsExplicitRemapMountUsesNeutralSandboxPath) {
+  // [[filesystem.mount]] host -> neutral sandbox path: host_path canonical + real,
+  // sandbox_path is the chosen neutral path, mode honored, deny rules still applied.
+  std::string h = make_subdir("data");
+  Config cfg = make_config(/*strict=*/true, {}, {});  // strict => no auto-cwd noise
+  cfg.ext.remap_mounts.push_back(FsRemapMount{h, "/data", MountMode::ReadOnly});
+  std::string err;
+  auto mounts = plan_no_home(cfg, cwd(), err);
+
+  ASSERT_EQ(mounts.size(), 1u);
+  EXPECT_EQ(mounts[0].host_path, h);           // real source, canonical
+  EXPECT_EQ(mounts[0].sandbox_path, "/data");  // neutral child path
+  EXPECT_EQ(mounts[0].mode, MountMode::ReadOnly);
+}
+
 TEST_F(FsGuard, PlanMountsNonStrictAppendsCwdAfterAllowPaths) {
   std::string r = make_subdir("ro");
   std::string w = make_subdir("rw");

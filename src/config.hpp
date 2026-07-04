@@ -149,6 +149,16 @@ struct Mount {
     MountMode   mode = MountMode::ReadOnly;
 };
 
+// One explicit remapped mount from [[filesystem.mount]]: expose the host path `host` inside
+// the sandbox at the neutral path `sandbox` (instead of at its real host path), so the child
+// can't read the host layout/username via that mount. `host` is the raw user path (resolved
+// like an allow path); `sandbox` is the absolute child-visible path. See docs/MOUNT-REMAP.md.
+struct FsRemapMount {
+    std::string host;
+    std::string sandbox;
+    MountMode   mode = MountMode::ReadOnly;
+};
+
 // Result of resolving the child process environment. `resolved` is the exact env the
 // child receives. The name lists are for the audit log — they carry NAMES ONLY, never
 // values, so secrets are never persisted.
@@ -356,6 +366,11 @@ struct ExtendedConfig {
     // docs/MOUNT-REMAP.md (partial fix: /proc/self/mountinfo's source field still shows the host
     // path — a bind mount always records its source).
     std::optional<std::string> remap_cwd;
+    // [[filesystem.mount]] — explicit host->neutral-path mounts (Phase 2 of remap_cwd). Each
+    // exposes a host path at a chosen sandbox path so allow-style paths under your home can be
+    // de-identified too. Same opt-in tradeoff as remap_cwd (absolute-host-path argv won't
+    // resolve). Applied like allow paths (deny rules still enforced).
+    std::vector<FsRemapMount> remap_mounts;
     BackendConfig backend;
     std::vector<std::string> init_create_dirs; // [init].create_dirs
     std::optional<bool> playful_report;        // [report].playful_summary

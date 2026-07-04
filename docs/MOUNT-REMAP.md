@@ -1,8 +1,8 @@
 # Spec: Neutral working-directory mount (path de-identification)
 
-**Status:** Phase 1 (cwd-only, opt-in `[filesystem].remap_cwd`) **implemented**. This doc is the
-design record; the honest limitations below still hold (partial mountinfo fix; opt-in because it
-breaks absolute-path argv).
+**Status:** Phase 1 (`[filesystem].remap_cwd`) **and** Phase 2 (`[[filesystem.mount]]` per-path
+remaps) **implemented**. This doc is the design record; the honest limitations below still hold
+(partial mountinfo fix; opt-in because it breaks absolute-path argv).
 
 ## Problem
 
@@ -75,11 +75,18 @@ mapping (backward compatible, SPEC contract preserved).
 remap_cwd = "/work"
 ```
 
-Scope decision (recommended): **Phase 1 remaps only the cwd.** `--allow-read`/`--allow-write`
-paths stay identity-mapped, because (a) they are frequently referenced by absolute path in the
-command, and (b) the user named them explicitly. A later Phase 2 can add an explicit per-mount
-remap for allow paths (e.g. a `[[filesystem.mount]]` table with `host`/`sandbox`/`mode`) for
-users who want those de-identified too and are willing to rewrite their argv.
+Scope decision: **Phase 1 remaps only the cwd** (`--allow-read`/`--allow-write` stay
+identity-mapped by default, since they are often referenced by absolute path). **Phase 2** adds
+the explicit per-mount remap for users who want allow-style paths de-identified too:
+
+```toml
+[[filesystem.mount]]
+host    = "/home/you/project/data"   # resolved like an allow path (must exist; deny rules apply)
+sandbox = "/data"                    # child sees this neutral path, not the host path
+mode    = "ro"                       # "ro" (default) | "rw"
+```
+
+Both phases share the same host→sandbox translation and the same honest tradeoff.
 
 ## Implementation plan (grounded in current code)
 

@@ -91,6 +91,15 @@ mode = "deny-by-default"
 # still shows the host path (a bind mount always records its source). See docs/MOUNT-REMAP.md.
 # remap_cwd = "/work"
 
+# Explicit per-path remaps (Phase 2 of remap_cwd): expose a host path at a chosen NEUTRAL
+# sandbox path, so allow-style paths under your home can be de-identified too. Resolved like an
+# allow path (must exist; [filesystem].deny rules still enforced). Same opt-in tradeoff — a
+# command that references the real host path won't find it (use the sandbox path instead).
+# [[filesystem.mount]]
+# host    = "/home/you/project/data"
+# sandbox = "/data"
+# mode    = "ro"                       # "ro" (default) | "rw"
+
 # Read-only mounts from host into sandbox.
 #
 # Recommended:

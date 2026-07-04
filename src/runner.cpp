@@ -83,21 +83,23 @@ std::string host_to_sandbox(const std::string& host_path, const std::vector<Moun
     return host_path;
 }
 
-// Validate a [filesystem].remap_cwd value. Returns an error string, or nullopt if OK. The
-// target must be an absolute path, contain no ".." segment, and not collide with a base
-// system mount bwrap sets up (which would shadow it or fail).
-std::optional<std::string> validate_remap_cwd(const std::string& p) {
+// Validate a neutral sandbox mount path (remap_cwd / [[filesystem.mount]].sandbox). Returns
+// an error string, or nullopt if OK. The target must be an absolute path, contain no ".."
+// segment, and not collide with a base system mount bwrap sets up (which would shadow it or
+// fail). `what` names the offending knob in the message.
+std::optional<std::string> validate_sandbox_path(const std::string& p, const char* what) {
+    const std::string w = what;
     if (p.empty() || p[0] != '/')
-        return "remap_cwd must be an absolute path (e.g. \"/work\"); got: " + p;
+        return w + " must be an absolute path (e.g. \"/work\"); got: " + p;
     if (p.find("/..") != std::string::npos || p == "/..")
-        return "remap_cwd must not contain '..': " + p;
+        return w + " must not contain '..': " + p;
     static const char* kReserved[] = {"/",    "/usr", "/bin",  "/sbin", "/lib",
                                       "/lib64", "/proc", "/dev", "/etc",  "/tmp",
                                       "/sys",  "/run",  "/var",  "/home", "/root"};
     for (const char* r : kReserved) {
         const std::string res = r;
         if (p == res || (res != "/" && path_within(p, res)))
-            return "remap_cwd \"" + p + "\" collides with the reserved system path " + res +
+            return w + " \"" + p + "\" collides with the reserved system path " + res +
                    "; pick a neutral mount point like /work or /project.";
     }
     return std::nullopt;
@@ -371,10 +373,16 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         const std::string& cwd, const std::string& assets_dir, std::string& err) {
     err.clear();
 
-    // Validate [filesystem].remap_cwd early (before any side effects) so a bad value is a
-    // clean config error rather than a broken mount.
+    // Validate remap sandbox paths early (before any side effects) so a bad value is a clean
+    // config error rather than a broken mount.
     if (cfg.ext.remap_cwd.has_value()) {
-        if (auto verr = validate_remap_cwd(*cfg.ext.remap_cwd)) {
+        if (auto verr = validate_sandbox_path(*cfg.ext.remap_cwd, "[filesystem].remap_cwd")) {
+            err = "Error: " + *verr;
+            return 1;
+        }
+    }
+    for (const auto& rm : cfg.ext.remap_mounts) {
+        if (auto verr = validate_sandbox_path(rm.sandbox, "[[filesystem.mount]].sandbox")) {
             err = "Error: " + *verr;
             return 1;
         }
@@ -1423,6 +1431,13 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             "pwd/realpath/$PWD). Note: absolute-path command args referencing the host path "
             "will not resolve, and /proc/self/mountinfo's mount-source field still shows the "
             "real path (a bind mount records its source).");
+    }
+    if (!cfg.ext.remap_mounts.empty()) {
+        rec.active_policy_notes.push_back(
+            std::to_string(cfg.ext.remap_mounts.size()) +
+            " explicit path remap(s) ([[filesystem.mount]]): host paths presented at neutral "
+            "sandbox paths (same caveats as remap_cwd — argv host paths won't resolve; "
+            "mountinfo source field unchanged).");
     }
     {
         // Backend overrides relative to the safe defaults (BackendConfig defaults).
