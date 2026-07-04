@@ -278,10 +278,18 @@ Verdict: this tool did not get to see you naked.
   mirror of `uname` — are shadowed with a generic kernel string, so the child can't read your exact
   kernel release or distro build host (e.g. a `…pop-os.org` builder) as a fingerprint. Toggle with
   `[backend].fake_kernel`; set `[backend].kernel_osrelease` / `[backend].kernel_version` for
-  specific values. **Honest caveat:** only the `/proc` file reads are covered — the `uname()`
-  *syscall* is **not** intercepted (bwrap can't), so a program that calls it directly still sees the
-  real kernel. (Your host's DMI serials, product UUID, and MAC addresses do *not* leak at all,
-  because Raincoat never mounts `/sys` into the sandbox.)
+  specific values. By itself this covers only the `/proc` *file* reads — a program that calls the
+  `uname()` **syscall** directly (e.g. a static or Go binary) would still see the real kernel. To
+  close that too, enable `[backend].fake_uname` (below). (Your host's DMI serials, product UUID,
+  and MAC addresses do *not* leak at all, because Raincoat never mounts `/sys` into the sandbox.)
+- **Your kernel, at the syscall level** *(opt-in, x86_64)*. `[backend].fake_uname = true` installs
+  a **seccomp user-notify** supervisor that intercepts the `uname(2)` syscall itself and returns the
+  same generic kernel/hostname the `/proc` masks show — so even a statically-linked or Go binary
+  issuing the raw syscall (which an `LD_PRELOAD` shim would miss) gets the fake. It's off by default
+  because it installs a seccomp filter plus a supervisor thread; see `docs/FINGERPRINT-SYSCALLS.md`
+  for the full catalogue of identification vectors across Linux/macOS/Windows and the roadmap.
+  **Honest caveat — the hard floor:** CPU *instructions* like `CPUID`/`RDTSC` execute in user mode
+  and never trap, so they can't be faked without a hypervisor (a VM) — a deliberate non-goal.
 - **Your CPU.** On x86 hosts, `/proc/cpuinfo` is shadowed with a generic block, so the child
   reads a neutral `Generic x86_64 Processor` instead of your exact CPU model, stepping,
   microcode, clock, and flags (a strong, trivially-read machine fingerprint). The

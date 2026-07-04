@@ -257,6 +257,7 @@ std::optional<Options> load_profile(const std::string& path, std::string& err) {
     set_backend_bool("backend.fake_machine_id", o.ext.backend.fake_machine_id);
     if (auto s = t.get_string("backend.machine_id"); s.has_value())
         o.ext.backend.machine_id = *s;
+    set_backend_bool("backend.fake_uname", o.ext.backend.fake_uname);
     set_backend_bool("backend.mount_dev", o.ext.backend.mount_dev);
     set_backend_bool("backend.mount_tmpfs_tmp", o.ext.backend.mount_tmpfs_tmp);
     set_backend_bool("backend.die_with_parent", o.ext.backend.die_with_parent);

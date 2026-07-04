@@ -2,6 +2,7 @@
 #include "runner.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <csignal>
@@ -15,6 +16,8 @@
 #include <thread>
 #include <vector>
 
+#include <pthread.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
@@ -31,6 +34,7 @@
 #include "net_guard.hpp"
 #include "profile.hpp"
 #include "proxy.hpp"
+#include "seccomp_notify.hpp"
 #include "util.hpp"
 
 namespace raincoat {
@@ -1401,6 +1405,20 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             "/etc/machine-id presented as a constant generic value (host per-install "
             "identifier not exposed).");
     }
+    if (cfg.ext.backend.fake_uname) {
+        if (seccomp_uname_supported()) {
+            rec.active_policy_notes.push_back(
+                "uname(2) syscall faked via a seccomp user-notify supervisor: the child "
+                "(and any static/Go binary calling uname directly) sees the same generic "
+                "kernel/hostname as the /proc masks. Best-effort — installs a seccomp "
+                "filter + supervisor thread; on setup failure the trapped call returns "
+                "ENOSYS and uname is left effectively unmasked.");
+        } else {
+            rec.active_policy_notes.push_back(
+                "uname(2) syscall mask requested but unsupported on this arch (x86_64 "
+                "only) — left real.");
+        }
+    }
 
     // Egress bridge transparency. Honest network-model disclosure + one summary per
     // bridge (name, child-visible endpoint, injected env var name). The real upstream is
@@ -1568,14 +1586,35 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     for (auto& s : argv) cargv.push_back(const_cast<char*>(s.c_str()));
     cargv.push_back(nullptr);
 
+    // uname(2) syscall mask (Tier 2). When enabled and supported, install a seccomp
+    // user-notify filter in the child (it survives execve, so bwrap and the target inherit
+    // it) and service the trapped uname() calls from a supervisor thread in this (unfiltered)
+    // parent, returning the same generic identity the /proc masks show. The listener fd is
+    // handed back parent-ward over a socketpair. Best-effort: any setup failure disables the
+    // hook and leaves uname() real. See docs/FINGERPRINT-SYSCALLS.md.
+    bool uname_hook = cfg.ext.backend.fake_uname && seccomp_uname_supported();
+    int sc_sock[2] = {-1, -1};
+    if (uname_hook) {
+        if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sc_sock) != 0) {
+            uname_hook = false;
+            sc_sock[0] = sc_sock[1] = -1;
+        }
+    }
+
     pid_t pid = ::fork();
     if (pid < 0) {
         err = "Error: fork failed: " + std::string(std::strerror(errno));
+        if (uname_hook) { ::close(sc_sock[0]); ::close(sc_sock[1]); }
         restore_signals();
         cleanup_root();
         return 1;
     }
     if (pid == 0) {
+        if (uname_hook) {
+            ::close(sc_sock[0]);                        // parent end
+            seccomp_child_install_and_send(sc_sock[1]);  // best-effort; filter survives exec
+            ::close(sc_sock[1]);
+        }
         ::execvp(launch_path.c_str(), cargv.data());
         // Only reached if exec failed.
         std::perror(jail_active ? "raincoat: failed to exec pasta"
@@ -1588,10 +1627,52 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     g_child_pid = pid;
     if (g_pending_signal != 0) ::kill(pid, static_cast<int>(g_pending_signal));
 
+    // Bring up the uname supervisor thread. It runs with SIGINT/SIGTERM/SIGHUP blocked so
+    // those keep hitting the main thread's handlers; the main thread waits on the child while
+    // the supervisor answers uname() notifications concurrently (no waitpid/notify deadlock).
+    std::atomic<bool> uname_stop{false};
+    std::thread uname_thread;
+    int uname_listener = -1;
+    if (uname_hook) {
+        ::close(sc_sock[1]);  // child end
+        uname_listener = seccomp_recv_listener_fd(sc_sock[0]);
+        ::close(sc_sock[0]);
+        if (uname_listener >= 0) {
+            UtsnameSpoof spoof;
+            spoof.nodename = identity_host;
+            spoof.release = cfg.ext.backend.kernel_osrelease;
+            spoof.version = cfg.ext.backend.kernel_version;
+            sigset_t block, old;
+            sigemptyset(&block);
+            sigaddset(&block, SIGINT);
+            sigaddset(&block, SIGTERM);
+            sigaddset(&block, SIGHUP);
+            pthread_sigmask(SIG_BLOCK, &block, &old);
+            uname_thread = std::thread(seccomp_supervise_uname, uname_listener,
+                                       spoof, std::ref(uname_stop));
+            pthread_sigmask(SIG_SETMASK, &old, nullptr);
+        } else {
+            uname_hook = false;  // no listener; kernel makes trapped uname() return ENOSYS
+        }
+    }
+    // Tear down the supervisor thread (idempotent): stop it and join before returning on any
+    // path, so its std::thread is never destroyed while joinable.
+    auto stop_uname_supervisor = [&]() {
+        if (uname_thread.joinable()) {
+            uname_stop.store(true);
+            uname_thread.join();
+        }
+        if (uname_listener >= 0) {
+            ::close(uname_listener);
+            uname_listener = -1;
+        }
+    };
+
     int status = 0;
     while (::waitpid(pid, &status, 0) < 0) {
         if (errno != EINTR) {
             err = "Error: waitpid failed: " + std::string(std::strerror(errno));
+            stop_uname_supervisor();
             restore_signals();
             cleanup_root();
             return 1;
@@ -1602,6 +1683,9 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // dispositions cannot make the handler kill() a now-reaped (possibly kernel-
     // recycled) pid. forward_terminating_signal only signals when g_child_pid > 0.
     g_child_pid = 0;
+    // Child gone: no more uname() callers, so stop and join the supervisor before we
+    // proceed to teardown/audit.
+    stop_uname_supervisor();
     restore_signals();
 
     // Child reaped: tear down the egress bridge listeners + worker threads now (free the

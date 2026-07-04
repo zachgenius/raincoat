@@ -523,6 +523,13 @@ kernel_version = "#1 SMP PREEMPT_DYNAMIC Generic"
 # Present a constant generic /etc/machine-id instead of the host's stable per-install id.
 fake_machine_id = true
 machine_id = "0123456789abcdef0123456789abcdef"
+# Tier-2 (syscall-level) mask, OPT-IN, x86_64 only. Intercepts the uname(2) SYSCALL via a
+# seccomp user-notify supervisor and returns the same generic kernel/hostname the /proc masks
+# show — closing the gap for static/Go binaries that call uname() directly (which the /proc
+# file overlays and an LD_PRELOAD shim both miss). Off by default: it installs a seccomp filter
+# and a supervisor thread. Presented values reuse kernel_osrelease / kernel_version / the
+# identity hostname. See docs/FINGERPRINT-SYSCALLS.md.
+fake_uname = false
 mount_dev = true
 mount_tmpfs_tmp = true
 

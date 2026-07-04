@@ -223,6 +223,13 @@ struct BackendConfig {
     // non-identifying by design; configure it if a tool needs a specific value.
     bool fake_machine_id = true;
     std::string machine_id = "0123456789abcdef0123456789abcdef";
+    // Syscall-level (Tier 2) mask: intercept the uname(2) SYSCALL via a seccomp user-notify
+    // supervisor and return the same generic kernel/hostname the /proc masks show — closing
+    // the gap for static/Go binaries that call uname() directly instead of reading /proc.
+    // OFF by default: it installs a seccomp filter + a supervisor thread (heavier, newer path)
+    // and is x86_64-only. See docs/FINGERPRINT-SYSCALLS.md. The presented values reuse
+    // kernel_osrelease / kernel_version / the identity hostname.
+    bool fake_uname = false;
     bool mount_dev      = true;
     bool mount_tmpfs_tmp = true;
     bool die_with_parent = true;
