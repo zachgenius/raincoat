@@ -78,6 +78,8 @@ Capabilities backend_capabilities() {
     c.supports_minimal_etc = false;           // cannot bind a fake /etc
     c.supports_curated_fonts = false;         // cannot overlay /usr/share/fonts
     c.supports_netns_jail = false;            // no netns; kernel firewall replaces it
+    c.supports_proc_overlays = false;         // no /proc to overlay; Tier-1 masks are Linux-only
+    c.supports_seccomp_identity = false;      // no seccomp; identity faking would need DYLD interpose
     c.label = "Seatbelt (sandbox-exec, best-effort)";
     return c;
 }

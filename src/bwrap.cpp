@@ -33,7 +33,9 @@ std::vector<std::string> build_bwrap_argv(const std::string& bwrap_path, const C
                                           const std::string& mask_empty_file,
                                           const std::vector<std::string>& mask_files,
                                           const std::vector<std::string>& curated_font_dirs,
-                                          bool mask_usr_local_fonts) {
+                                          bool mask_usr_local_fonts,
+                                          const std::vector<std::pair<std::string, std::string>>&
+                                              proc_overlays) {
     std::vector<std::string> a;
     auto p1 = [&](const std::string& x) { a.push_back(x); };
     auto p2 = [&](const std::string& x, const std::string& y) {
@@ -114,7 +116,18 @@ std::vector<std::string> build_bwrap_argv(const std::string& bwrap_path, const C
         for (const auto& d : curated_font_dirs) p3("--ro-bind", d, d);
     }
 
-    if (backend.mount_proc) p2("--proc", "/proc");
+    if (backend.mount_proc) {
+        p2("--proc", "/proc");
+        // Overlay generic files onto the freshly-mounted procfs to hide machine
+        // fingerprints the real /proc exposes: /proc/cpuinfo (CPU model/stepping/flags),
+        // /proc/version and /proc/sys/kernel/{osrelease,version} (kernel release + build
+        // host — the file mirror of `uname`). Each entry is {host_file, /proc/... target};
+        // the raincoat-created host file is bound read-only over the target. These MUST
+        // come AFTER --proc so they land on the fresh procfs. Empty entries when the runner
+        // synthesized nothing (mask disabled, or a non-x86 host for cpuinfo), leaving the
+        // real files untouched. (The uname() *syscall* is not intercepted — file reads only.)
+        for (const auto& ov : proc_overlays) p3("--ro-bind", ov.first, ov.second);
+    }
     if (backend.mount_dev) p2("--dev", "/dev");
 
     // TLS trust store; DNS resolver (only when requested).

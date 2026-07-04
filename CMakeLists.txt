@@ -24,6 +24,7 @@ list(REMOVE_ITEM CORE_SOURCES "${CMAKE_SOURCE_DIR}/src/main.cpp")
 list(REMOVE_ITEM CORE_SOURCES
   "${CMAKE_SOURCE_DIR}/src/bwrap.cpp"
   "${CMAKE_SOURCE_DIR}/src/backend_linux.cpp"
+  "${CMAKE_SOURCE_DIR}/src/seccomp_notify.cpp"
   "${CMAKE_SOURCE_DIR}/src/seatbelt.cpp"
   "${CMAKE_SOURCE_DIR}/src/backend_macos.cpp")
 if(APPLE)
@@ -31,9 +32,11 @@ if(APPLE)
     "${CMAKE_SOURCE_DIR}/src/seatbelt.cpp"
     "${CMAKE_SOURCE_DIR}/src/backend_macos.cpp")
 else()
+  # seccomp_notify uses <linux/seccomp.h> / <linux/filter.h> — Linux-only.
   list(APPEND CORE_SOURCES
     "${CMAKE_SOURCE_DIR}/src/bwrap.cpp"
-    "${CMAKE_SOURCE_DIR}/src/backend_linux.cpp")
+    "${CMAKE_SOURCE_DIR}/src/backend_linux.cpp"
+    "${CMAKE_SOURCE_DIR}/src/seccomp_notify.cpp")
 endif()
 
 add_library(raincoat_core STATIC ${CORE_SOURCES})
@@ -80,7 +83,7 @@ file(GLOB TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/tests/test_*.cpp")
 set(RC_LINUX_ONLY_TESTS
   test_bwrap test_bwrap_attack2_regression test_bwrap_font_mask_regression
   test_font_local_mask_missing_dir_regression test_font_local_share_leak_attack
-  test_backend_golden_argv)
+  test_backend_golden_argv test_seccomp_notify)
 set(RC_MACOS_ONLY_TESTS test_seatbelt)
 
 foreach(test_src ${TEST_SOURCES})

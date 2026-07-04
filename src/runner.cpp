@@ -12,12 +12,25 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+// The Tier-2 identity-syscall mask (fake uname(2)/sysinfo(2)) uses seccomp user-notify — a
+// Linux-only kernel mechanism whose header pulls <linux/filter.h>. It and every use of it
+// below are guarded by __linux__, and seccomp_notify.cpp is compiled only on Linux (see
+// CMakeLists). The Tier-1 /proc overlays are portable and gated on Capabilities instead.
+// See docs/FINGERPRINT-SYSCALLS.md.
+#ifdef __linux__
+#include <pthread.h>      // pthread_sigmask for the identity supervisor thread
+#include <sys/socket.h>   // socketpair for the seccomp listener-fd handoff
+#include "seccomp_notify.hpp"
+#endif
 
 #include "audit.hpp"
 #include "backend.hpp"
@@ -86,6 +99,83 @@ std::string default_or_empty(const std::map<std::string, std::string>& m,
                              const std::string& key) {
     auto it = m.find(key);
     return it == m.end() ? std::string() : it->second;
+}
+
+// ---- Tier-1 fingerprint content generators (portable; see docs/FINGERPRINT-SYSCALLS.md) --
+// These build generic /proc file bodies. They contain no OS-specific APIs (uname() is
+// POSIX), so they compile on every platform; they are only CALLED under the
+// caps.supports_proc_overlays gate, which is false on backends without a /proc to overlay.
+
+// True on x86 hosts (the only arch for which we synthesize a plausible /proc/cpuinfo).
+bool host_is_x86() {
+    struct utsname u{};
+    if (::uname(&u) != 0) return false;
+    const std::string m = u.machine;
+    return m == "x86_64" || m == "amd64" || m == "i386" || m == "i486" ||
+           m == "i586" || m == "i686";
+}
+
+// Generic x86_64 /proc/cpuinfo with `nproc` identical logical processors — masks the host
+// CPU model/stepping/microcode/MHz/cache/bogomips while keeping the core count + baseline
+// flags. Two hosts with the same core count emit byte-identical output. vendor_id/model
+// are profile-configurable.
+std::string generic_cpuinfo(unsigned nproc, const std::string& vendor_id,
+                            const std::string& model_name) {
+    if (nproc == 0) nproc = 1;
+    const char* kFlags =
+        "fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 "
+        "clflush mmx fxsr sse sse2 ht syscall nx lm constant_tsc";
+    std::ostringstream ss;
+    for (unsigned i = 0; i < nproc; ++i) {
+        ss << "processor\t: " << i << "\n"
+           << "vendor_id\t: " << vendor_id << "\n"
+           << "cpu family\t: 6\n"
+           << "model\t\t: 60\n"
+           << "model name\t: " << model_name << "\n"
+           << "stepping\t: 3\n"
+           << "microcode\t: 0x1\n"
+           << "cpu MHz\t\t: 2000.000\n"
+           << "cache size\t: 8192 KB\n"
+           << "physical id\t: 0\n"
+           << "siblings\t: " << nproc << "\n"
+           << "core id\t\t: " << i << "\n"
+           << "cpu cores\t: " << nproc << "\n"
+           << "apicid\t\t: " << i << "\n"
+           << "initial apicid\t: " << i << "\n"
+           << "fpu\t\t: yes\n"
+           << "fpu_exception\t: yes\n"
+           << "cpuid level\t: 13\n"
+           << "wp\t\t: yes\n"
+           << "flags\t\t: " << kFlags << "\n"
+           << "bugs\t\t:\n"
+           << "bogomips\t: 4000.00\n"
+           << "clflush size\t: 64\n"
+           << "cache_alignment\t: 64\n"
+           << "address sizes\t: 39 bits physical, 48 bits virtual\n"
+           << "power management:\n"
+           << "\n";
+    }
+    return ss.str();
+}
+
+// Generic /proc/version line — masks the host kernel release + distro build host/toolchain.
+std::string generic_proc_version(const std::string& osrelease, const std::string& version) {
+    return "Linux version " + osrelease +
+           " (builder@sandbox) (gcc version 13.0.0 (Generic)) " + version + "\n";
+}
+
+// Generic /proc/meminfo — masks the host's exact RAM size; total_kb is shared with sysinfo(2).
+std::string generic_meminfo(std::uint64_t total_kb) {
+    const std::uint64_t avail = total_kb / 2;
+    std::ostringstream ss;
+    ss << "MemTotal:       " << total_kb << " kB\n"
+       << "MemFree:        " << avail << " kB\n"
+       << "MemAvailable:   " << avail << " kB\n"
+       << "Buffers:               0 kB\n"
+       << "Cached:                0 kB\n"
+       << "SwapTotal:             0 kB\n"
+       << "SwapFree:              0 kB\n";
+    return ss.str();
 }
 
 // Terminating-signal handling for sandbox cleanup. When raincoat is interrupted
@@ -765,11 +855,22 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // sandbox temp tree and bound read-only at their canonical /etc paths; they are
     // destroyed with the sandbox root. /etc/localtime is bound from the host zoneinfo
     // for the resolved TZ (falling back to UTC) only when that file exists.
-    bool etc_hostname = false, etc_hosts = false, etc_localtime = false;
+    bool etc_hostname = false, etc_hosts = false, etc_localtime = false, etc_machine_id = false;
     if (caps.supports_minimal_etc) {  // bind-based; the Seatbelt backend cannot overlay /etc
         const std::string etc_dir = root + "/etc";
         std::string derr;
         if (make_dirs(etc_dir, derr)) {
+            // Constant generic /etc/machine-id — masks the stable per-install identifier the
+            // host would otherwise expose. Configurable via backend.machine_id.
+            if (cfg.ext.backend.fake_machine_id) {
+                const std::string mid_path = etc_dir + "/machine-id";
+                std::ofstream mf(mid_path, std::ios::binary | std::ios::trunc);
+                mf << cfg.ext.backend.machine_id << "\n";
+                if (mf) {
+                    mounts.push_back(Mount{mid_path, "/etc/machine-id", MountMode::ReadOnly});
+                    etc_machine_id = true;
+                }
+            }
             const std::string hostname_path = etc_dir + "/hostname";
             const std::string hosts_path = etc_dir + "/hosts";
             {
@@ -1132,6 +1233,59 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         mask_usr_local_fonts =
             std::filesystem::is_directory("/usr/local/share/fonts", lec) && !lec;
     }
+
+    // ---- Tier-1 fingerprint /proc overlays (see docs/FINGERPRINT-SYSCALLS.md) ---------
+    // Synthesize generic /proc files and hand the backend a list of {host_file, /proc
+    // target} overlays it binds over the fresh procfs, masking the host CPU / kernel / RAM.
+    // Portable code, gated on caps.supports_proc_overlays (false on backends without a
+    // /proc to overlay, e.g. Seatbelt) so it is a no-op there and proc_overlays stays empty.
+    std::vector<std::pair<std::string, std::string>> proc_overlays;
+    bool cpuinfo_masked = false, cpuinfo_skipped_arch = false, kernel_masked = false;
+    bool meminfo_masked = false, uptime_masked = false, boot_id_masked = false;
+    if (caps.supports_proc_overlays && cfg.ext.backend.mount_proc) {
+        auto write_overlay = [&](const std::string& name, const std::string& target,
+                                 const std::string& content) -> bool {
+            const std::string path = root + "/" + name;
+            std::ofstream f(path, std::ios::binary | std::ios::trunc);
+            f << content;
+            if (!f) return false;
+            proc_overlays.emplace_back(path, target);
+            return true;
+        };
+        if (cfg.ext.backend.fake_cpuinfo) {
+            if (host_is_x86()) {
+                cpuinfo_masked = write_overlay(
+                    ".rc-cpuinfo", "/proc/cpuinfo",
+                    generic_cpuinfo(std::thread::hardware_concurrency(),
+                                    cfg.ext.backend.cpu_vendor_id,
+                                    cfg.ext.backend.cpu_model_name));
+            } else {
+                cpuinfo_skipped_arch = true;
+            }
+        }
+        if (cfg.ext.backend.fake_kernel) {
+            const std::string& rel = cfg.ext.backend.kernel_osrelease;
+            const std::string& ver = cfg.ext.backend.kernel_version;
+            bool v = write_overlay(".rc-version", "/proc/version", generic_proc_version(rel, ver));
+            bool r = write_overlay(".rc-osrelease", "/proc/sys/kernel/osrelease", rel + "\n");
+            bool k = write_overlay(".rc-kversion", "/proc/sys/kernel/version", ver + "\n");
+            kernel_masked = v || r || k;
+        }
+        if (cfg.ext.backend.fake_meminfo) {
+            meminfo_masked = write_overlay(".rc-meminfo", "/proc/meminfo",
+                                           generic_meminfo(cfg.ext.backend.mem_total_kb));
+        }
+        if (cfg.ext.backend.fake_uptime) {
+            bool up = write_overlay(".rc-uptime", "/proc/uptime", "3600.00 3600.00\n");
+            bool la = write_overlay(".rc-loadavg", "/proc/loadavg", "0.00 0.00 0.00 1/128 1\n");
+            uptime_masked = up || la;
+        }
+        if (cfg.ext.backend.fake_boot_id) {
+            boot_id_masked = write_overlay(".rc-bootid", "/proc/sys/kernel/random/boot_id",
+                                           cfg.ext.backend.boot_id + "\n");
+        }
+    }
+
     // Assemble the full launch through the platform backend. On Linux this delegates to
     // the unchanged build_bwrap_argv and reproduces the pasta wrap verbatim; on macOS it
     // produces `sandbox-exec -f <profile> -- cmd...` plus the SBPL profile_text. Every
@@ -1151,6 +1305,7 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     li.mask_files = mask_files;
     li.curated_font_dirs = font.font_dirs;
     li.mask_usr_local_fonts = mask_usr_local_fonts;
+    li.proc_overlays = proc_overlays;
     li.jail_active = jail_active;
     li.strict_jail = strict_jail;
     li.pasta_path = pasta_path;
@@ -1348,8 +1503,58 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         if (etc_hostname) add("hostname");
         if (etc_hosts) add("hosts");
         if (etc_localtime) add("localtime");
+        if (etc_machine_id) add("machine-id");
         rec.active_policy_notes.push_back(
             "Minimal /etc provided (generic, host /etc never exposed): " + files);
+    }
+
+    // Machine-fingerprint masks (Tier 1 /proc overlays + Tier 2 syscall fakes). Only present
+    // when the linked backend supports them (Linux); honest per-mask disclosure.
+    if (cpuinfo_masked) {
+        rec.active_policy_notes.push_back(
+            "/proc/cpuinfo masked with a generic block (host CPU model/stepping/microcode/"
+            "MHz/cache/bogomips hidden; core count + baseline flags kept).");
+    } else if (cpuinfo_skipped_arch) {
+        rec.active_policy_notes.push_back(
+            "/proc/cpuinfo left unmasked: fake_cpuinfo only synthesizes an x86 block, and this "
+            "host is not x86 (a wrong generic block would confuse tools more than the leak).");
+    }
+    if (kernel_masked) {
+        rec.active_policy_notes.push_back(
+            "Kernel identity masked: /proc/version and /proc/sys/kernel/{osrelease,version} "
+            "present generic values (host kernel release + distro build host hidden).");
+    }
+    if (meminfo_masked) {
+        rec.active_policy_notes.push_back(
+            "/proc/meminfo masked (host RAM size hidden; generic self-consistent totals).");
+    }
+    if (uptime_masked) {
+        rec.active_policy_notes.push_back(
+            "/proc/uptime and /proc/loadavg masked with generic constants.");
+    }
+    if (boot_id_masked) {
+        rec.active_policy_notes.push_back(
+            "/proc/sys/kernel/random/boot_id masked with a constant (per-boot correlation ID).");
+    }
+    if (cfg.ext.backend.fake_uname || cfg.ext.backend.fake_sysinfo) {
+        std::string which;
+        if (cfg.ext.backend.fake_uname) which += "uname(2)";
+        if (cfg.ext.backend.fake_sysinfo)
+            which += (which.empty() ? "" : " + ") + std::string("sysinfo(2)");
+        bool active = false;
+#ifdef __linux__
+        active = id_hook;
+#endif
+        if (active) {
+            rec.active_policy_notes.push_back(
+                which + " syscall(s) faked via a seccomp user-notify supervisor: even a "
+                "static/Go binary issuing the raw syscall gets the generic identity, matching "
+                "the /proc masks.");
+        } else {
+            rec.active_policy_notes.push_back(
+                which + " syscall mask requested but not active on this run (unsupported on "
+                "this backend/arch, or setup failed — the real syscall values are returned).");
+        }
     }
 
     // Egress bridge transparency. Honest network-model disclosure + one summary per
@@ -1518,9 +1723,34 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     for (auto& s : argv) cargv.push_back(const_cast<char*>(s.c_str()));
     cargv.push_back(nullptr);
 
+    // ---- Tier-2 identity-syscall mask (uname(2)/sysinfo(2)) via seccomp user-notify -----
+    // Linux-only kernel mechanism (see docs/FINGERPRINT-SYSCALLS.md): install a seccomp
+    // user-notify filter in the CHILD (it survives execve, so bwrap + the target inherit it)
+    // and service trapped calls from a supervisor thread in this (unfiltered) parent. The
+    // whole hook is #ifdef __linux__ + gated on caps.supports_seccomp_identity; best-effort
+    // (any setup failure disables it and leaves the syscalls real). The BPF program is built
+    // HERE so the child path stays allocation-free; the listener fd comes back over a socketpair.
+#ifdef __linux__
+    const bool want_uname = caps.supports_seccomp_identity && cfg.ext.backend.fake_uname;
+    const bool want_sysinfo = caps.supports_seccomp_identity && cfg.ext.backend.fake_sysinfo;
+    bool id_hook = (want_uname || want_sysinfo) && seccomp_identity_supported();
+    std::vector<sock_filter> id_prog;
+    int sc_sock[2] = {-1, -1};
+    if (id_hook) {
+        id_prog = build_identity_filter_program(want_uname, want_sysinfo);
+        if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sc_sock) != 0) {
+            id_hook = false;
+            sc_sock[0] = sc_sock[1] = -1;
+        }
+    }
+#endif
+
     pid_t pid = ::fork();
     if (pid < 0) {
         err = "Error: fork failed: " + std::string(std::strerror(errno));
+#ifdef __linux__
+        if (id_hook) { ::close(sc_sock[0]); ::close(sc_sock[1]); }
+#endif
         restore_signals();
         cleanup_root();
         return 1;
@@ -1544,6 +1774,14 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         }
         // Linux/bubblewrap (ViaArgv): env is baked into argv (--clearenv/--setenv); exec
         // carrying the inherited parent environ exactly as before — byte-for-byte unchanged.
+#ifdef __linux__
+        if (id_hook) {
+            ::close(sc_sock[0]);  // parent end
+            seccomp_child_install_and_send(sc_sock[1], id_prog.data(),
+                                           static_cast<unsigned int>(id_prog.size()));
+            ::close(sc_sock[1]);
+        }
+#endif
         ::execvp(launch_path.c_str(), cargv.data());
         // Only reached if exec failed.
         std::perror(jail_active ? "raincoat: failed to exec pasta"
@@ -1556,10 +1794,61 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     g_child_pid = pid;
     if (g_pending_signal != 0) ::kill(pid, static_cast<int>(g_pending_signal));
 
+    // Bring up the identity supervisor thread (Linux). It runs with SIGINT/SIGTERM/SIGHUP
+    // blocked so those keep hitting the main thread's handlers; the main thread waits on the
+    // child while the supervisor answers seccomp notifications concurrently (no deadlock).
+#ifdef __linux__
+    std::atomic<bool> id_stop{false};
+    std::thread id_thread;
+    int id_listener = -1;
+    if (id_hook) {
+        ::close(sc_sock[1]);  // child end
+        id_listener = seccomp_recv_listener_fd(sc_sock[0]);
+        ::close(sc_sock[0]);
+        if (id_listener >= 0) {
+            IdentitySpoof spoof;
+            spoof.trap_uname = want_uname;
+            spoof.trap_sysinfo = want_sysinfo;
+            spoof.uts.nodename = identity_host;
+            spoof.uts.release = cfg.ext.backend.kernel_osrelease;
+            spoof.uts.version = cfg.ext.backend.kernel_version;
+            spoof.sys.total_ram_bytes =
+                static_cast<std::uint64_t>(cfg.ext.backend.mem_total_kb) * 1024;
+            spoof.sys.free_ram_bytes = spoof.sys.total_ram_bytes / 2;
+            sigset_t block, old;
+            sigemptyset(&block);
+            sigaddset(&block, SIGINT);
+            sigaddset(&block, SIGTERM);
+            sigaddset(&block, SIGHUP);
+            pthread_sigmask(SIG_BLOCK, &block, &old);
+            id_thread = std::thread(seccomp_supervise_identity, id_listener, spoof,
+                                    std::ref(id_stop));
+            pthread_sigmask(SIG_SETMASK, &old, nullptr);
+        } else {
+            id_hook = false;  // no listener; kernel makes trapped syscalls return ENOSYS
+        }
+    }
+    // Stop + join the supervisor (idempotent) before any return, so its std::thread is never
+    // destroyed while joinable.
+    auto stop_id_supervisor = [&]() {
+        if (id_thread.joinable()) {
+            id_stop.store(true);
+            id_thread.join();
+        }
+        if (id_listener >= 0) {
+            ::close(id_listener);
+            id_listener = -1;
+        }
+    };
+#endif
+
     int status = 0;
     while (::waitpid(pid, &status, 0) < 0) {
         if (errno != EINTR) {
             err = "Error: waitpid failed: " + std::string(std::strerror(errno));
+#ifdef __linux__
+            stop_id_supervisor();
+#endif
             restore_signals();
             cleanup_root();
             return 1;
@@ -1570,6 +1859,10 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // dispositions cannot make the handler kill() a now-reaped (possibly kernel-
     // recycled) pid. forward_terminating_signal only signals when g_child_pid > 0.
     g_child_pid = 0;
+#ifdef __linux__
+    // Child gone: no more uname()/sysinfo() callers, so stop + join the supervisor.
+    stop_id_supervisor();
+#endif
     restore_signals();
 
     // Child reaped: tear down the egress bridge listeners + worker threads now (free the

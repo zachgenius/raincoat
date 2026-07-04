@@ -71,6 +71,10 @@ struct Capabilities {
     bool supports_curated_fonts        = true;  // tmpfs /usr/share/fonts + re-bind curated set
     bool supports_netns_jail           = true;  // pasta/slirp4netns isolated-netns egress jail
 
+    // Machine-fingerprint faking (see docs/FINGERPRINT-SYSCALLS.md).
+    bool supports_proc_overlays        = true;  // Tier 1: --ro-bind generic /proc/{cpuinfo,version,...}
+    bool supports_seccomp_identity     = true;  // Tier 2: fake uname(2)/sysinfo(2) via seccomp user-notify
+
     std::string label = "bubblewrap (Linux user namespaces)";  // for audit + doctor
 };
 
@@ -95,6 +99,9 @@ struct LaunchInputs {
     std::vector<std::string> mask_files;
     std::vector<std::string> curated_font_dirs;
     bool                     mask_usr_local_fonts = true;
+    // Tier-1 fingerprint overlays: {host_file, /proc target} pairs bound over the fresh
+    // procfs (Linux). Empty on backends without supports_proc_overlays.
+    std::vector<std::pair<std::string, std::string>> proc_overlays;
 
     // Isolated-netns (pasta) jail context. supports_netns_jail=false backends leave these
     // default (jail_active=false) and emit no wrap.
