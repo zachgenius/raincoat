@@ -537,6 +537,9 @@ mount_proc = true
 # logical-processor COUNT is always the host's, so thread-pool sizing stays correct.
 cpu_vendor_id = "GenuineIntel"
 cpu_model_name = "Generic x86_64 Processor"
+# Logical CPU count as seen via /proc/cpuinfo (block count) AND sched_getaffinity(2) — the
+# syscall nproc/OpenMP/Go read (so even a static binary sees this count). Unset => real count.
+cpu_count = 8
 # Kernel: /proc/version + /proc/sys/kernel/{osrelease,version} AND uname(2). Faked if either
 # is set; the unset one stays the host's real value.
 kernel_osrelease = "6.1.0-generic"

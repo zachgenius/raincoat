@@ -42,7 +42,7 @@ supervisor exists. To be consistent, the fake values MUST match across both path
 |---|---|---|---|
 | `uname(2)` (63) | `sysname`, `nodename` (hostname), `release` (kernel), `version` (build string), `machine` (arch), `domainname` | seccomp user-notify: write a fake `struct new_utsname` into the child's buffer | **implemented** (set `kernel_osrelease`/`kernel_version`) |
 | `sysinfo(2)` (99) | `uptime`, load avg, `totalram`/`freeram` (RAM size), swap, process count | seccomp user-notify: write fake `struct sysinfo` | **implemented** (set `mem_total_kb`/`uptime_seconds`) |
-| `sched_getaffinity(2)` (204) | logical CPU count (`nproc`) | seccomp user-notify: rewrite the returned cpu-set | planned (risky — breaks pool sizing) |
+| `sched_getaffinity(2)` (204) | logical CPU count (`nproc`) | seccomp user-notify: write a cpu-set with `cpu_count` bits | **implemented** (`cpu_count`) |
 | `getcpu(2)` (309) | current CPU/NUMA node → topology inference | user-notify: pin to 0 | low value |
 | `clock_gettime(CLOCK_BOOTTIME)` / `CLOCK_MONOTONIC` | uptime, boot correlation | hard — faking time breaks programs; only offset-able | not planned |
 | `ioctl(SIOCGIFHWADDR/SIOCGIFCONF)` | interface **MAC** + names | user-notify is awkward (ioctl arg structs); the **isolated-netns jail** (pasta) is the real fix — child sees only a synthetic iface | covered by egress strict jail; else note |
@@ -216,21 +216,44 @@ identity remain Tier 3 / hardware-rooted.
 
 ## Implementation roadmap
 
-- [x] Tier 1, Linux: `/proc/cpuinfo`, `/proc/version` + `uname` file mirror, `/etc/machine-id`
-- [x] Tier 2, Linux: `uname(2)` via seccomp user-notify (set `kernel_osrelease`/`kernel_version`)
-- [x] Tier 2, Linux: `sysinfo(2)` (set `mem_total_kb`/`uptime_seconds`) + paired `/proc/meminfo`, `/proc/uptime`, `/proc/loadavg` overlays
-- [x] Tier 1, Linux: `boot_id` overlay (set `boot_id`); `/proc/cmdline` (set `kernel_cmdline`)
-- [x] Capability-gated per backend: `supports_proc_overlays` / `supports_seccomp_identity`
-      (Linux true, macOS false). Tier-1 overlays are portable code gated on the flag; the
-      Tier-2 seccomp hook is `#ifdef __linux__` + a Linux-only `seccomp_notify.cpp` TU.
+**Done (Linux, value-driven — set the value to mask, omit for the real system value):**
+
+- [x] Tier 1: `/proc/cpuinfo` (`cpu_vendor_id`/`cpu_model_name`)
+- [x] Tier 1: `/proc/version` + `/proc/sys/kernel/{osrelease,version}` (`kernel_osrelease`/`kernel_version`)
+- [x] Tier 1: `/proc/cmdline` — root/resume disk UUID + distro boot image (`kernel_cmdline`)
+- [x] Tier 1: `/etc/machine-id` (`machine_id`); `/proc/sys/kernel/random/boot_id` (`boot_id`)
+- [x] Tier 1: `/proc/meminfo` (`mem_total_kb`); `/proc/uptime` + `/proc/loadavg` (`uptime_seconds`)
+- [x] Tier 2: `uname(2)` via seccomp user-notify (`kernel_osrelease`/`kernel_version`)
+- [x] Tier 2: `sysinfo(2)` via seccomp user-notify (`mem_total_kb`/`uptime_seconds`)
+- [x] Tier 1 + Tier 2: **CPU core count** — `/proc/cpuinfo` block count + `sched_getaffinity(2)` (`cpu_count`)
+- [x] Path de-identification: `[filesystem].remap_cwd` + `[[filesystem.mount]]` present host paths at neutral sandbox paths (see `MOUNT-REMAP.md`)
+- [x] Not exposed at all: DMI serials / product UUID / MAC (Raincoat never mounts `/sys`)
+
+**Done (cross-platform architecture + macOS):**
+
+- [x] Capability-gated per backend: `supports_proc_overlays` / `supports_seccomp_identity` /
+      `supports_path_remap` / `supports_dyld_interpose`. Tier-1 overlays are portable code gated
+      on the flag; the Tier-2 seccomp hook is `#ifdef __linux__` + a Linux-only `seccomp_notify.cpp` TU.
 - [x] macOS Seatbelt backend (fs/network/env identity) — see `docs/MACOS.md`
-- [ ] Tier 1, Linux: `/proc/self/mountinfo` — **blocked**: bind-overlay can't follow the per-reader `self` indirection (verified), and there's no syscall to trap. Needs a different mechanism (mount cwd at a generic path; strip host paths from binds).
-- [ ] `uname` on non-x86 arches (per-arch syscall numbers)
 - [x] macOS `DYLD_INSERT_LIBRARIES` interposer — `gethostname`, `uname`, `getlogin`/`getlogin_r`,
-      `getpwuid`/`getpwnam`, `sysctlbyname` (hostname/CPU/kernel/RAM); routes the value-driven
-      `fake_*` knobs to Tier-2 on macOS via an **in-process `sandbox_init` pivot** (SIP strips the
-      injection through `sandbox-exec` — measured). Honest limits kept: libc-caller-only, **no
+      `getpwuid`/`getpwnam`, `sysctlbyname` (hostname/CPU/kernel/RAM/`hw.ncpu`); routes the
+      value-driven config to Tier-2 on macOS via an **in-process `sandbox_init` pivot** (SIP strips
+      the injection through `sandbox-exec` — measured). Honest limits: libc-caller-only, **no
       seccomp-notify backstop**, SIP/hardened-runtime/static targets opt out — strictly weaker than
       Linux Tier-2. Still future: `gethostuuid`, IOKit UUID/serial, `getifaddrs` MACs.
-- [ ] Windows API-hook layer (`MachineGuid`, SMBIOS, WMI)
-- [ ] Tier 3 — explicit non-goal (needs a VM/hypervisor)
+
+**Open (candidates):**
+
+- [ ] `uname` on non-x86 arches (per-arch syscall numbers)
+
+**Blocked / deferred (no clean mechanism):**
+
+- [ ] `/proc/self/mountinfo`, `/proc/mounts` — per-reader `self` indirection defeats bind-overlay (verified); no syscall to trap. `remap_cwd` mitigates the *mount-point* path; the mount-*source* field and `uid=`/device remain.
+- [ ] `/proc/stat` — a static overlay would freeze the live CPU counters (`btime` is the only static leak; not worth breaking `top`/`mpstat`).
+- [ ] `statfs`/`statvfs` syscalls — the path/fd argument resolves in the *child's* mount namespace, so the parent-side supervisor can't baseline the real result cleanly.
+- [ ] `getuid`/`getgid`, `sched_setaffinity`, `clock_gettime(CLOCK_BOOTTIME)` — faking these breaks permission/thread/timing logic; the right tool for uid is `--unshare-user` mapping, not a fake.
+
+**Off-platform / non-goal:**
+
+- [ ] Windows API-hook layer (`MachineGuid`, SMBIOS, WMI) — separate effort
+- [ ] Tier 3 (`CPUID`/`RDTSC`/`RDRAND`) — needs a VM/hypervisor; explicit non-goal

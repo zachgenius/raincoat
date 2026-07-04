@@ -158,6 +158,24 @@ bool host_is_x86() {
            m == "i586" || m == "i686";
 }
 
+// Read the host's real CPU vendor_id + model name from /proc/cpuinfo (first occurrence), so an
+// unset cpu_vendor_id/cpu_model_name can fall back to the real value (e.g. setting only
+// cpu_count keeps the real model while changing the block count).
+void read_host_cpu(std::string& vendor, std::string& model) {
+    vendor.clear();
+    model.clear();
+    std::ifstream f("/proc/cpuinfo");
+    std::string line;
+    while ((vendor.empty() || model.empty()) && std::getline(f, line)) {
+        auto after_colon = [&](const std::string& l) -> std::string {
+            auto pos = l.find(':');
+            return pos == std::string::npos ? std::string() : trim(l.substr(pos + 1));
+        };
+        if (vendor.empty() && starts_with(line, "vendor_id")) vendor = after_colon(line);
+        if (model.empty() && starts_with(line, "model name")) model = after_colon(line);
+    }
+}
+
 // Generic x86_64 /proc/cpuinfo with `nproc` identical logical processors — masks the host
 // CPU model/stepping/microcode/MHz/cache/bogomips while keeping the core count + baseline
 // flags. Two hosts with the same core count emit byte-identical output. vendor_id/model
@@ -1346,13 +1364,24 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         const BackendConfig& bk = cfg.ext.backend;
         // Value-driven: each mask is active when its config value is set; an unset value on a
         // composite (/proc/version) falls back to the host's REAL value ("unset => system").
-        if (bk.cpu_vendor_id || bk.cpu_model_name) {
+        // cpuinfo: faked when any cpu identity value is set (vendor/model/count). Each unset
+        // field falls back to the host's REAL value (read from /proc/cpuinfo), so setting only
+        // cpu_count keeps the real model while changing the block count — consistent with the
+        // sched_getaffinity mask below.
+        if (bk.cpu_vendor_id || bk.cpu_model_name || bk.cpu_count) {
             if (host_is_x86()) {
+                std::string real_vendor, real_model;
+                read_host_cpu(real_vendor, real_model);
+                const unsigned count = bk.cpu_count ? static_cast<unsigned>(*bk.cpu_count)
+                                                    : std::thread::hardware_concurrency();
                 cpuinfo_masked = write_overlay(
                     ".rc-cpuinfo", "/proc/cpuinfo",
-                    generic_cpuinfo(std::thread::hardware_concurrency(),
-                                    bk.cpu_vendor_id.value_or("GenuineIntel"),
-                                    bk.cpu_model_name.value_or("Generic x86_64 Processor")));
+                    generic_cpuinfo(
+                        count,
+                        bk.cpu_vendor_id.value_or(real_vendor.empty() ? "GenuineIntel"
+                                                                      : real_vendor),
+                        bk.cpu_model_name.value_or(
+                            real_model.empty() ? "Generic x86_64 Processor" : real_model)));
             } else {
                 cpuinfo_skipped_arch = true;
             }
@@ -1666,11 +1695,13 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         cfg.ext.backend.kernel_osrelease.has_value() || cfg.ext.backend.kernel_version.has_value();
     const bool cfg_want_sysinfo =
         cfg.ext.backend.mem_total_kb.has_value() || cfg.ext.backend.uptime_seconds.has_value();
-    if (cfg_want_uname || cfg_want_sysinfo) {
+    const bool cfg_want_affinity = cfg.ext.backend.cpu_count.has_value();
+    if (cfg_want_uname || cfg_want_sysinfo || cfg_want_affinity) {
         std::string which;
-        if (cfg_want_uname) which += "uname(2)";
-        if (cfg_want_sysinfo)
-            which += (which.empty() ? "" : " + ") + std::string("sysinfo(2)");
+        auto add_which = [&](const char* s) { which += (which.empty() ? "" : " + ") + std::string(s); };
+        if (cfg_want_uname) add_which("uname(2)");
+        if (cfg_want_sysinfo) add_which("sysinfo(2)");
+        if (cfg_want_affinity) add_which("sched_getaffinity(2)");
         bool active = false;
 #ifdef __linux__
         active = id_hook;
@@ -1867,11 +1898,13 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     const bool want_sysinfo = caps.supports_seccomp_identity &&
         (cfg.ext.backend.mem_total_kb.has_value() ||
          cfg.ext.backend.uptime_seconds.has_value());
-    bool id_hook = (want_uname || want_sysinfo) && seccomp_identity_supported();
+    const bool want_affinity =
+        caps.supports_seccomp_identity && cfg.ext.backend.cpu_count.has_value();
+    bool id_hook = (want_uname || want_sysinfo || want_affinity) && seccomp_identity_supported();
     std::vector<sock_filter> id_prog;
     int sc_sock[2] = {-1, -1};
     if (id_hook) {
-        id_prog = build_identity_filter_program(want_uname, want_sysinfo);
+        id_prog = build_identity_filter_program(want_uname, want_sysinfo, want_affinity);
         if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sc_sock) != 0) {
             id_hook = false;
             sc_sock[0] = sc_sock[1] = -1;
@@ -1960,12 +1993,14 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             IdentitySpoof spoof;
             spoof.trap_uname = want_uname;
             spoof.trap_sysinfo = want_sysinfo;
+            spoof.trap_affinity = want_affinity;
             spoof.uts_nodename = identity_host;
             spoof.uts_release = cfg.ext.backend.kernel_osrelease;
             spoof.uts_version = cfg.ext.backend.kernel_version;
             if (cfg.ext.backend.mem_total_kb)
                 spoof.sys_total_ram_bytes = *cfg.ext.backend.mem_total_kb * 1024;
             spoof.sys_uptime_seconds = cfg.ext.backend.uptime_seconds;
+            spoof.cpu_count = cfg.ext.backend.cpu_count;
             sigset_t block, old;
             sigemptyset(&block);
             sigaddset(&block, SIGINT);

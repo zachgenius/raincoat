@@ -175,6 +175,7 @@ std::optional<LaunchPlan> backend_build_launch(const LaunchInputs& in, std::stri
         if (bk.cpu_model_name) plan.child_env["RC_FAKE_CPU_BRAND"] = *bk.cpu_model_name;
         if (bk.mem_total_kb)
             plan.child_env["RC_FAKE_MEMSIZE"] = std::to_string(*bk.mem_total_kb * 1024ull);
+        if (bk.cpu_count) plan.child_env["RC_FAKE_NCPU"] = std::to_string(*bk.cpu_count);
     }
     return plan;
 }
