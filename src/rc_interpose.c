@@ -126,6 +126,19 @@ static int rc_return_u64(uint64_t val, void* oldp, size_t* oldlenp) {
     }
     return 0;
 }
+// hw.ncpu / hw.logicalcpu / ... are int32.
+static int rc_return_i32(int32_t val, void* oldp, size_t* oldlenp) {
+    if (oldlenp && !oldp) {
+        *oldlenp = sizeof(int32_t);
+        return 0;
+    }
+    if (oldp && oldlenp && *oldlenp >= sizeof(int32_t)) {
+        memcpy(oldp, &val, sizeof(int32_t));
+        *oldlenp = sizeof(int32_t);
+        return 0;
+    }
+    return 0;
+}
 static int rc_sysctlbyname(const char* name, void* oldp, size_t* oldlenp, void* newp,
                            size_t newlen) {
     if (name && !newp) {  // only intercept reads, never sets
@@ -140,6 +153,14 @@ static int rc_sysctlbyname(const char* name, void* oldp, size_t* oldlenp, void* 
             return rc_return_str(v, oldp, oldlenp);
         if (strcmp(name, "hw.memsize") == 0 && (v = rc_env("RC_FAKE_MEMSIZE")))
             return rc_return_u64(strtoull(v, NULL, 10), oldp, oldlenp);
+        // Logical CPU count (nproc / os.cpus() read these). Fake all the count views to the
+        // same value so they stay self-consistent.
+        if ((strcmp(name, "hw.ncpu") == 0 || strcmp(name, "hw.logicalcpu") == 0 ||
+             strcmp(name, "hw.logicalcpu_max") == 0 || strcmp(name, "hw.physicalcpu") == 0 ||
+             strcmp(name, "hw.physicalcpu_max") == 0 || strcmp(name, "hw.activecpu") == 0 ||
+             strcmp(name, "hw.availcpu") == 0) &&
+            (v = rc_env("RC_FAKE_NCPU")))
+            return rc_return_i32((int32_t)strtol(v, NULL, 10), oldp, oldlenp);
     }
     return sysctlbyname(name, oldp, oldlenp, newp, newlen);
 }
