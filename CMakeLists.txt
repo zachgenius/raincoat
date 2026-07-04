@@ -11,10 +11,6 @@ endif()
 
 add_compile_options(-Wall -Wextra)
 
-# Bake linked-library directories into the rpath so test binaries find a non-standard
-# GoogleTest dylib (e.g. a conda/homebrew install) at runtime without DYLD_LIBRARY_PATH.
-set(CMAKE_BUILD_RPATH_USE_LINK_PATH ON)
-
 # ---------------------------------------------------------------------------
 # Core static library: every src/*.cpp except main.cpp
 # ---------------------------------------------------------------------------
