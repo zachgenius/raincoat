@@ -7,11 +7,14 @@
 // see docs/MACOS.md for the honest guarantee downgrade vs the Linux backend.
 #include "backend.hpp"
 
+#include <climits>
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
-#include <unistd.h>  // access, confstr, X_OK
+#include <mach-o/dyld.h>  // _NSGetExecutablePath (locate the interposer dylib)
+#include <unistd.h>       // access, confstr, X_OK
 
 #include "seatbelt.hpp"
 #include "util.hpp"  // canonicalize
@@ -45,6 +48,21 @@ std::string darwin_cache_dir() {
     size_t n = ::confstr(_CS_DARWIN_USER_CACHE_DIR, buf, sizeof(buf));
     if (n == 0 || n > sizeof(buf)) return std::string();
     return canon_or(std::string(buf));
+}
+
+// Locate rc_interpose.dylib next to the running raincoat executable (CMake builds it there).
+// Returns "" if it cannot be found — the interposer is then simply not injected (best-effort;
+// env-level identity still applies).
+std::string interpose_dylib_path() {
+    char buf[PATH_MAX];
+    uint32_t sz = sizeof(buf);
+    if (_NSGetExecutablePath(buf, &sz) != 0) return std::string();
+    std::string exe(buf);
+    auto slash = exe.find_last_of('/');
+    std::string dir = (slash == std::string::npos) ? std::string(".") : exe.substr(0, slash);
+    std::string dylib = dir + "/rc_interpose.dylib";
+    if (::access(dylib.c_str(), R_OK) == 0) return dylib;
+    return std::string();
 }
 
 // Display-safe join of the launch argv for the audit log. Unlike the bwrap path there are
@@ -81,6 +99,7 @@ Capabilities backend_capabilities() {
     c.supports_proc_overlays = false;         // no /proc to overlay; Tier-1 masks are Linux-only
     c.supports_seccomp_identity = false;      // no seccomp; identity faking would need DYLD interpose
     c.supports_path_remap = false;            // no bind mount; the child keeps its real cwd
+    c.supports_dyld_interpose = true;         // in-process sandbox_init + execve preserves DYLD injection
     c.label = "Seatbelt (sandbox-exec, best-effort)";
     return c;
 }
@@ -118,18 +137,45 @@ std::optional<LaunchPlan> backend_build_launch(const LaunchInputs& in, std::stri
     cfgc.workdir = canon_or(in.cfg->workdir);
     c.cfg = &cfgc;
 
+    // Locate + canonicalize the interposer dylib BEFORE generating the profile, so the profile
+    // re-allows reading it (it may live under a denied path, e.g. a dev build under $HOME).
+    const std::string dylib = canon_or(interpose_dylib_path());
+    c.interpose_dylib = dylib;
+
     std::string profile = build_seatbelt_profile(c, err);
     if (!err.empty()) return std::nullopt;
 
     LaunchPlan plan;
-    plan.launch_path = kSandboxExec;
-    plan.argv = {"sandbox-exec", "-f", c.profile_path, "--"};
-    for (const std::string& t : in.cfg->command) plan.argv.push_back(t);
-    plan.child_env = in.env.resolved;      // applied at execve by the runner
+    // In-process apply model: the child sandbox_init(apply_sbpl)s then exec's the target
+    // ITSELF (argv = the raw command), so an injected DYLD_INSERT_LIBRARIES survives SIP —
+    // going through the SIP-protected /usr/bin/sandbox-exec would strip it (measured). The
+    // profile is ALSO written to a file (profile_path, kept) for the fail-closed pre-flight
+    // probe, which still runs via sandbox-exec -f (same SBPL, same enforcement).
+    plan.apply_sbpl = profile;
+    plan.argv = in.cfg->command;
+    plan.launch_path = plan.argv.empty() ? std::string() : plan.argv.front();
+    plan.child_env = in.env.resolved;      // applied at exec by the runner
     plan.env_apply = EnvApply::ViaExec;
     plan.profile_text = profile;
     plan.profile_path = c.profile_path;
     plan.audit_command = join_for_audit(plan.argv);
+
+    // Best-effort identity/fingerprint interposer: inject the dylib (when present next to the
+    // executable) + the value-driven RC_FAKE_* env it reads, faking gethostname/uname/
+    // getpwuid/getlogin/sysctl that Seatbelt cannot. DYLD_* was scrubbed from env.resolved, so
+    // setting our OWN controlled value here is deliberate and wins over the scrub.
+    if (!dylib.empty()) {
+        const BackendConfig& bk = in.cfg->ext.backend;
+        plan.child_env["DYLD_INSERT_LIBRARIES"] = dylib;
+        plan.child_env["RC_FAKE_HOSTNAME"] = in.cfg->ext.hostname.value_or("sandbox");
+        plan.child_env["RC_FAKE_USER"] = in.cfg->ext.username.value_or("user");
+        plan.child_env["RC_FAKE_HOME"] = c.fake_home;
+        if (bk.kernel_osrelease) plan.child_env["RC_FAKE_OSRELEASE"] = *bk.kernel_osrelease;
+        if (bk.kernel_version) plan.child_env["RC_FAKE_OSVERSION"] = *bk.kernel_version;
+        if (bk.cpu_model_name) plan.child_env["RC_FAKE_CPU_BRAND"] = *bk.cpu_model_name;
+        if (bk.mem_total_kb)
+            plan.child_env["RC_FAKE_MEMSIZE"] = std::to_string(*bk.mem_total_kb * 1024ull);
+    }
     return plan;
 }
 

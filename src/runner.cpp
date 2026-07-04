@@ -33,6 +33,13 @@
 #include "seccomp_notify.hpp"
 #endif
 
+#ifdef __APPLE__
+#include <crt_externs.h>  // _NSGetEnviron for the in-process-sandbox exec path
+// sandbox_init is a public but deprecated libSystem entry point (used internally by
+// sandbox-exec). Declared here to apply the SBPL in-process without the deprecated header.
+extern "C" int sandbox_init(const char* profile, uint64_t flags, char** errorbuf);
+#endif
+
 #include "audit.hpp"
 #include "backend.hpp"
 #include "browser.hpp"
@@ -1884,10 +1891,9 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     }
     if (pid == 0) {
         if (plan->env_apply == EnvApply::ViaExec) {
-            // macOS/Seatbelt: sandbox-exec passes its environment through untouched and SBPL
-            // has no env directives, so the resolved child env MUST be installed at exec
-            // (execvp would leak raincoat's full parent environ — secrets included — into the
-            // child). launch_path is absolute, so execve (no PATH search) is correct.
+            // macOS: SBPL has no env directives and the resolved child env MUST be installed at
+            // exec (execvp/execve would otherwise leak raincoat's full parent environ — secrets
+            // included). Build the envp from the resolved child env.
             std::vector<std::string> envs;
             envs.reserve(plan->child_env.size());
             for (const auto& kv : plan->child_env) envs.push_back(kv.first + "=" + kv.second);
@@ -1895,8 +1901,26 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             envp.reserve(envs.size() + 1);
             for (auto& e : envs) envp.push_back(const_cast<char*>(e.c_str()));
             envp.push_back(nullptr);
+#ifdef __APPLE__
+            if (!plan->apply_sbpl.empty()) {
+                // Apply the Seatbelt profile IN-PROCESS, then exec the target ourselves so an
+                // injected DYLD_INSERT_LIBRARIES survives SIP (going through the SIP-protected
+                // /usr/bin/sandbox-exec would strip it — measured; see docs/MACOS.md). Install
+                // the child env into `environ` (execvp reads it AND searches PATH), then execvp.
+                char* sberr = nullptr;
+                if (sandbox_init(plan->apply_sbpl.c_str(), 0, &sberr) != 0) {
+                    std::cerr << "raincoat: sandbox_init failed: " << (sberr ? sberr : "(unknown)")
+                              << "\n";
+                    _exit(127);
+                }
+                *_NSGetEnviron() = envp.data();
+                ::execvp(cargv[0], cargv.data());
+                std::perror("raincoat: failed to exec sandboxed command");
+                _exit(127);
+            }
+#endif
             ::execve(launch_path.c_str(), cargv.data(), envp.data());
-            std::perror("raincoat: failed to exec sandbox-exec");
+            std::perror("raincoat: failed to exec sandboxed command");
             _exit(127);
         }
         // Linux/bubblewrap (ViaArgv): env is baked into argv (--clearenv/--setenv); exec

@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
-project(raincoat CXX)
+# C is enabled for the macOS interposer dylib (src/rc_interpose.c); harmless on Linux.
+project(raincoat CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -52,6 +53,17 @@ target_link_libraries(raincoat_core PUBLIC OpenSSL::SSL OpenSSL::Crypto Threads:
 # ---------------------------------------------------------------------------
 add_executable(raincoat "${CMAKE_SOURCE_DIR}/src/main.cpp")
 target_link_libraries(raincoat PRIVATE raincoat_core)
+
+# macOS identity interposer: a standalone dylib injected into the sandboxed child via
+# DYLD_INSERT_LIBRARIES (see src/rc_interpose.c). Built next to the raincoat binary so the
+# runner can locate it relative to its own executable path. Not part of raincoat_core.
+if(APPLE)
+  add_library(rc_interpose SHARED "${CMAKE_SOURCE_DIR}/src/rc_interpose.c")
+  set_target_properties(rc_interpose PROPERTIES
+    PREFIX "" OUTPUT_NAME "rc_interpose" SUFFIX ".dylib"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+  add_dependencies(raincoat rc_interpose)
+endif()
 
 # ---------------------------------------------------------------------------
 # Tests (GoogleTest)

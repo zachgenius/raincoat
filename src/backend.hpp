@@ -80,6 +80,11 @@ struct Capabilities {
     // (Seatbelt) has no bind mount and the child keeps its real cwd, so it cannot remap.
     bool supports_path_remap           = true;
 
+    // Best-effort identity/fingerprint faking via DYLD function interposition (macOS): fake
+    // gethostname/uname/getpwuid/sysctl that Seatbelt cannot. Only for backends that apply the
+    // sandbox in-process and exec the target themselves (so DYLD_INSERT_LIBRARIES survives).
+    bool supports_dyld_interpose       = false;
+
     std::string label = "bubblewrap (Linux user namespaces)";  // for audit + doctor
 };
 
@@ -120,6 +125,7 @@ struct LaunchInputs {
     std::vector<std::string> fs_deny_resolved;   // [filesystem].deny, realpath'd
     std::string              profile_path;        // where the runner will write the .sb
     std::vector<int>         allow_loopback_ports;// proxy + egress-bridge child ports for the firewall
+    std::string              interpose_dylib;     // macOS: re-allow reading the injected interposer
 };
 
 // The result the runner needs to fork/exec and to audit. Built by the backend so the
@@ -135,6 +141,11 @@ struct LaunchPlan {
     // by the runner). Empty on Linux.
     std::string                        profile_text;
     std::string                        profile_path;
+
+    // macOS: when non-empty, the child applies this SBPL in-process via sandbox_init() and
+    // then exec's the target ITSELF (rather than exec'ing /usr/bin/sandbox-exec), so an
+    // injected DYLD_INSERT_LIBRARIES survives SIP. Empty on Linux / non-interposer paths.
+    std::string                        apply_sbpl;
 };
 
 // Static capability descriptor of the linked backend. Pure.

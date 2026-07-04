@@ -132,6 +132,16 @@ std::string build_seatbelt_profile(const LaunchInputs& in, std::string& err) {
         os << "(deny file-read* (literal " << q << "))\n";
     }
 
+    // --- (7b) Re-allow reading the injected identity interposer dylib, even if it lives under
+    // a denied path (e.g. a dev build under $HOME). Last-match-wins puts this after the denies
+    // so dyld can load it; it is read-only. ---
+    if (!in.interpose_dylib.empty()) {
+        if (!emit_subpath(os, "(allow file-read*", in.interpose_dylib, ok)) {
+            err = "seatbelt: unrepresentable interpose_dylib path";
+            return std::string();
+        }
+    }
+
     // --- (8) Network ---
     // A non-empty allow_loopback_ports means a guarded proxy / egress bridge is active:
     // deny ALL outbound at the kernel level (for EVERY client, not just proxy-aware ones —
