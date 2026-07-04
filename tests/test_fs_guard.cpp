@@ -255,6 +255,20 @@ TEST_F(FsGuard, PlanMountsNonStrictAutoAddsCwdAsReadWrite) {
   EXPECT_TRUE(any_writable(mounts));
 }
 
+TEST_F(FsGuard, PlanMountsRemapCwdMovesSandboxPathOnly) {
+  // [filesystem].remap_cwd presents the cwd at a neutral mount point: the bind SOURCE
+  // (host_path) stays the real dir, only the child-visible sandbox_path changes.
+  Config cfg = make_config(/*strict=*/false, {}, {});
+  cfg.ext.remap_cwd = "/work";
+  std::string err;
+  auto mounts = plan_no_home(cfg, cwd(), err);
+
+  ASSERT_EQ(mounts.size(), 1u);
+  EXPECT_EQ(mounts[0].host_path, cwd());       // source unchanged
+  EXPECT_EQ(mounts[0].sandbox_path, "/work");  // child sees the neutral path
+  EXPECT_EQ(mounts[0].mode, MountMode::ReadWrite);
+}
+
 TEST_F(FsGuard, PlanMountsNonStrictAppendsCwdAfterAllowPaths) {
   std::string r = make_subdir("ro");
   std::string w = make_subdir("rw");

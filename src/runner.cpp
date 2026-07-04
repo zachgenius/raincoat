@@ -69,6 +69,40 @@ bool path_within(const std::string& path, const std::string& mount) {
     return starts_with(path, mount + "/");
 }
 
+// Translate a host path to the path the child sees, via the covering mount. Identity
+// unless that mount was remapped (e.g. cwd -> /work); returns the input unchanged when no
+// mount covers it. Used to keep host-keyed guards (egress profile mask, workdir/chdir)
+// correct when [filesystem].remap_cwd moves the cwd to a neutral mount point.
+std::string host_to_sandbox(const std::string& host_path, const std::vector<Mount>& mounts) {
+    for (const auto& m : mounts) {
+        if (path_within(host_path, m.host_path)) {
+            if (m.host_path == m.sandbox_path) return host_path;
+            return m.sandbox_path + host_path.substr(m.host_path.size());  // "" or "/sub..."
+        }
+    }
+    return host_path;
+}
+
+// Validate a [filesystem].remap_cwd value. Returns an error string, or nullopt if OK. The
+// target must be an absolute path, contain no ".." segment, and not collide with a base
+// system mount bwrap sets up (which would shadow it or fail).
+std::optional<std::string> validate_remap_cwd(const std::string& p) {
+    if (p.empty() || p[0] != '/')
+        return "remap_cwd must be an absolute path (e.g. \"/work\"); got: " + p;
+    if (p.find("/..") != std::string::npos || p == "/..")
+        return "remap_cwd must not contain '..': " + p;
+    static const char* kReserved[] = {"/",    "/usr", "/bin",  "/sbin", "/lib",
+                                      "/lib64", "/proc", "/dev", "/etc",  "/tmp",
+                                      "/sys",  "/run",  "/var",  "/home", "/root"};
+    for (const char* r : kReserved) {
+        const std::string res = r;
+        if (p == res || (res != "/" && path_within(p, res)))
+            return "remap_cwd \"" + p + "\" collides with the reserved system path " + res +
+                   "; pick a neutral mount point like /work or /project.";
+    }
+    return std::nullopt;
+}
+
 // Look up a key in env_defaults, returning "" when absent.
 std::string default_or_empty(const std::map<std::string, std::string>& m,
                              const std::string& key) {
@@ -336,6 +370,15 @@ Config resolve_config(const CliInvocation& inv,
 int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         const std::string& cwd, const std::string& assets_dir, std::string& err) {
     err.clear();
+
+    // Validate [filesystem].remap_cwd early (before any side effects) so a bad value is a
+    // clean config error rather than a broken mount.
+    if (cfg.ext.remap_cwd.has_value()) {
+        if (auto verr = validate_remap_cwd(*cfg.ext.remap_cwd)) {
+            err = "Error: " + *verr;
+            return 1;
+        }
+    }
 
     // ---- 0. Install terminating-signal handlers FIRST -------------------
     // These MUST be armed before mkdtemp() creates the sandbox root: a SIGINT/
@@ -885,16 +928,20 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // back to the fake HOME (the cwd was withheld: strict, or the home guard).
     std::string workdir_canon = canonicalize(cfg.workdir).value_or(cfg.workdir);
     bool workdir_mounted = false;
+    bool cwd_remapped = false;
+    // When mounted, use the child-visible path of the covering mount — the raw cfg.workdir
+    // may be a relative string (e.g. "sub"), and bwrap --chdir starts at "/" inside the
+    // sandbox, so a relative target would not exist. Match on host_path (the mount source)
+    // and translate to sandbox_path, so a remapped cwd (-> /work) chdir's to the neutral path.
+    std::string effective_workdir = workdir_canon;
     for (const auto& m : mounts) {
-        if (path_within(workdir_canon, m.sandbox_path)) {
+        if (path_within(workdir_canon, m.host_path)) {
             workdir_mounted = true;
+            effective_workdir = host_to_sandbox(workdir_canon, mounts);
+            cwd_remapped = (m.host_path != m.sandbox_path);
             break;
         }
     }
-    // When mounted, use the absolute canonical path the mount is keyed on — the
-    // raw cfg.workdir may be a relative string (e.g. "sub"), and bwrap --chdir
-    // starts at "/" inside the sandbox, so a relative target would not exist.
-    std::string effective_workdir = workdir_canon;
     if (!workdir_mounted) {
         effective_workdir = fake_home;
         if (!warning.empty()) warning += "\n";
@@ -904,6 +951,10 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
 
     Config cfg_copy = cfg;
     cfg_copy.workdir = effective_workdir;
+    // When the cwd is remapped to a neutral path, also present PWD as that path so tools
+    // that read $PWD (rather than calling getcwd) don't see the host path. Only set it in
+    // the remap case to leave the default (unset PWD) behavior untouched.
+    if (cwd_remapped) env.resolved["PWD"] = effective_workdir;
 
     // Fail-safe + honesty: network=off MUST actually isolate the network. A profile
     // that pairs `network = "off"` with `[backend].unshare_net_when_off = false` would
@@ -1118,7 +1169,9 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             canonicalize(*cfg.profile_path).value_or(absolutize(*cfg.profile_path, cwd));
         bool prof_reachable = false;
         for (const auto& m : mounts) {
-            if (path_within(prof_canon, m.sandbox_path)) {
+            // Reachability is a property of the mount SOURCE (host_path); a remapped cwd
+            // still exposes the file, just at a translated child path.
+            if (path_within(prof_canon, m.host_path)) {
                 prof_reachable = true;
                 break;
             }
@@ -1151,7 +1204,9 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             std::ofstream ef(mask_empty_file, std::ios::binary | std::ios::trunc);
             if (ef) {
                 ef.close();
-                mask_files.push_back(prof_canon);
+                // Bind the empty file over the profile's CHILD-visible path (translated
+                // through a remapped cwd, if any) — that is where the child would read it.
+                mask_files.push_back(host_to_sandbox(prof_canon, mounts));
                 if (!warning.empty()) warning += "\n";
                 warning +=
                     "Note: the --profile file (" + prof_canon +
@@ -1361,6 +1416,13 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     if (cfg.ext.fs_deny_by_default.value_or(false)) {
         rec.active_policy_notes.push_back(
             "filesystem deny-by-default: the working directory is not auto-mounted");
+    }
+    if (cwd_remapped) {
+        rec.active_policy_notes.push_back(
+            "working directory presented at " + effective_workdir + " (host path hidden from "
+            "pwd/realpath/$PWD). Note: absolute-path command args referencing the host path "
+            "will not resolve, and /proc/self/mountinfo's mount-source field still shows the "
+            "real path (a bind mount records its source).");
     }
     {
         // Backend overrides relative to the safe defaults (BackendConfig defaults).

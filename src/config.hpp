@@ -349,6 +349,13 @@ struct ExtendedConfig {
     std::optional<bool> fs_deny_by_default;    // [filesystem].mode == "deny-by-default"
     std::vector<std::string> tripwire_files;   // [filesystem.tripwire].fake_sensitive_files
     bool tripwire_enabled = false;
+    // [filesystem].remap_cwd — mount the working directory at this neutral path (e.g. "/work")
+    // instead of its real host path, and chdir there, so the child cannot read the host
+    // username/layout via pwd/realpath/$PWD/logs. UNSET => identity mapping (same-path, default).
+    // Opt-in because absolute-path command args referencing the host path stop resolving. See
+    // docs/MOUNT-REMAP.md (partial fix: /proc/self/mountinfo's source field still shows the host
+    // path — a bind mount always records its source).
+    std::optional<std::string> remap_cwd;
     BackendConfig backend;
     std::vector<std::string> init_create_dirs; // [init].create_dirs
     std::optional<bool> playful_report;        // [report].playful_summary

@@ -1,7 +1,8 @@
 # Spec: Neutral working-directory mount (path de-identification)
 
-**Status:** design spec, not yet implemented. Decision requested before building — it changes a
-documented contract and has a real UX tradeoff.
+**Status:** Phase 1 (cwd-only, opt-in `[filesystem].remap_cwd`) **implemented**. This doc is the
+design record; the honest limitations below still hold (partial mountinfo fix; opt-in because it
+breaks absolute-path argv).
 
 ## Problem
 

@@ -207,6 +207,13 @@ std::vector<Mount> plan_mounts(const Config& cfg, const std::string& cwd,
                 if (!m) {
                     return {};
                 }
+                // [filesystem].remap_cwd: present the working dir at a neutral mount point
+                // (e.g. /work) instead of its host path, so the child can't read the host
+                // username/layout via pwd/realpath. host_path stays the real dir (the bind
+                // source); only the child-visible sandbox_path changes. See MOUNT-REMAP.md.
+                if (cfg.ext.remap_cwd && !cfg.ext.remap_cwd->empty()) {
+                    m->sandbox_path = *cfg.ext.remap_cwd;
+                }
                 mounts.push_back(*m);
             }
         }
