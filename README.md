@@ -2,16 +2,20 @@
 
 **Raincoat is a lightweight privacy sandbox for nosy CLI tools and AI agents.** It helps
 prevent untrusted tools from casually inspecting your real home directory, credentials, browser
-profiles, locale, timezone, and other machine fingerprints. It swaps in a curated generic font
-set (Noto/DejaVu) that masks your host's full installed-font list, and a minimal `/etc` view so
-your real hostname/hosts never leak.
+profiles, locale, timezone, and machine fingerprints — your CPU model, kernel, RAM, uptime,
+machine-id, and installed-font list. It swaps in a curated generic font set (Noto/DejaVu), a
+minimal `/etc` view so your real hostname/hosts never leak, and can present generic hardware
+values that a tool reads from `/proc` **or** the raw syscalls (`uname`/`sysinfo`/
+`sched_getaffinity`) — so even a static or Go binary sees the fakes.
 
 It is a thin, Linux-first wrapper around [bubblewrap (`bwrap`)](https://github.com/containers/bubblewrap)
 that hands the command you run a *fake* home, a scrubbed environment, a generic locale and
-timezone, a curated font environment, a minimal `/etc`, restricted filesystem access, an audit
-log (human-readable or JSON) of exactly what it did, and — when you ask for it — a filtering
-egress layer: an endpoint-hiding bridge, an isolated-netns jail (via `pasta`), and a domain
-allow/block firewall.
+timezone, a curated font environment, a minimal `/etc`, configurable machine-fingerprint masks
+([`docs/FINGERPRINT-SYSCALLS.md`](docs/FINGERPRINT-SYSCALLS.md)), restricted filesystem access
+with optional neutral path remapping so your username doesn't leak via `pwd`
+([`docs/MOUNT-REMAP.md`](docs/MOUNT-REMAP.md)), an audit log (human-readable or JSON) of exactly
+what it did, and — when you ask for it — a filtering egress layer: an endpoint-hiding bridge, an
+isolated-netns jail (via `pasta`), and a domain allow/block firewall.
 
 ```
 raincoat -- <command> [args...]
@@ -725,6 +729,16 @@ roadmap have since shipped.
   so `fc-list` shows a generic set instead of your host's full font list (best-effort fallback when
   no curated dirs exist).
 - **Minimal `/etc`** — generic `/etc/hostname`, `/etc/hosts`, and `/etc/localtime`.
+- **Machine-fingerprint masks** (value-driven; [`docs/FINGERPRINT-SYSCALLS.md`](docs/FINGERPRINT-SYSCALLS.md)) —
+  present generic CPU (`/proc/cpuinfo`), kernel (`/proc/version` + cmdline), RAM/uptime
+  (`/proc/meminfo`, `/proc/uptime`), machine-id and boot-id, and CPU count. On x86_64 the same
+  values are enforced at the **syscall level** via a seccomp user-notify supervisor
+  (`uname(2)`/`sysinfo(2)`/`sched_getaffinity(2)`), so a static/Go binary can't read the real host
+  by calling the raw syscall. DMI serials / product UUID / MAC never leak (no `/sys` mount).
+- **Neutral path remapping** ([`docs/MOUNT-REMAP.md`](docs/MOUNT-REMAP.md)) —
+  `[filesystem].remap_cwd` and `[[filesystem.mount]]` present the working directory / allow paths
+  at neutral mount points (e.g. `/work`) so the child can't read your username/layout via
+  `pwd`/`realpath`/`$PWD`.
 - **JSON audit logs** — `[audit].format = "json"` / `--audit-format json`, one structured object
   per run alongside the human-readable format; `raincoat report` summarizes either.
 - **Tripwire / honeytoken files** — `[filesystem.tripwire]` plants inert decoy credentials in the
@@ -756,7 +770,13 @@ roadmap have since shipped.
 - **Deep anti-fingerprinting** — canvas/WebGL/audio/font-metrics/TLS-JA3 normalization would need
   an instrumented browser build, not a launch shim. Explicit non-goal for the browser layer.
 - **uid/gid remap** — the numeric uid/gid stay visible (identity is masked via
-  username/hostname/HOME, not the uid).
+  username/hostname/HOME, not the uid); this also leaves `uid=` in `/proc/self/mountinfo`. Would
+  need bwrap `--unshare-user` mapping, with its own ownership tradeoffs.
+- **Remaining fingerprint vectors** ([`docs/FINGERPRINT-SYSCALLS.md`](docs/FINGERPRINT-SYSCALLS.md)
+  has the full roadmap) — `/proc/self/mountinfo` and `/proc/stat` have no clean mechanism
+  (per-reader `self` indirection / live counters); CPU **instructions** (`CPUID`/`RDTSC`) can't be
+  faked without a VM (Tier-3 non-goal); and macOS (`DYLD_INSERT_LIBRARIES`) / Windows (API hooks)
+  interposers are separate efforts.
 
 ---
 
