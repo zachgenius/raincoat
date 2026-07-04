@@ -231,6 +231,17 @@ std::optional<Options> load_profile(const std::string& path, std::string& err) {
         o.ext.fs_deny_by_default = (*s == "deny-by-default");
     if (auto s = t.get_string("filesystem.remap_cwd"); s.has_value())
         o.ext.remap_cwd = *s;
+    // [[filesystem.mount]] array-of-tables -> one FsRemapMount per entry, in order.
+    for (const TomlTable& mt : t.get_table_array("filesystem.mount")) {
+        FsRemapMount rm;
+        if (auto s = mt.get_string("host"); s.has_value()) rm.host = *s;
+        if (auto s = mt.get_string("sandbox"); s.has_value()) rm.sandbox = *s;
+        if (auto s = mt.get_string("mode"); s.has_value())
+            rm.mode = (*s == "rw" || *s == "read-write" || *s == "readwrite")
+                          ? MountMode::ReadWrite
+                          : MountMode::ReadOnly;
+        if (!rm.host.empty() && !rm.sandbox.empty()) o.ext.remap_mounts.push_back(rm);
+    }
     if (auto b = t.get_bool("filesystem.tripwire.enabled"); b.has_value())
         o.ext.tripwire_enabled = *b;
     if (auto a = t.get_string_array("filesystem.tripwire.fake_sensitive_files");

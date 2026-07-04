@@ -169,6 +169,20 @@ std::vector<Mount> plan_mounts(const Config& cfg, const std::string& cwd,
         mounts.push_back(*m);
     }
 
+    // [[filesystem.mount]] explicit remaps: resolve the host path like an allow path (canonical,
+    // must exist, deny rules enforced), then present it at the chosen neutral sandbox path.
+    for (const auto& rm : cfg.ext.remap_mounts) {
+        auto m = make_mount(rm.host, cwd, rm.mode, err);
+        if (!m) {
+            return {};
+        }
+        if (refuse_if_denied(*m, rm.host)) {
+            return {};
+        }
+        m->sandbox_path = rm.sandbox;  // child sees the neutral path, not the host path
+        mounts.push_back(*m);
+    }
+
     // Non-strict: auto-add the cwd as ReadWrite unless it's already covered. A profile
     // with [filesystem].mode = "deny-by-default" (ext.fs_deny_by_default) suppresses the
     // auto-mount entirely, exactly like strict mode, so ONLY explicit allow paths are
