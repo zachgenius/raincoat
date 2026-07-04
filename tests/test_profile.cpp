@@ -1114,6 +1114,53 @@ TEST(Profile, EgressTimeoutPositiveValuePreserved) {
     EXPECT_EQ(opt->ext.egress.timeout_seconds, 45);
 }
 
+// [egress].isolate_netns = "strict" (and its synonyms) parses to NetnsIsolation::Strict.
+// Strict is the ONLY level that blocks general internet, so it must be an explicit,
+// distinct value — never confused with auto/on/off.
+TEST(Profile, EgressIsolateNetnsStrictParses) {
+    for (const char* val : {"strict", "only-bridge", "egress-only", "bridge-only"}) {
+        std::string path = write_temp_file(
+            std::string("[egress]\n"
+                        "mode = \"bridge\"\n"
+                        "isolate_netns = \"") + val + "\"\n"
+            "[[egress.bridge]]\n"
+            "name = \"api\"\n"
+            "env = \"BASE\"\n"
+            "child_endpoint = \"http://127.0.0.1:18080\"\n"
+            "upstream_endpoint = \"http://127.0.0.1:9\"\n");
+        std::string err;
+        auto opt = load_profile(path, err);
+        ASSERT_TRUE(opt.has_value()) << "val=" << val << " err=" << err;
+        EXPECT_EQ(opt->ext.egress.isolate_netns, raincoat::NetnsIsolation::Strict)
+            << "isolate_netns = \"" << val << "\" must parse to Strict";
+    }
+}
+
+// The canonical auto/on/off values still parse to their own levels (strict must not have
+// swallowed them), and auto is NEVER strict — strict must be opted into explicitly.
+TEST(Profile, EgressIsolateNetnsCanonicalLevelsUnchanged) {
+    struct Case { const char* val; raincoat::NetnsIsolation want; };
+    for (const Case& c : {Case{"auto", raincoat::NetnsIsolation::Auto},
+                          Case{"on", raincoat::NetnsIsolation::On},
+                          Case{"off", raincoat::NetnsIsolation::Off}}) {
+        std::string path = write_temp_file(
+            std::string("[egress]\n"
+                        "mode = \"bridge\"\n"
+                        "isolate_netns = \"") + c.val + "\"\n"
+            "[[egress.bridge]]\n"
+            "name = \"api\"\n"
+            "env = \"BASE\"\n"
+            "child_endpoint = \"http://127.0.0.1:18080\"\n"
+            "upstream_endpoint = \"http://127.0.0.1:9\"\n");
+        std::string err;
+        auto opt = load_profile(path, err);
+        ASSERT_TRUE(opt.has_value()) << "val=" << c.val << " err=" << err;
+        EXPECT_EQ(opt->ext.egress.isolate_netns, c.want) << "val=" << c.val;
+        EXPECT_NE(opt->ext.egress.isolate_netns, raincoat::NetnsIsolation::Strict)
+            << "val=" << c.val << " must NOT be Strict (strict is explicit-only)";
+    }
+}
+
 // Load the ACTUAL docs/full-config-reference.toml from the source tree (not the
 // inline verbatim copy) and assert the egress bridge section parses end-to-end.
 // This guards against the shipped reference config and the parser drifting apart.

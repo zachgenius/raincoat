@@ -282,16 +282,23 @@ timeout_seconds = 120
 # Important for agent/LLM-style APIs.
 streaming = true
 
-# Network-namespace isolation for the bridge:
+# Network-namespace isolation for the bridge (requires `pasta`/passt for the jail levels):
 #   "auto" (default) : run the child inside an isolated pasta network namespace WHEN
 #                      pasta is installed, otherwise fall back to shared-loopback.
 #   "on"             : prefer the isolated pasta netns (fall back to shared if pasta absent).
 #   "off"            : always share the host loopback (the child's /proc/net/tcp can then
 #                      observe the upstream socket).
-# The isolated netns keeps the child_endpoint at 127.0.0.1:<port>, hides the host-side
-# bridge->upstream socket from the child's /proc/net/tcp, and exposes ONLY the bridge
-# port(s) on the ns loopback. It is a NAT (general outbound internet still works), NOT a
-# per-destination firewall.
+#   "strict"         : the isolated pasta netns AND block general internet. Adds
+#                      `-o 127.0.0.1` so pasta's outbound is bound to loopback: the child
+#                      reaches ONLY the forwarded bridge port(s) — no general internet, no
+#                      other host-loopback. A per-destination (bridge-only) egress firewall.
+#                      REQUIRES pasta; if pasta is absent the run is REFUSED (fail-closed),
+#                      never downgraded to general internet. Must be set explicitly (auto is
+#                      never strict). Synonyms: "only-bridge", "egress-only", "bridge-only".
+# For "auto"/"on" the isolated netns keeps the child_endpoint at 127.0.0.1:<port>, hides the
+# host-side bridge->upstream socket from the child's /proc/net/tcp, and exposes ONLY the
+# bridge port(s) on the ns loopback. Those levels are a NAT (general outbound internet still
+# works), NOT a per-destination firewall — only "strict" blocks general internet.
 isolate_netns = "auto"
 
 # Multiple bridges can be configured.

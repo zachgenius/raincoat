@@ -81,17 +81,34 @@ opt-in before logging upstream endpoints.
   - the child is **NOT** fully network-jailed: pasta NATs general outbound traffic, so the child
     retains general outbound internet by IP. This is a **NAT, not a per-destination firewall** —
     the audit says so explicitly and never overclaims.
+- **`isolate_netns = "strict"` — the real "only the bridge" firewall (IMPLEMENTED).** Strict keeps
+  everything above AND blocks the child's general internet by adding `-o 127.0.0.1` to the pasta
+  invocation: `pasta --config-net -t none -o 127.0.0.1 -T <bridge-ports> -- bwrap …`. `-o 127.0.0.1`
+  binds pasta's outbound to loopback, so pasta can no longer NAT the child's traffic out any real
+  interface — only the `-T` bridge forward(s) keep working. MEASURED on this host: with `-o 127.0.0.1`
+  the child's connections to real IPs (e.g. `1.1.1.1`) **time out**, while the forwarded bridge port
+  **still reaches the upstream**. The child can therefore reach **ONLY** the configured bridge
+  endpoint(s) — **no general internet, and no other host-loopback service**. For the strict level
+  **only**, this is a genuine **per-destination (bridge-only) egress firewall**; the audit + a stderr
+  note say exactly that. Strict **requires pasta**: there is no safe shared-loopback equivalent
+  (sharing the host loopback would hand the child general host network), so `strict` with pasta
+  **absent fails CLOSED** — the run is refused with a clear, actionable error rather than silently
+  downgraded to general internet. (`auto`/`on` are unchanged: they still NAT general outbound.)
 - When `pasta` is absent (or `isolate_netns = "off"`) raincoat falls back to the shared-loopback
-  model below, with the honest shared-net warning.
+  model below, with the honest shared-net warning. (`strict` is the exception: it refuses instead of
+  falling back, so "strict" never silently means "general internet".)
 - `raincoat doctor` reports whether the jail is available: `[ OK ] egress network jail:
   available (pasta) <path>` when pasta (or slirp4netns) is present, or `[INFO] … unavailable —
   egress bridge shares the host network namespace` otherwise. It is informational, never a
   `[FAIL]` — a missing helper only means the shared-loopback fallback is used.
 
 **Still future (deferred; the schema/code is shaped so these slot in):**
-- A per-destination **egress firewall** (only the configured upstreams reachable, general internet
-  blocked). The pasta jail fixes the `/proc-net` leak and blocks other host-loopback services but
-  does not filter arbitrary outbound internet.
+- A general **domain/CIDR allow-list egress firewall** (reach an arbitrary *set* of named upstreams,
+  everything else blocked). Note the **`strict` level already provides the bridge-only case** of this
+  — with `isolate_netns = "strict"` (pasta required) the child reaches ONLY the forwarded bridge
+  port(s) and nothing else, general internet included. What remains future is a *configurable* per
+  destination/domain policy beyond "only the configured bridge endpoint(s)". The `auto`/`on` NAT jail
+  still does not filter arbitrary outbound internet.
 - **Host-loopback mapping on newer pasta** (`--map-host-loopback`). The pasta build measured here
   is older and lacks it, so the host is reached via NAT (the ns default gateway) rather than the
   child's `127.0.0.1`. The bridge sidesteps this by keeping the host-side listener and letting
@@ -115,8 +132,11 @@ opt-in before logging upstream endpoints.
   line discloses this shared-net model explicitly so it is never a silent leak.
   **The isolated-netns (pasta) mode FIXES this specific leak** — see the isolated-netns section
   above — because the bridge's upstream socket then lives in the host netns, invisible to the child.
-- The child retains **general outbound network access** in BOTH modes (shared loopback, or NAT'd via
-  pasta) — the bridge is URL-indirection, not a per-destination network firewall.
+- The child retains **general outbound network access** in the shared-loopback and the `auto`/`on`
+  NAT'd-via-pasta modes — there the bridge is URL-indirection, not a per-destination network
+  firewall. **The exception is `isolate_netns = "strict"`** (pasta required), which binds pasta's
+  outbound to loopback (`-o 127.0.0.1`) and so **blocks** general outbound: in strict mode the child
+  reaches only the forwarded bridge port(s) — that mode *is* a per-destination (bridge-only) firewall.
 - It does NOT necessarily hide the fact that the child is using a custom/local endpoint.
 - Full HTTPS hostname rewriting without exposing a custom endpoint may require MITM, control of the
   original certificate, or transparent network-level routing.
@@ -148,6 +168,11 @@ same loopback the host bridge listens on:
   leak); `-t none` exposes only the bridge port(s); pasta NATs general internet (not a firewall).
   pasta runs as raincoat's direct child and propagates the child's exit code; it is reaped/torn
   down on every exit path (normal, error, signal) with no orphans.
+  **With `isolate_netns = "strict"`** the runner additionally passes `-o 127.0.0.1`
+  (`pasta --config-net -t none -o 127.0.0.1 -T <bridge-ports>`), binding pasta's outbound to
+  loopback so general internet is blocked and ONLY the forwarded bridge port(s) remain reachable — a
+  real per-destination (bridge-only) firewall. Strict requires pasta; with pasta absent it fails
+  CLOSED (refused) rather than sharing the host loopback.
 - **Implemented — shared loopback (fallback):** when pasta is absent or `isolate_netns = "off"`, the
   runner does NOT unshare the net namespace, so the child shares the host loopback and reaches the
   bridge. Tradeoff: the child retains general host network access and the upstream IP:port is

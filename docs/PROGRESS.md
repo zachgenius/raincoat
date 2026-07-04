@@ -173,9 +173,12 @@ CLI grammar: the subcommand must be the first token (e.g. `raincoat init --profi
 
 Generic, profile-driven. No provider/model/env/service names hard-coded. Host-side HTTP(S)
 forward proxy per bridge (`src/egress.*`), wired into the live runner. The isolated-netns
-egress jail (pasta) has since landed as a *partial* network jail — it fixes the `/proc-net`
-upstream leak and hides other host-loopback services (§2.6). Items that remain stay honest
-`[-]` (a per-destination egress firewall, guarded/DNS policy, transparent/MITM modes).
+egress jail (pasta) has since landed: `auto`/`on` are a *partial* jail (fix the `/proc-net`
+upstream leak + hide other host-loopback services, but still NAT general internet), while
+`isolate_netns = "strict"` is a *full* bridge-only egress firewall — it also blocks general
+internet via `-o 127.0.0.1` so only the forwarded bridge port(s) are reachable (§2.6). Items
+that remain stay honest `[-]` (a general configurable domain/CIDR allow-list firewall beyond
+the bridge-only strict case, guarded/DNS policy, transparent/MITM modes).
 
 ### 2.1 Profile schema & parsing
 - [x] `[egress] mode = off|bridge`; `[[egress.bridge]]` array-of-tables — *profile/egress*
@@ -208,17 +211,19 @@ upstream leak and hides other host-loopback services (§2.6). Items that remain 
 - [x] child_endpoint unchanged at `127.0.0.1:<port>` (pasta `-T` forwards ns loopback → host bridge); child reaches the upstream — *runner* (verified: child got `UPSTREAM_OK`)
 - [x] **`/proc/net/tcp` upstream leak FIXED** — host-side bridge→upstream socket stays in the host netns, invisible to the child — *runner* (MEASURED: upstream IP:port absent from child `/proc/net/tcp`)
 - [x] Tighter than shared mode: `-t none` exposes only the forwarded bridge port(s); other host-loopback services NOT reachable — *runner*
-- [x] `[egress].isolate_netns = auto|on|off` knob; `auto` uses the jail when pasta present, else shared fallback — *config/profile*
+- [x] `[egress].isolate_netns = auto|on|off|strict` knob; `auto` uses the jail when pasta present, else shared fallback; `strict` (explicit-only) also blocks general internet — *config/profile*
 - [x] pasta reaped/torn down on every exit path (normal/error/signal), exit code propagated; graceful fallback + warning when pasta requested but absent — *runner / test_egress_jail_pasta_failure_regression*
 - [x] `doctor` reports egress-jail availability (pasta/slirp4netns) as `[ OK ]`/`[INFO]`, never `[FAIL]` — *doctor / test_doctor* (verified)
-- [-] **Per-destination egress firewall** — pasta NATs general outbound traffic, so the child retains general internet by IP; the jail is NOT an allow-list firewall (honest non-goal this phase)
+- [x] **Per-destination egress firewall (bridge-only) — for `isolate_netns = "strict"`** — adds `-o 127.0.0.1` (pasta outbound bound to loopback) so general internet is BLOCKED and ONLY the forwarded bridge port(s) are reachable; requires pasta (fails CLOSED if absent) — *runner / test_egress_jail_netns* (MEASURED: child reaches the bridge, but 1.1.1.1 and off-bridge loopback both fail). The `auto`/`on` NAT jail still retains general internet by IP (honest non-goal for those levels).
+- [-] **General domain/CIDR allow-list egress firewall** (an arbitrary configurable set of upstreams, not just the bridge) — the `strict` bridge-only case landed above; a configurable per-domain policy remains future
 - [-] Host-loopback mapping on newer pasta (`--map-host-loopback`, so the host is at the child's `127.0.0.1`) — this pasta build lacks it
 - [-] `guarded` mode + domain allow/block · [-] DNS policy · [-] transparent egress · [-] explicit MITM (off by default)
 
 ### 2.7 Limitations documented (honest)
 - [x] Hides upstream URL from child env, not the fact a custom endpoint is used — *EGRESS.md / README*
 - [x] Shared-loopback fallback (no pasta / `isolate_netns=off`) ⇒ NOT a network jail; upstream IP:port visible via `/proc/net/tcp`; general net access retained — *EGRESS.md / README* (disclosed in the audit every run)
-- [x] Isolated-netns jail (pasta) FIXES the `/proc-net` upstream leak + hides other host-loopback services, but still NATs general internet (not a per-destination firewall) — *EGRESS.md / README* (MEASURED; disclosed in the audit + a stderr note every run)
+- [x] Isolated-netns jail (pasta), `auto`/`on`: FIXES the `/proc-net` upstream leak + hides other host-loopback services, but still NATs general internet (not a per-destination firewall) — *EGRESS.md / README* (MEASURED; disclosed in the audit + a stderr note every run)
+- [x] Isolated-netns jail (pasta), `strict`: also BLOCKS general internet (`-o 127.0.0.1`) so ONLY the forwarded bridge port(s) are reachable — a per-destination (bridge-only) egress firewall; requires pasta, fails CLOSED if absent — *EGRESS.md / runner* (MEASURED: bridge works, 1.1.1.1 + off-bridge loopback both blocked; disclosed in the audit + stderr as "STRICT ISOLATED-NETNS ... per-destination (bridge-only) egress firewall")
 - [x] HTTPS hostname rewrite may need MITM/cert control/transparent routing — *EGRESS.md*
 - [x] No claims of bypassing any specific tool/service detection — *EGRESS.md / README*
 

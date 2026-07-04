@@ -450,3 +450,135 @@ TEST(EgressJailNetns, IsolatedNetnsReachesBridgeFixesProcNetLeakAndStaysHonest) 
             << "audit overclaims: '" << lie << "'\n" << audit;
     }
 }
+
+// ---------------------------------------------------------------------------
+// STRICT level: the jail ALSO blocks general internet (pasta -o 127.0.0.1), so the
+// child reaches ONLY the forwarded bridge port(s) — a true per-destination firewall.
+// This pins the difference from the "on"/"auto" NAT jail above: there general internet
+// works; here it must NOT.
+// ---------------------------------------------------------------------------
+TEST(EgressJailNetns, StrictModeReachesBridgeButBlocksGeneralInternet) {
+    SKIP_UNLESS_JAILABLE(bin);
+
+    // (1) The real upstream, reached only THROUGH raincoat's host-side bridge.
+    LoopbackHttp upstream{std::string(kSentinel)};
+    ASSERT_TRUE(upstream.start()) << "failed to start upstream";
+    const int uport = upstream.port();
+    ASSERT_GT(uport, 0);
+    const std::string upstream_url = "http://127.0.0.1:" + std::to_string(uport);
+
+    // (2) An unrelated host-loopback service the child is NEVER told about — off-bridge,
+    //     so strict must NOT be able to reach it (it is not one of the `-T` forwards).
+    LoopbackHttp other{std::string(kOtherSentinel)};
+    ASSERT_TRUE(other.start()) << "failed to start other host service";
+    const int oport = other.port();
+    ASSERT_GT(oport, 0);
+    ASSERT_NE(oport, uport);
+
+    const int cport = pick_free_port();
+    ASSERT_GT(cport, 0);
+    ASSERT_NE(cport, uport);
+    ASSERT_NE(cport, oport);
+    const std::string child_url = "http://127.0.0.1:" + std::to_string(cport);
+
+    // Profile OUTSIDE the mounted cwd, opting in to the STRICT isolated netns jail.
+    std::string profile_dir = make_temp_dir("profile-strict");
+    std::string profile_path = (fs::path(profile_dir) / "egress.toml").string();
+    {
+        std::ofstream p(profile_path);
+        p << "[egress]\n"
+          << "mode = \"bridge\"\n"
+          << "isolate_netns = \"strict\"\n"
+          << "\n"
+          << "[[egress.bridge]]\n"
+          << "name = \"api\"\n"
+          << "env = \"MY_BASE_URL\"\n"
+          << "child_endpoint = \"" << child_url << "\"\n"
+          << "upstream_endpoint = \"" << upstream_url << "\"\n";
+    }
+    ASSERT_TRUE(fs::exists(profile_path));
+
+    std::string real_home = make_temp_dir("home-strict");
+    std::string cwd = make_temp_dir("cwd-strict");
+    auto env = base_env(real_home);
+
+    std::ostringstream py;
+    py << "import os, socket, time, urllib.request\n"
+       << "base = os.environ['MY_BASE_URL']\n"
+       << "print('MY_BASE_URL:', base)\n"
+       << "body = None\n"
+       << "for _ in range(80):\n"
+       << "    try:\n"
+       << "        body = urllib.request.urlopen(base + '/probe', timeout=2).read().decode()\n"
+       << "        break\n"
+       << "    except Exception:\n"
+       << "        time.sleep(0.1)\n"
+       << "print('REACHED_BRIDGE:', body)\n"
+       // Off-bridge host-loopback service: must NOT be reachable in strict mode.
+       << "oport = " << oport << "\n"
+       << "try:\n"
+       << "    s = socket.create_connection(('127.0.0.1', oport), timeout=3)\n"
+       << "    s.close()\n"
+       << "    print('OTHER_HOST_LOOPBACK_REACHABLE:', 'yes')\n"
+       << "except Exception:\n"
+       << "    print('OTHER_HOST_LOOPBACK_REACHABLE:', 'no')\n"
+       // General internet: STRICT must BLOCK it (pasta -o 127.0.0.1). We assert it is NOT
+       // 'connected'. On a host WITH internet this proves -o blocks the general outbound;
+       // on a host WITHOUT internet it trivially holds — either way strict's contract
+       // ("only the bridge, no general internet") is upheld.
+       << "try:\n"
+       << "    s = socket.create_connection(('1.1.1.1', 443), timeout=5)\n"
+       << "    s.close()\n"
+       << "    print('GENERAL_INTERNET:', 'connected')\n"
+       << "except Exception as e:\n"
+       << "    print('GENERAL_INTERNET:', type(e).__name__)\n";
+
+    RunResult r = run_proc(
+        bin, {"--profile", profile_path, "--", kPython, "-c", py.str()}, env, cwd);
+    upstream.stop();
+    other.stop();
+
+    ASSERT_TRUE(r.spawn_ok);
+    ASSERT_EQ(r.exit_code, 0) << "raincoat/child failed. Output:\n" << r.output;
+
+    // --- The child reached the upstream via the bridge (the ONE allowed destination).
+    EXPECT_EQ(field(r.output, "MY_BASE_URL:"), child_url) << r.output;
+    EXPECT_NE(r.output.find(kSentinel), std::string::npos)
+        << "strict child did not receive the upstream sentinel through the bridge:\n"
+        << r.output;
+
+    // --- Off-bridge host-loopback service is NOT reachable.
+    EXPECT_EQ(field(r.output, "OTHER_HOST_LOOPBACK_REACHABLE:"), "no")
+        << "strict mode must not reach a non-bridge host-loopback service. Output:\n"
+        << r.output;
+
+    // --- General internet is BLOCKED — the strict-specific guarantee. This is the key
+    //     difference from the "on"/"auto" NAT jail, where 1.1.1.1 would connect.
+    const std::string internet = field(r.output, "GENERAL_INTERNET:");
+    EXPECT_FALSE(internet.empty()) << r.output;
+    EXPECT_NE(internet, "connected")
+        << "STRICT mode (pasta -o 127.0.0.1) MUST block general outbound internet; the "
+           "child connected to 1.1.1.1:443. Output:\n"
+        << r.output;
+    RecordProperty("strict_general_internet_from_jailed_child", internet);
+
+    // --- Audit + stderr disclose the STRICT reality honestly and never leak the upstream.
+    std::string audit_path = (fs::path(cwd) / ".raincoat" / "audit.log").string();
+    ASSERT_TRUE(fs::exists(audit_path)) << "expected audit at " << audit_path;
+    std::string audit = read_file(audit_path);
+
+    EXPECT_NE(audit.find("STRICT ISOLATED-NETNS"), std::string::npos) << audit;
+    EXPECT_NE(audit.find("per-destination (bridge-only) egress firewall"),
+              std::string::npos)
+        << "strict audit should state it is a per-destination (bridge-only) firewall:\n"
+        << audit;
+    EXPECT_NE(audit.find("/proc-net leak is FIXED"), std::string::npos) << audit;
+    EXPECT_NE(audit.find(child_url), std::string::npos) << audit;
+    EXPECT_EQ(audit.find(upstream_url), std::string::npos)
+        << "strict audit leaked the real upstream URL:\n" << audit;
+
+    // stderr disclosure for a user who never opens the audit.
+    EXPECT_NE(r.output.find("STRICT ISOLATED-NETNS mode"), std::string::npos) << r.output;
+    EXPECT_NE(r.output.find("general outbound internet is BLOCKED"), std::string::npos)
+        << r.output;
+}

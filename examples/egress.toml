@@ -57,6 +57,18 @@ redact_upstreams_in_audit = true    # record upstreams as "hidden" in the audit 
 streaming = true                    # stream responses (important for LLM/agent APIs)
 timeout_seconds = 120
 
+# Network-namespace isolation for the bridge (requires `pasta`/passt installed):
+#   "auto" (default) : isolated pasta netns when pasta is present, else shared loopback.
+#   "on"             : prefer the isolated pasta netns (fall back to shared if pasta absent).
+#   "off"            : always share the host loopback (child /proc/net/tcp sees the upstream).
+# "auto"/"on" fix the /proc-net upstream leak and hide other host-loopback services, but pasta
+# NATs general outbound, so the child still has general internet. To make this bridge a REAL
+# "only the bridge, nothing else" firewall, use "strict": it adds `-o 127.0.0.1` so pasta's
+# outbound is bound to loopback — the child's general internet is BLOCKED and ONLY the
+# forwarded bridge port(s) are reachable. "strict" REQUIRES pasta; if pasta is absent the run
+# is refused (fail-closed) rather than silently granting general internet.
+# isolate_netns = "strict"
+
 # One bridge. Add more [[egress.bridge]] blocks for multiple upstreams — each gets
 # its own loopback listener and its own injected env var.
 [[egress.bridge]]

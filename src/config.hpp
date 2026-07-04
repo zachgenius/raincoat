@@ -43,11 +43,21 @@ enum class FontStatus { Disabled, Enabled, BestEffort, Unavailable };
 enum class AuditFormat { Text, Json };
 
 // Egress network-namespace isolation policy ([egress].isolate_netns).
-//   Auto -> use the isolated pasta netns jail WHEN pasta is available on the host,
-//           otherwise fall back to the shared-loopback model (with a warning). Default.
-//   On   -> prefer the jail; if pasta is absent, fall back to shared-loopback (warn).
-//   Off  -> always use the shared-loopback model, even when pasta is present.
-enum class NetnsIsolation { Auto, On, Off };
+//   Auto   -> use the isolated pasta netns jail WHEN pasta is available on the host,
+//             otherwise fall back to the shared-loopback model (with a warning). Default.
+//             Same NAT jail as On when pasta is present — general internet stays reachable.
+//   On     -> prefer the jail; if pasta is absent, fall back to shared-loopback (warn).
+//             pasta NATs general outbound traffic, so the child keeps general internet.
+//   Off    -> always use the shared-loopback model, even when pasta is present.
+//   Strict -> jail AND block general internet. Requires pasta: adds `-o 127.0.0.1` to the
+//             pasta args so pasta's outbound is bound to loopback, blocking general
+//             outbound while the forwarded bridge port(s) still work. The child can then
+//             reach ONLY the configured bridge endpoint(s) — no general internet, no other
+//             host-loopback. This is a per-destination (bridge-only) egress firewall. When
+//             pasta is ABSENT there is no safe shared-loopback equivalent, so the run fails
+//             CLOSED (refused with a clear error) rather than silently granting general
+//             internet. Must be requested EXPLICITLY — Auto never becomes Strict.
+enum class NetnsIsolation { Auto, On, Off, Strict };
 
 // ---------------------------------------------------------------------------
 // Enum <-> string helpers (inline, no link deps)
@@ -97,18 +107,25 @@ inline std::optional<AuditFormat> audit_format_from_string(const std::string& s)
 
 inline const char* to_string(NetnsIsolation i) {
     switch (i) {
-        case NetnsIsolation::Auto: return "auto";
-        case NetnsIsolation::On:   return "on";
-        case NetnsIsolation::Off:  return "off";
+        case NetnsIsolation::Auto:   return "auto";
+        case NetnsIsolation::On:     return "on";
+        case NetnsIsolation::Off:    return "off";
+        case NetnsIsolation::Strict: return "strict";
     }
     return "auto";
 }
 
-// Parse the [egress].isolate_netns knob. Accepts the canonical "auto"/"on"/"off"
-// plus common synonyms so a profile can spell the intent naturally. Unknown values
-// return nullopt (the caller keeps the default rather than aborting the profile).
+// Parse the [egress].isolate_netns knob. Accepts the canonical "auto"/"on"/"off"/"strict"
+// plus common synonyms so a profile can spell the intent naturally. "strict" (aka
+// "only-bridge"/"egress-only") is the ONLY value that blocks general internet — it must be
+// requested explicitly (auto/on never imply it). Unknown values return nullopt (the caller
+// keeps the default rather than aborting the profile).
 inline std::optional<NetnsIsolation> netns_isolation_from_string(const std::string& s) {
     if (s == "auto") return NetnsIsolation::Auto;
+    if (s == "strict" || s == "only-bridge" || s == "only_bridge" ||
+        s == "egress-only" || s == "egress_only" || s == "bridge-only" ||
+        s == "bridge_only")
+        return NetnsIsolation::Strict;
     if (s == "on" || s == "true" || s == "yes" || s == "jail" || s == "isolate" ||
         s == "isolated")
         return NetnsIsolation::On;
@@ -229,6 +246,11 @@ struct EgressConfig {
     // host-side bridge's upstream socket lives in the host netns and is invisible to
     // the child's /proc/net/tcp (the shared-loopback /proc-net leak is fixed). When
     // pasta is absent (or Off), the child shares the host loopback (the MVP model).
+    // Strict adds `-o 127.0.0.1` to the pasta args: it keeps the jail AND blocks the
+    // child's general outbound internet, leaving ONLY the forwarded bridge port(s)
+    // reachable — a true per-destination (bridge-only) egress firewall. Strict requires
+    // pasta; with pasta absent the run fails CLOSED (Auto/On/Off do NOT block general
+    // internet — pasta NATs it).
     NetnsIsolation isolate_netns = NetnsIsolation::Auto;
     std::vector<EgressBridge> bridges;
 };

@@ -288,11 +288,44 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     //     outbound internet by IP — this is a NAT, NOT a per-destination firewall.
     // When pasta is absent (or isolate_netns=off) fall back to the shared-loopback
     // model with the existing honest warning.
+    //
+    // STRICT level (isolate_netns=strict): the jail additionally BLOCKS general internet.
+    // The runner appends `-o 127.0.0.1` (pasta --outbound bound to loopback) to the pasta
+    // args below, so pasta cannot NAT the child's traffic out any real interface — only the
+    // `-T <bridge-ports>` forwards keep working. MEASURED on this host: with `-o 127.0.0.1`
+    // the child's connections to real IPs (e.g. 1.1.1.1) time out while the bridge still
+    // reaches the upstream. The result is a true per-destination (bridge-only) egress
+    // firewall. Strict REQUIRES pasta: there is no safe shared-loopback equivalent (shared
+    // loopback would hand the child general host network), so strict-without-pasta fails
+    // CLOSED (refused below) rather than silently downgrading to general internet.
     const NetnsIsolation isolate_mode = cfg.ext.egress.isolate_netns;
     const bool jail_requested = egress_active && isolate_mode != NetnsIsolation::Off;
     std::optional<std::string> pasta_path;
     if (jail_requested) pasta_path = find_pasta();
     const bool jail_active = jail_requested && pasta_path.has_value();
+    // Strict jail: block general internet by binding pasta's outbound to loopback. Only
+    // meaningful once the jail is actually active (pasta present).
+    const bool strict_jail = jail_active && isolate_mode == NetnsIsolation::Strict;
+
+    // Fail CLOSED for STRICT without pasta. Strict promises "only the bridge, no general
+    // internet". The shared-loopback fallback used by auto/on would instead give the child
+    // GENERAL host network access — the exact opposite of strict. Rather than silently
+    // downgrade (fail OPEN), refuse the run with an actionable error. This returns before
+    // mkdtemp(), so only the signal handlers (armed in step 0) need restoring; no sandbox
+    // root exists to clean up yet.
+    if (egress_active && isolate_mode == NetnsIsolation::Strict && !pasta_path.has_value()) {
+        err =
+            "Error: [egress].isolate_netns = \"strict\" blocks the child's general internet "
+            "and exposes ONLY the forwarded bridge port(s), which requires `pasta` (passt) "
+            "to run the child in an isolated network namespace — but pasta was not found on "
+            "this host. There is no safe shared-loopback equivalent of \"strict\" (sharing "
+            "the host loopback would grant the child general host network access), so the "
+            "run is refused (fail-closed) rather than silently downgraded. Install pasta, or "
+            "set isolate_netns to \"on\"/\"auto\" (jail with general internet via NAT) or "
+            "\"off\" (shared loopback).";
+        restore_signals();
+        return 1;
+    }
 
     // ---- 1. Create the sandbox root + fixed sub-tree ---------------------
     const char* tmpdir_env = std::getenv("TMPDIR");
@@ -669,7 +702,21 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // MEASURED reality of the mode actually selected: an isolated pasta netns jail, or the
     // shared-loopback fallback. Surface it on stderr so a user who never opens the audit
     // still learns the model.
-    if (egress_active && jail_active) {
+    if (egress_active && strict_jail) {
+        if (!warning.empty()) warning += "\n";
+        warning +=
+            "Note: egress bridge mode is active in STRICT ISOLATED-NETNS mode (pasta " +
+            *pasta_path +
+            "). The child runs in a private network namespace with pasta's outbound bound "
+            "to loopback (-o 127.0.0.1), so its general outbound internet is BLOCKED "
+            "(connections to real IPs fail/time out). The child can reach ONLY the "
+            "configured bridge endpoint(s) at 127.0.0.1:<port> (relayed to the upstream) "
+            "and has NO other network access — no general internet, and no other "
+            "host-loopback services. For this STRICT level, egress is a per-destination "
+            "(bridge-only) firewall. The host-side bridge's upstream socket stays in the "
+            "host network namespace, so the child's /proc/net/tcp does NOT reveal the real "
+            "upstream IP:port.";
+    } else if (egress_active && jail_active) {
         if (!warning.empty()) warning += "\n";
         warning +=
             "Note: egress bridge mode is active in ISOLATED-NETNS mode (pasta " +
@@ -872,7 +919,7 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     std::string launch_path = *bwrap_path;
     if (jail_active) {
         std::vector<std::string> wrapped;
-        wrapped.reserve(argv.size() + 6);
+        wrapped.reserve(argv.size() + 8);
         wrapped.push_back(*pasta_path);
         wrapped.push_back("--config-net");
         wrapped.push_back("-t");
@@ -885,6 +932,15 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             }
             wrapped.push_back("-T");
             wrapped.push_back(spec);
+        }
+        // STRICT: bind pasta's outbound to loopback so general internet is BLOCKED while
+        // the `-T` bridge forward(s) still work. MEASURED on this host: with `-o 127.0.0.1`
+        // the child cannot reach real IPs (they time out) but the forwarded bridge port
+        // still reaches the upstream — a true "only the bridge, nothing else" jail. Without
+        // it (auto/on) pasta NATs general outbound, so the child keeps general internet.
+        if (strict_jail) {
+            wrapped.push_back("-o");
+            wrapped.push_back("127.0.0.1");
         }
         wrapped.push_back("--");
         for (auto& tok : argv) wrapped.push_back(std::move(tok));
@@ -993,7 +1049,23 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // bridge (name, child-visible endpoint, injected env var name). The real upstream is
     // recorded ONLY when redaction was explicitly disabled; by default it is hidden. The
     // upstream_endpoint is NEVER placed in the child env (only child_endpoint is).
-    if (egress_active && jail_active) {
+    if (egress_active && strict_jail) {
+        rec.active_policy_notes.push_back(
+            "egress bridge active in STRICT ISOLATED-NETNS mode (pasta " + *pasta_path +
+            "): the child runs in a PRIVATE network namespace (pasta --config-net -t "
+            "none -o 127.0.0.1 -T <bridge-ports>) and bwrap joins it (no --unshare-net). "
+            "pasta's outbound is bound to loopback (-o 127.0.0.1), so the child's general "
+            "outbound internet is BLOCKED — connections to real IPs fail/time out. The "
+            "child can reach ONLY the forwarded bridge port(s) at their child_endpoint "
+            "(127.0.0.1:<port>, relayed to the configured upstream(s)); it has NO general "
+            "internet access and NO access to other host-loopback services. MEASURED on "
+            "this host: the host-side bridge's upstream socket lives in the HOST network "
+            "namespace, so the child's /proc/net/tcp does NOT reveal the real upstream "
+            "IP:port — the shared-loopback /proc-net leak is FIXED. For this STRICT level "
+            "ONLY, egress is restricted to the configured bridge endpoint(s): this IS a "
+            "per-destination (bridge-only) egress firewall. (The \"on\"/\"auto\" levels "
+            "still NAT general outbound internet; only \"strict\" blocks it.)");
+    } else if (egress_active && jail_active) {
         rec.active_policy_notes.push_back(
             "egress bridge active in ISOLATED-NETNS mode (pasta " + *pasta_path +
             "): the child runs in a PRIVATE network namespace (pasta --config-net -t "
