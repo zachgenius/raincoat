@@ -2,6 +2,7 @@
 #include "runner.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <csignal>
