@@ -106,7 +106,15 @@ are per-arch). Values are kept consistent with the Tier-1 file masks above.
 
 ---
 
-## macOS (design notes — not implemented)
+## macOS (Seatbelt backend landed; syscall interposer is future)
+
+The macOS **Seatbelt backend** is implemented (filesystem hiding, network, and *env-level*
+identity — `USER`/`HOME`/`HOSTNAME`/`TZ`; see `docs/MACOS.md`). What is **not** yet implemented
+is the machine-fingerprint *syscall* faking below — the macOS analog of the Linux Tier-2 seccomp
+supervisor. In the capability model it is gated OFF: the Seatbelt backend reports
+`supports_proc_overlays = false` and `supports_seccomp_identity = false`, so the Tier-1 `/proc`
+overlays and the Tier-2 `uname`/`sysinfo` seccomp hook are compiled but never run on macOS. The
+`fake_*` config knobs remain valid; on macOS they will route to the interposer below once built.
 
 No seccomp; the equivalents are `sysctl`, Mach traps, and IOKit. There is no bind-mount trick
 for these (they are not files), so Tier-2 faking means **`DYLD_INSERT_LIBRARIES` function
@@ -121,13 +129,28 @@ Endpoint-Security/DriverKit approach.
 | `getifaddrs` / `NET_RT_IFLIST` sysctl | — | interface **MAC**s |
 | Mach `host_info` / `host_statistics64` | — | CPU type, memory |
 | `uname(3)` | — | sysname/nodename/release/version/machine |
+| `getpwuid`/`getpwnam`(`_r`) · `getlogin`(`_r`) | opendirectoryd | **real login name + home dir** — a *user*-identity leak Seatbelt's path denials do NOT close (the lookup is not a file read) |
 | CPUID / `hw.optional.*` | — | Intel: CPUID; Apple Silicon: feature flags via sysctl |
 
 **Faking:** interpose `sysctl`/`sysctlbyname`, `gethostuuid`, `IOServiceGetMatchingService` /
-`IORegistryEntryCreateCFProperty`, and `getifaddrs` via a `__DATA,__interpose` dylib injected
-with `DYLD_INSERT_LIBRARIES`. Limits: SIP-protected/`hardened-runtime` binaries ignore
-`DYLD_INSERT_LIBRARIES`; hardware-instruction reads (CPUID on Intel) remain Tier 3. The
+`IORegistryEntryCreateCFProperty`, `getifaddrs`, and the `getpwuid`/`getlogin` family via a
+`__DATA,__interpose` dylib injected with `DYLD_INSERT_LIBRARIES`. Raincoat scrubs `DYLD_*` from
+the child env, so it must inject its **own** controlled value via `set_env` (which wins over the
+scrub — the scrub still blocks an *attacker's* injection).
+
+**Honest limit — macOS Tier-2 is strictly weaker than Linux Tier-2.** DYLD interposition is the
+`LD_PRELOAD`-class technique, and macOS has **no seccomp-notify equivalent**. So it only catches
+**dynamically-linked libc callers**: a static binary, or one issuing a raw `sysctl(2)`/Mach trap
+directly, bypasses the interposer entirely — with no syscall-boundary backstop (short of Endpoint
+Security, which is heavy and entitlement-gated). This is the exact opposite of the Linux argument
+for preferring seccomp over `LD_PRELOAD`. On top of that, SIP-protected/`hardened-runtime` binaries
+ignore `DYLD_INSERT_LIBRARIES` outright, and CPUID on Intel remains Tier 3. The
 `IOPlatformUUID`/`IOPlatformSerialNumber` pair is the highest-value target.
+
+**Consistency requirement.** A datum leaks by multiple paths that must agree or you create a
+*tell*: on macOS the interposer must keep `sysctlbyname("kern.hostname")`, `gethostname()`, and
+`uname().nodename` identical (and matching `$HOSTNAME`) — the same cross-path rule the Linux
+`uname(2)` ↔ `/proc/sys/kernel/osrelease` pairing follows.
 
 ---
 
@@ -173,8 +196,14 @@ identity remain Tier 3 / hardware-rooted.
 - [x] Tier 2, Linux: `uname(2)` via seccomp user-notify (`backend.fake_uname`)
 - [x] Tier 2, Linux: `sysinfo(2)` (`backend.fake_sysinfo`) + paired `/proc/meminfo`, `/proc/uptime`, `/proc/loadavg` overlays
 - [x] Tier 1, Linux: `boot_id` overlay (`backend.fake_boot_id`)
+- [x] Capability-gated per backend: `supports_proc_overlays` / `supports_seccomp_identity`
+      (Linux true, macOS false). Tier-1 overlays are portable code gated on the flag; the
+      Tier-2 seccomp hook is `#ifdef __linux__` + a Linux-only `seccomp_notify.cpp` TU.
+- [x] macOS Seatbelt backend (fs/network/env identity) — see `docs/MACOS.md`
 - [ ] Tier 1, Linux: `/proc/self/mountinfo` overlay (host mount-layout deanon vector)
 - [ ] `uname` on non-x86 arches (per-arch syscall numbers)
-- [ ] macOS `DYLD_INSERT_LIBRARIES` interposer (`sysctl`, `gethostuuid`, IOKit)
+- [ ] macOS `DYLD_INSERT_LIBRARIES` interposer (`sysctl`, `gethostuuid`, IOKit, `getpwuid`);
+      routes the `fake_*` knobs to Tier-2 on macOS. Note: libc-caller-only, no seccomp-notify
+      backstop, SIP/hardened-runtime binaries opt out — strictly weaker than Linux Tier-2.
 - [ ] Windows API-hook layer (`MachineGuid`, SMBIOS, WMI)
 - [ ] Tier 3 — explicit non-goal (needs a VM/hypervisor)
