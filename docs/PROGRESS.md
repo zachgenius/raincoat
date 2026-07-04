@@ -360,12 +360,15 @@ three POD structs and GATES every platform step on the backend's `Capabilities`,
 Seatbelt cannot deliver is SKIPPED, never dishonestly audited. **The core inversion:** bwrap
 CONSTRUCTS a namespace (fail-closed, structural); Seatbelt FILTERS the real filesystem (fail-open,
 deny-based). So structural `[x]` guarantees become best-effort `[~]`, and a per-run fail-closed
-pre-flight probe restores a measured fail-closed check. Measured on macOS 26.5.1 (Apple Silicon).
+pre-flight probe restores a measured fail-closed check. A **DYLD identity/fingerprint interposer**
+(via an in-process `sandbox_init` pivot) additionally fakes the hostname/username/CPU/kernel/RAM leaks
+Seatbelt can only allow/deny, never rewrite — best-effort, injectable (non-hardened) targets only.
+Measured on macOS 26.5.1 (Apple Silicon).
 
 ### 6.1 Backend seam  (backend.hpp / backend_macos.cpp / backend_linux.cpp)
 - [x] `Capabilities` / `LaunchInputs` / `LaunchPlan` PODs; `backend_capabilities` / `backend_locate` / `backend_build_launch` free functions; compile-time platform selection, no runtime dispatch — *backend.hpp / CMakeLists*
 - [x] Linux backend delegates to the unchanged `build_bwrap_argv` + reproduces the pasta wrap; no MVP regression — *backend_linux.cpp / test_backend_golden_argv*
-- [x] macOS `Capabilities`: `fs_hiding=Filter`, `net_off=PolicyDeny`, `env_apply=ViaExec`, `net_firewall_kernel=true`; `supports_{fontconfig,uts_hostname,minimal_etc,curated_fonts,netns_jail}=false` — *backend_macos.cpp*
+- [x] macOS `Capabilities`: `fs_hiding=Filter`, `net_off=PolicyDeny`, `env_apply=ViaExec`, `net_firewall_kernel=true`, **`supports_dyld_interpose=true`**; `supports_{fontconfig,uts_hostname,minimal_etc,curated_fonts,netns_jail}=false` — *backend_macos.cpp*
 - [x] `backend_locate` returns `/usr/bin/sandbox-exec` (actionable error if absent/not X_OK) — *backend_macos.cpp*
 
 ### 6.2 SBPL generator  (seatbelt.cpp — pure, no filesystem access)
@@ -382,27 +385,33 @@ pre-flight probe restores a measured fail-closed check. Measured on macOS 26.5.1
 - [x] `--net off` → `(deny network*)` blocks outbound to a public IP — *seatbelt* (MEASURED)
 - [x] **Kernel egress firewall** (`isolate_netns = "strict"` + egress/proxy): `(deny network*)` + `(allow network-outbound (remote ip "localhost:<port>"))` — constrains ALL clients (not just proxy-aware), NO pasta, port-precise, `localhost` covers `::1`; needs no pasta and does NOT fail closed on macOS — a STRENGTH over Linux — *seatbelt / runner* (MEASURED)
 - [x] **Fail-closed pre-flight probe** (every run): spawns a probe under the IDENTICAL profile that tries to read real `$HOME` (+ connect to a public IP when net-restricted); REFUSES the run if either succeeds — restores fail-closed for a Filter backend — *runner* (verified: a permissive profile aborts the run)
+- [x] **In-process `sandbox_init` pivot**: the child applies the SBPL via `sandbox_init(profile,0)` and `execvp`s the target ITSELF (not through the SIP-protected `/usr/bin/sandbox-exec`), because SIP STRIPS `DYLD_INSERT_LIBRARIES` when exec'ing a protected binary (MEASURED: injection through sandbox-exec left `gethostname` real). Sandbox stays enforced AND the injection survives (both MEASURED); `sandbox_init` is public-but-deprecated (same status as sandbox-exec) — *runner.cpp / backend_macos* (`apply_sbpl`, `env_apply=ViaExec`)
+- [x] **DYLD identity/fingerprint interposer** (`supports_dyld_interpose=true`): a `__DATA,__interpose` dylib (`src/rc_interpose.c`, built next to the binary as `rc_interpose.dylib`) fakes `gethostname`, `uname` (nodename/release/version), `getlogin`/`getlogin_r`, `getpwuid`/`getpwnam` (pw_name+pw_dir), `sysctlbyname` (kern.hostname / machdep.cpu.brand_string / kern.osrelease / kern.osversion / hw.memsize) — closing the identity leaks Seatbelt can only allow/deny, never rewrite — *rc_interpose.c / backend_macos* (MEASURED)
+- [x] **Value-driven, same config as Linux**: identity hostname/username always faked; `kernel_osrelease`/`kernel_version`→`uname.release`/`.version`, `cpu_model_name`→CPU brand, `mem_total_kb`→`hw.memsize` only when SET (unset → real). VERIFIED: set → release=6.1.0-generic, cpu="Generic CPU", memsize=16 GiB; unset → real value — *backend_macos / rc_interpose*
+- [x] SBPL re-allows READING the dylib (it may sit under a denied path, e.g. a dev build under `$HOME`) — *backend_macos / seatbelt*
 
 ### 6.4 Best-effort on macOS (deny-based, honest `[~]`)
 - [~] best-effort (macOS): real-`$HOME` hiding is DENY-based (present-but-denied), not structural absence — mitigated (not fixed) by the pre-flight probe — *seatbelt / runner*
 - [~] best-effort (macOS): audit-dir tamper protection is a deny rule over the real audit dir, not a tmpfs mask — *seatbelt*
+- [~] best-effort (macOS): hostname/`uname` masking is via the DYLD interposer (`gethostname`/`uname().nodename`), not a UTS ns — INJECTABLE targets only; hardened/SIP/static callers still leak (`supports_uts_hostname=false`, `supports_dyld_interpose=true`) — *rc_interpose / backend_macos*
+- [~] best-effort (macOS): CPU/kernel/RAM fingerprint (`sysctlbyname`/`uname`) + username (`getpwuid`/`getlogin`) faked via the interposer — libc-caller-only, NO seccomp-notify backstop, strictly weaker than Linux Tier-2 — *rc_interpose / docs/FINGERPRINT-SYSCALLS.md*
 
 ### 6.5 N/A on macOS (honest `[-]` — gated off, never dishonestly audited)
 - [-] N/A on macOS: structural (fail-closed) filesystem invisibility — Seatbelt is a Filter, so it is deny-based/fail-open (`fs_hiding=Filter`)
-- [-] N/A on macOS: UTS hostname masking — no UTS ns; `gethostname()`/`uname()` leak the real name, only `$HOSTNAME` env is faked (`supports_uts_hostname=false`)
+- [-] N/A on macOS: structural UTS hostname masking — no UTS ns (`supports_uts_hostname=false`); `gethostname()`/`uname()` are instead faked best-effort by the DYLD interposer (see §6.4), NOT structurally
 - [-] N/A on macOS: minimal `/etc` view — cannot bind a fake `/etc` (`supports_minimal_etc=false`)
 - [-] N/A on macOS: curated-font / fontconfig masking — Core Text, not fontconfig; cannot overlay `/usr/share/fonts` (`supports_curated_fonts`/`supports_fontconfig_isolation=false`)
 - [-] N/A on macOS: pasta netns jail + `/proc/net/tcp` leak-fix — no `/proc`, no netns; kernel firewall replaces it (`supports_netns_jail=false`)
 - [-] N/A on macOS: true `(deny default)` strict — a bare deny-default can't even load libSystem (MEASURED, exit 71); macOS `strict` = allow-default + expanded denies + no cwd auto-grant
 
 ### 6.6 Disclosed residual bypasses (present, not hidden — see docs/MACOS.md)
-- [x] `getpwuid()->pw_name`/`pw_dir` can still leak the real username/home via opendirectoryd (not a filesystem read) — *docs/MACOS.md*
+- [x] `getpwuid()->pw_name`/`pw_dir` + `getlogin()` (opendirectoryd, not a file read) — now FAKED by the DYLD interposer for injectable targets (closes the previously-documented un-closable leak); a hardened/SIP/static target still recovers the real name (honest residual) — *rc_interpose / docs/MACOS.md*
 - [x] Hardlinks on the shared APFS volume can reference a denied inode by a different path — *docs/MACOS.md*
 - [x] Exposure depends on the host's TCC state (Full Disk Access on the parent terminal changes reachable surface) — *docs/MACOS.md*
 
 ### 6.7 Verification gate (Phase 6)
 - [x] `tests/test_seatbelt.cpp` SBPL golden/assembly suite (compiled only on macOS; Linux `bwrap` suites pruned on macOS) — *CMakeLists*
-- [x] Real runs verified on macOS 26.5.1: real `~/.ssh`/`~/.gitconfig` denied, `ls /Users` EPERM, fake identity via env, `--net off` blocks outbound, kernel egress firewall constrains raw clients, pre-flight probe aborts a permissive profile
+- [x] Real runs verified on macOS 26.5.1: real `~/.ssh`/`~/.gitconfig` denied, `ls /Users` EPERM, fake identity via env, `--net off` blocks outbound, kernel egress firewall constrains raw clients, pre-flight probe aborts a permissive profile, DYLD interposer fakes `gethostname`/`uname`/`getpwuid`/`sysctl` for a non-system binary (and returns real values when unset)
 - [x] docs/MACOS.md (honest design + threat model) + this Phase 6 tracker; README "Platform status" updated to best-effort macOS
 
 **PHASE 6 (macOS Seatbelt, best-effort): COMPLETE ✅**

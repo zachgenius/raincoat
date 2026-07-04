@@ -369,11 +369,14 @@ honest reasons. Read [`docs/MACOS.md`](docs/MACOS.md) before trusting it:
 2. **`sandbox-exec` is Apple-deprecated.** It works today and is the only way to confine an arbitrary
    CLI, but Apple ships no supported replacement for that use case (the App Sandbox needs a signed
    bundle + entitlements). Raincoat uses the deprecated-but-functional path and says so.
-3. **No font / `/etc` / hostname masking.** macOS uses Core Text (not fontconfig) and has no UTS
-   namespace, so the curated font set, the minimal `/etc` view, and `gethostname()`/`uname()` masking
-   are all unavailable — only the `$HOSTNAME` *env* value is faked. (One place macOS is actually
-   *stronger*: the guarded-proxy egress firewall is kernel-enforced for **all** clients with no pasta
-   helper — see [`docs/MACOS.md`](docs/MACOS.md).)
+3. **No font / `/etc` masking; hostname/fingerprint faking is best-effort.** macOS uses Core Text (not
+   fontconfig) and has no UTS namespace, so the curated font set and the minimal `/etc` view are
+   unavailable. Hostname/username/CPU/kernel/RAM *are* now faked — best-effort — by a small **DYLD
+   interposer** that rewrites `gethostname()`/`uname()`/`getpwuid()`/`getlogin()`/`sysctl` for
+   **non-hardened** targets (unsigned/ad-hoc Homebrew/dev tools); a hardened-runtime, SIP-protected, or
+   static binary ignores it and still sees the truth, and there is no seccomp-style backstop as on
+   Linux. (One place macOS is actually *stronger*: the guarded-proxy egress firewall is kernel-enforced
+   for **all** clients with no pasta helper — see [`docs/MACOS.md`](docs/MACOS.md).)
 
 Same raincoat, thinner fabric: it keeps the everyday drizzle off on macOS too, but the seams are wider
 and honestly disclosed.
@@ -772,9 +775,10 @@ roadmap have since shipped.
 - **Per-job profile templates** — the [`examples/`](examples/) directory (strict, paranoid,
   ai-agent, node-build, python-tool, egress, api-agent, guarded, browser).
 - **macOS best-effort mode** (in progress on `macos-seatbelt-backend`) — a reduced-guarantee Seatbelt
-  backend behind the platform seam: `sandbox-exec` deny-based filtering + a fail-closed per-run
-  pre-flight probe, a kernel egress firewall, and honest `[-]` gaps (no font/`/etc`/hostname masking).
-  Full honest write-up in [`docs/MACOS.md`](docs/MACOS.md).
+  backend behind the platform seam: in-process `sandbox_init` deny-based filtering + a fail-closed
+  per-run pre-flight probe, a kernel egress firewall, a best-effort **DYLD identity/fingerprint
+  interposer** (hostname/username/CPU/kernel/RAM for non-hardened targets), and honest `[-]` gaps (no
+  font/`/etc` masking). Full honest write-up in [`docs/MACOS.md`](docs/MACOS.md).
 
 **Still ahead / genuine non-goals:**
 
