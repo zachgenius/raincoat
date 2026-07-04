@@ -1,0 +1,68 @@
+# Raincoat profile — Node.js build (npm / pnpm / yarn).
+#
+# Run an untrusted `npm install` / `npm run build` (or pnpm/yarn) so that the
+# build — and every transitive lifecycle script in your dependency tree — can
+# read your project and write ONLY its build outputs, while your real home,
+# credentials, SSH keys, and the rest of the machine stay hidden.
+#
+#   project source  -> READ-ONLY   (the build can read it, not rewrite it)
+#   node_modules    -> READ-WRITE  (install target)
+#   dist            -> READ-WRITE  (build output)
+#
+# Run it from your project root:
+#   cd /path/to/your/project
+#   raincoat --profile /path/to/node-build.toml -- npm ci
+#   raincoat --profile /path/to/node-build.toml -- npm run build
+#
+# IMPORTANT: every allow_write path must EXIST before the run (Raincoat mounts it,
+# it does not create it). Pre-create them once:
+#   mkdir -p node_modules dist
+# npm/pnpm will happily populate an already-present node_modules.
+
+strict  = false
+network = "full"          # package registry access; see the network_policy note below
+
+# "." = your project (the launch directory), mounted READ-ONLY so a malicious
+# postinstall script cannot rewrite your source. Add more RO paths if your build
+# reads config from outside the project.
+allow_read  = ["."]
+
+# Only the build's output dirs are writable. ADJUST to your toolchain, e.g.
+# add "./.next", "./build", "./.turbo", "./coverage" as needed. Each must exist.
+allow_write = ["./node_modules", "./dist"]
+
+# Forward nothing by default. If you publish or pull from a private registry, add
+# the token name here (e.g. "NPM_TOKEN") — only names you list are copied in.
+allow_env   = []
+
+[env]
+TZ     = "UTC"
+LANG   = "en_US.UTF-8"
+LC_ALL = "en_US.UTF-8"
+
+[fontconfig]
+enabled = true
+
+[audit]
+log_file = ".raincoat/audit.log"
+
+# --- OPTIONAL: lock egress to your registry (uncomment to enable) -----------
+# By default network = "full" gives the build unrestricted internet. To confine
+# it to just your package registry, uncomment the block below. It becomes a REAL
+# egress firewall only WITH the strict pasta netns jail (requires `pasta`; check
+# with `raincoat doctor`); without it, only proxy-aware clients are constrained.
+# See examples/guarded.toml and docs/EGRESS.md for the full threat model.
+#
+# [network_policy]
+# enabled = true
+# default_action = "deny"                 # allow-list mode (strongest)
+# allow_hosts = [
+#   "registry.npmjs.org",                 # npm         (replace with YOUR registry)
+#   "registry.yarnpkg.com",               # yarn
+#   # "your-company.jfrog.io",            # private Artifactory/Nexus, etc.
+# ]
+# block_hosts = []
+# block_private_metadata_endpoints = true # block 169.254.169.254 & friends
+#
+# [egress]
+# isolate_netns = "strict"                # REQUIRED for a hard firewall; needs pasta

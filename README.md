@@ -2,13 +2,16 @@
 
 **Raincoat is a lightweight privacy sandbox for nosy CLI tools and AI agents.** It helps
 prevent untrusted tools from casually inspecting your real home directory, credentials, browser
-profiles, locale, timezone, and other machine fingerprints. It also normalizes generic font
-aliases (best-effort — it does not hide the installed font list; see the caveat below).
+profiles, locale, timezone, and other machine fingerprints. It swaps in a curated generic font
+set (Noto/DejaVu) that masks your host's full installed-font list, and a minimal `/etc` view so
+your real hostname/hosts never leak.
 
 It is a thin, Linux-first wrapper around [bubblewrap (`bwrap`)](https://github.com/containers/bubblewrap)
 that hands the command you run a *fake* home, a scrubbed environment, a generic locale and
-timezone, a best-effort font environment, restricted filesystem access, optional network
-isolation, and an audit log of exactly what it did.
+timezone, a curated font environment, a minimal `/etc`, restricted filesystem access, an audit
+log (human-readable or JSON) of exactly what it did, and — when you ask for it — a filtering
+egress layer: an endpoint-hiding bridge, an isolated-netns jail (via `pasta`), and a domain
+allow/block firewall.
 
 ```
 raincoat -- <command> [args...]
@@ -120,6 +123,7 @@ raincoat report      # summarize the most recent audit log
 | `--net <full\|off>` | Network on (`full`) or isolated (`off`). |
 | `--workdir <path>` | Working directory inside the sandbox. |
 | `--audit-log <path>` | Where to write the audit log. |
+| `--audit-format <text\|json>` | Audit-log format. Overrides `[audit].format` in the profile. |
 | `--keep-temp` | Do not delete the temporary sandbox dir on exit. |
 
 The examples below are real output from `./build/raincoat`. Only three things will differ
@@ -254,27 +258,42 @@ Verdict: this tool did not get to see you naked.
   sandbox hostname is set to a generic `sandbox` (your real machine name never leaks through the
   UTS namespace), timezone is `UTC`, and locale is `en_US.UTF-8` — regardless of your real
   settings. (Your numeric `uid`/`gid` are *not* remapped — see limitations.)
-- **Your font environment (best-effort — see the honest caveat).** Raincoat points fontconfig at
-  a minimal in-sandbox config that remaps the `serif` and `monospace` aliases to DejaVu Serif /
-  DejaVu Sans Mono. The `sans-serif` alias is also declared, but its normalization is **not
-  reliable across hosts** — on some systems `fc-match sans-serif` is still outranked by another
-  installed family — so do not count on it. It
-  does **not** yet hide your installed font list: because `/usr` is mounted read-only, the config
-  still resolves the host's real font directories, so `fc-list` can still enumerate every font on
-  your machine. Bundling a fixed generic font set (which would actually make the list uniform) is
-  on the roadmap. Treat this as cosmetic normalization today, not fingerprint resistance.
+- **Your font list.** When fontconfig isolation is on (default), Raincoat masks `/usr/share/fonts`
+  with a tmpfs and re-binds **only** a curated generic set — the DejaVu and Noto directories
+  (`.../truetype/dejavu`, `.../{truetype,opentype}/noto`) — read-only, and points fontconfig at an
+  in-sandbox config that lists just those dirs. So `fc-list` inside the sandbox enumerates a
+  generic Noto/DejaVu set instead of your host's full font list (e.g. your installed `lato`,
+  `ubuntu`, corporate, or hand-installed families are gone). The generic aliases `serif`,
+  `sans-serif`, `monospace`, and `emoji` are strong-pinned to Noto/DejaVu faces. **Honest caveat:**
+  the exposed set is *whichever* of those curated dirs exist on your host, so two machines with
+  different Noto packages installed can still differ; and if a host has **no** DejaVu/Noto dirs at
+  all, Raincoat leaves `/usr/share/fonts` unmasked (best-effort fallback) rather than hiding
+  everything. This is real font-list masking, not per-glyph anti-fingerprinting.
+- **A minimal `/etc`.** The child sees a generic `/etc/hostname` (`sandbox`), a generic
+  `/etc/hosts`, and an `/etc/localtime` pinned to the resolved timezone — so your real machine
+  name and host file never leak through `/etc`.
 - **The filesystem.** Only the paths you allow (plus the CWD in non-strict mode) are visible.
-  `--allow-read` is read-only; `--allow-write` is read-write.
-- **The network (optional).** `--net off` (the default in strict mode) isolates networking.
-- **An audit trail.** Every run appends a human-readable record to the audit log — mode,
-  network, fake home, mounts, which env vars were allowed / set / scrubbed, and the exact bwrap
-  command. **Environment *values* are never written to disk**: every env value in the logged
-  bwrap command is redacted to `<redacted>` and only variable *names* appear. **Caveat:** the
-  *command you run* is logged verbatim (both the `Command:` line and the command tail of the
-  bwrap invocation), so a secret you pass as a command-line argument — e.g.
-  `curl -H 'Authorization: Bearer <token>'` — **will** appear in the audit log. Put secrets in
+  `--allow-read` is read-only; `--allow-write` is read-write. A `[filesystem].mode =
+  "deny-by-default"` profile drops even the CWD auto-mount, and optional `[filesystem.tripwire]`
+  decoys plant inert bait files in the fake home.
+- **The network (optional).** `--net off` (the default in strict mode) isolates networking. Beyond
+  all-or-nothing, Raincoat also ships an opt-in filtering egress layer — an endpoint-hiding
+  **egress bridge**, an isolated-netns **jail** (`pasta`), and a domain-level **guarded proxy**
+  firewall. See the [Egress bridge](#egress-bridge-endpoint-indirection) and
+  [Network policy](#network-policy-guarded-proxy) sections below.
+- **Browser profiles.** Your real Chrome/Firefox profiles are never mounted (the fake home hides
+  them); the optional `[browser]` block adds a throwaway profile + generic launch shims for
+  Playwright/Puppeteer/Selenium jobs. See [Browser isolation](#browser-isolation-browser).
+- **An audit trail.** Every run appends a record to the audit log — mode, network, fake home,
+  mounts, which env vars were allowed / set / scrubbed, active-policy notes, and the exact bwrap
+  command — in a human-readable block or, with `[audit].format = "json"` (or `--audit-format
+  json`), one structured JSON object per run. **Environment *values* are never written to disk**:
+  every env value in the logged bwrap command is redacted to `<redacted>` and only variable
+  *names* appear. **Caveat:** the *command you run* is logged verbatim (both the `Command:` line
+  and the command tail of the bwrap invocation), so a secret you pass as a command-line argument —
+  e.g. `curl -H 'Authorization: Bearer <token>'` — **will** appear in the audit log. Put secrets in
   `--set-env`/`--allow-env` (which are redacted), never in argv. `raincoat report` turns the
-  latest log into a plain-language summary.
+  latest log (text or JSON) into a plain-language summary.
 
 ---
 
@@ -344,12 +363,26 @@ Being honest about the sharp edges:
   an explicit `network = "full"` in a profile (or `--net full` on the CLI) overrides it. Precedence
   is: CLI flag > profile value > mode default. If you want a profile that is strict *and* offline,
   set `network = "off"` explicitly.
-- **Font isolation is best-effort.** The MVP ships a minimal fontconfig setup but does **not**
-  bundle a fixed font set yet, so it does not hide the installed font list at all — `fc-list`
-  inside the sandbox still enumerates every host font (the config resolves the real
-  `/usr/share/fonts`). It only remaps the `serif`/`monospace` generic aliases (the `sans-serif`
-  remap is best-effort and not reliable across hosts). Real fingerprint resistance
-  (a bundled generic font set) is on the roadmap.
+- **Font masking depends on the curated dirs existing.** When enabled, Raincoat masks
+  `/usr/share/fonts` and re-binds only the curated DejaVu/Noto directories, so `fc-list` shows a
+  generic Noto/DejaVu set rather than your host's full list. But it exposes *whichever* of those
+  curated dirs your host actually has, so two hosts with different Noto packages can still differ;
+  and on a host with **no** DejaVu/Noto dirs it falls back to leaving `/usr/share/fonts` unmasked
+  (it never hides *all* fonts as a side effect of a missing curated set). This is font-list
+  masking, not per-glyph anti-fingerprinting (canvas/metrics signals are untouched).
+- **The egress jail needs `pasta`, and only `strict` is a firewall.** The isolated-netns jail
+  requires [`pasta`](https://passt.top/) (`raincoat doctor` reports it). At `auto`/`on` it fixes
+  the `/proc/net/tcp` upstream leak and hides other host-loopback services, but pasta **NATs**
+  general outbound traffic — the child keeps general internet by IP. Only `isolate_netns =
+  "strict"` blocks general internet (bridge/proxy port only); with `pasta` absent, `strict` fails
+  **closed** (the run is refused). Without any jail (shared loopback), the child keeps general host
+  network access and the upstream IP:port is visible via `/proc/net/tcp`.
+- **The guarded proxy is a hard firewall only *with* the strict jail.** `[network_policy]`'s
+  allow/block list is a real domain-level egress firewall only when composed with `[egress]
+  isolate_netns = "strict"` (the jail forwards only the proxy port, so the proxy is the child's
+  sole exit). Without the strict jail — shared loopback or the `auto`/`on` NAT jail — it constrains
+  only **proxy-aware** clients: a tool that ignores `http_proxy` or dials a raw IP bypasses the
+  policy. There is no transparent interception without the jail.
 - **Your numeric `uid`/`gid` stay visible.** The `USER`/`LOGNAME` *strings* are masked to a
   generic `user`, but the command runs with your real numeric uid/gid, so `id` still prints e.g.
   `uid=1000 gid=1000 groups=1000,65534`. Host supplementary groups are dropped (only the
@@ -373,8 +406,9 @@ Being honest about the sharp edges:
 ## Example profiles
 
 Profiles are TOML. `--profile <path>` loads one; **CLI flags always override the profile.**
-`raincoat init` writes a starter `.raincoat.toml` you can edit. Two ready-made examples live in
-[`examples/`](examples/) and are safe to run as-is.
+`raincoat init` writes a starter `.raincoat.toml` you can edit. Ready-made, heavily-commented
+templates live in [`examples/`](examples/) — see the [index](#the-examples-directory) below. They
+use generic placeholders (no real hosts/secrets); adapt the paths and hostnames before use.
 
 ### `.raincoat.toml` schema
 
@@ -392,7 +426,7 @@ LANG   = "en_US.UTF-8"
 LC_ALL = "en_US.UTF-8"
 
 [fontconfig]
-enabled = true             # best-effort font-fingerprint isolation
+enabled = true             # curated Noto/DejaVu font-set isolation
 
 [audit]
 log_file = ".raincoat/audit.log"
@@ -401,7 +435,33 @@ log_file = ".raincoat/audit.log"
 Every path listed in `allow_read` / `allow_write` **must exist**, or Raincoat refuses to start
 with `Error: allowed path does not exist: <path>`. `set_env` is CLI-only (not read from
 profiles). Wrong-typed `strict` / `network` / `fontconfig.enabled` values are rejected rather
-than silently ignored — a silently-dropped `strict` would be a privacy downgrade.
+than silently ignored — a silently-dropped `strict` would be a privacy downgrade. The full
+sectioned schema (identity / environment / filesystem / backend / egress / network_policy /
+browser / proxy / tripwire) is documented in
+[`docs/full-config-reference.toml`](docs/full-config-reference.toml).
+
+### The `examples/` directory
+
+Each template is heavily commented and safe to *parse*; several need you to point paths and
+hostnames at real targets first. All values are generic placeholders — **no** real
+providers/secrets/hosts.
+
+| Profile | Job | Highlights |
+|---------|-----|------------|
+| [`strict.toml`](examples/strict.toml) | Fully untrusted tool | `strict`, network off, grants nothing until you add paths. Runs as-is. |
+| [`paranoid.toml`](examples/paranoid.toml) | Maximum lockdown | `strict` + net off + deny-by-default fs + genericized identity + curated fonts + tripwire decoys + JSON audit. Runs as-is. |
+| [`ai-agent.toml`](examples/ai-agent.toml) | AI coding agent | Non-strict, project RW, network on, a couple of API keys forwarded. |
+| [`node-build.toml`](examples/node-build.toml) | npm / pnpm / yarn build | Project RO, `node_modules`/`dist` RW; optional registry allow-list. Pre-create the write dirs. |
+| [`python-tool.toml`](examples/python-tool.toml) | pip / poetry / CLI run | Project RO, `out` RW, extra env scrub; optional index allow-list. Pre-create `out`. |
+| [`egress.toml`](examples/egress.toml) | Hide one upstream's URL | Egress bridge (endpoint indirection); `isolate_netns` defaults to `auto` (URL hidden, general net retained). |
+| [`api-agent.toml`](examples/api-agent.toml) | Agent that may talk to **one** API only | Egress bridge **+ `isolate_netns = "strict"`** = real bridge-only egress firewall. Keep the profile **outside** mounted paths. Needs `pasta`. |
+| [`guarded.toml`](examples/guarded.toml) | Domain allow-list firewall | `[network_policy]` guarded proxy **+ strict jail** = real domain-level egress firewall. Needs `pasta`. |
+| [`browser.toml`](examples/browser.toml) | Playwright / Puppeteer / Selenium | Browser profile isolation + launch shims + strict egress allow-list. Needs `pasta` for the firewall. |
+
+The `api-agent`, `guarded`, and `browser` templates use `isolate_netns = "strict"`, which requires
+[`pasta`](https://passt.top/) and fails **closed** (refuses the run) if it is absent — check with
+`raincoat doctor`. Drop them to `"auto"` to accept the weaker (NAT / proxy-aware-clients-only)
+guarantee. Below are the two simplest templates in full; the rest are best read in `examples/`.
 
 ### `examples/strict.toml` — fully untrusted
 
@@ -626,38 +686,48 @@ A ready-to-edit profile lives at [`examples/browser.toml`](examples/browser.toml
 
 ## Roadmap
 
-The MVP implements the fake home, env scrub, generic locale/timezone, best-effort fonts,
-filesystem restriction, `full`/`off` networking, and the audit log. Planned and deferred work:
+The core sandbox implements the fake home, env scrub, generic identity/locale/timezone,
+filesystem restriction, `full`/`off` networking, and the audit log. Several items once on this
+roadmap have since shipped.
 
-- **Network allowlist mode** — the `NetMode` enum already reserves `allowlist`; let a profile
-  permit specific destinations instead of all-or-nothing.
-- **Interactive "ask" mode** — prompt before granting access at run time (reserved as `ask`).
-- **Browser profile isolation** *(best-effort layer implemented — see the
-  [Browser isolation](#browser-isolation-browser) section and [`examples/browser.toml`](examples/browser.toml))*.
-  The fake home already hides your real browser profiles; the `[browser]` block adds an isolated
-  throwaway profile and optional generic PATH launch shims for Playwright / Puppeteer / Selenium
-  jobs. Still deferred: **deep anti-fingerprinting** (canvas/WebGL/audio/font/JA3 normalization) and
-  intercepting absolute-path / flag-overriding launches the shims can't reach.
-- **Better font/emoji fingerprint resistance** — bundle a fixed generic font set (Noto
-  Sans/Serif/Sans Mono/Color Emoji, DejaVu Sans) so the font list is uniform, not best-effort.
-- **Honeytoken / tripwire files** — plant decoy credentials in the fake home and flag any tool
-  that touches them.
-- **macOS best-effort mode** — a reduced-guarantee port for macOS.
-- **JSON audit logs** — a machine-readable audit format alongside the human-readable one.
-- **Per-command policy templates** — reusable presets for common tools.
-- **Agent-specific profiles** — curated starting points for popular AI agents.
-- **Egress bridge / endpoint indirection** *(implemented in the MVP — see the
-  [Egress bridge](#egress-bridge-endpoint-indirection) section and [`docs/EGRESS.md`](docs/EGRESS.md))*.
-  The **isolated-netns jail** (default when `pasta` is present) is now implemented: it fixes the
-  `/proc/net/tcp` upstream leak and hides other host-loopback services. The **`guarded` mode / domain
-  allow-block policy** (`[network_policy]`) is now implemented too — a host-side filtering forward
-  proxy that becomes a real domain-level egress firewall when composed with the strict netns jail
-  (see [Network policy (guarded proxy)](#network-policy-guarded-proxy) and
-  [`docs/EGRESS.md`](docs/EGRESS.md)). Still deferred within egress: a **general CIDR-based egress
-  firewall** (the guarded proxy is name-based, not CIDR), host-loopback mapping on newer `pasta`
-  (`--map-host-loopback`, so the host is reachable at the child's `127.0.0.1`), **transparent
-  interception** of non-proxy-aware clients without the jail, **DNS policy**, a transparent egress
-  mode, and an explicit MITM mode (off by default).
+**Delivered** (documented in the sections above / [`docs/EGRESS.md`](docs/EGRESS.md)):
+
+- **Curated font set** — masks `/usr/share/fonts` and re-binds only the curated Noto/DejaVu dirs,
+  so `fc-list` shows a generic set instead of your host's full font list (best-effort fallback when
+  no curated dirs exist).
+- **Minimal `/etc`** — generic `/etc/hostname`, `/etc/hosts`, and `/etc/localtime`.
+- **JSON audit logs** — `[audit].format = "json"` / `--audit-format json`, one structured object
+  per run alongside the human-readable format; `raincoat report` summarizes either.
+- **Tripwire / honeytoken files** — `[filesystem.tripwire]` plants inert decoy credentials in the
+  fake home.
+- **Egress bridge / endpoint indirection** — hides one upstream's URL from the child
+  ([Egress bridge](#egress-bridge-endpoint-indirection)).
+- **Isolated-netns jail** (`pasta`) — `isolate_netns = auto|on|off|strict`; fixes the
+  `/proc/net/tcp` upstream leak and hides other host-loopback services, and `strict` blocks general
+  internet for a real bridge-only egress firewall.
+- **Guarded proxy / domain firewall** — `[network_policy]` host allow/block + metadata-IP blocking,
+  a real domain-level egress firewall when composed with the strict jail
+  ([Network policy](#network-policy-guarded-proxy)).
+- **Browser isolation** (best-effort) — `[browser]` throwaway profile + generic PATH launch shims
+  ([Browser isolation](#browser-isolation-browser)).
+- **Per-job profile templates** — the [`examples/`](examples/) directory (strict, paranoid,
+  ai-agent, node-build, python-tool, egress, api-agent, guarded, browser).
+
+**Still ahead / genuine non-goals:**
+
+- **macOS best-effort mode** — a reduced-guarantee port; the current design is Linux-only (needs
+  bubblewrap + user namespaces). Non-goal for now.
+- **Interactive "ask" mode** — prompt before granting access at run time (reserved as `ask` in the
+  `NetMode` enum). Not implemented.
+- **General CIDR / allowlist egress firewall** — the guarded proxy is name-based, not CIDR, and the
+  strict jail is bridge-only; an arbitrary per-destination allow-list beyond those is future.
+  Also: `--map-host-loopback` on newer `pasta`, **transparent interception** of non-proxy-aware
+  clients without the jail, and an explicit MITM mode (off by default).
+- **DNS policy** — `[dns]` is parsed and reserved but not enforced.
+- **Deep anti-fingerprinting** — canvas/WebGL/audio/font-metrics/TLS-JA3 normalization would need
+  an instrumented browser build, not a launch shim. Explicit non-goal for the browser layer.
+- **uid/gid remap** — the numeric uid/gid stay visible (identity is masked via
+  username/hostname/HOME, not the uid).
 
 ---
 

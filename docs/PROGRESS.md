@@ -12,7 +12,7 @@ Legend for "Where": module source + test file that owns the behavior.
 
 ### 1.1 Build & project scaffolding
 - [x] C++17 project, CMake build, `-Wall -Wextra` clean — *CMakeLists.txt*
-- [x] GoogleTest wiring; every module test registered with `ctest` (15 suites, 545 tests) — *CMakeLists.txt*
+- [x] GoogleTest wiring; every module test registered with `ctest` (currently **47 suites / ~950 test cases**, all green; the per-phase counts in the gate lines below are point-in-time snapshots showing growth, not the live total) — *CMakeLists.txt*
 - [x] Shared type contract — *src/config.hpp*
 - [x] Interface contract doc — *docs/DESIGN.md*; behavioural spec — *docs/SPEC.md*
 - [x] `assets/fontconfig/fonts.conf`; `examples/strict.toml`, `examples/ai-agent.toml`; `.gitignore`
@@ -119,7 +119,7 @@ Legend for "Where": module source + test file that owns the behavior.
 - [x] SPEC / DESIGN / EGRESS / PROGRESS docs + docs/full-config-reference.toml (config demo)
 - [x] README: what it is, problem, usage, protects / does-not-protect, Linux-first, bwrap dep, limitations (incl. PATH/username + PWD + uid/gid caveats, precedence), example profiles, roadmap — *README.md*
 - [x] Honest positioning + warning text present — *README.md*
-- [x] Example profiles documented as project-local templates — *examples/*
+- [x] Example profiles documented as project-local templates (all parse-validated) — *examples/{strict,paranoid,ai-agent,node-build,python-tool,egress,api-agent,guarded,browser}.toml*
 
 ### 1.17 Hardening (post-review, verified)
 - [x] Hostname no longer leaks — `--hostname sandbox` — *bwrap/runner* (verified)

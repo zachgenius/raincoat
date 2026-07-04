@@ -1,0 +1,64 @@
+# Raincoat profile — Python tool / script run (pip, poetry, a CLI, a model, ...).
+#
+# Run an untrusted Python tool so it can read your project and write ONLY to a
+# dedicated output directory, with a scrubbed environment (no stray *_TOKEN /
+# *_KEY / AWS_* / cloud creds leak in) and your real home kept hidden.
+#
+#   project source  -> READ-ONLY   (the tool reads it, cannot modify it)
+#   out             -> READ-WRITE  (its single output sink)
+#
+# Run it from your project root:
+#   cd /path/to/your/project
+#   raincoat --profile /path/to/python-tool.toml -- python tool.py --out ./out
+#   raincoat --profile /path/to/python-tool.toml -- pip download -d ./out somepkg
+#
+# IMPORTANT: the output dir must EXIST before the run (Raincoat mounts it, it does
+# not create it):
+#   mkdir -p out
+
+strict  = false
+network = "full"          # pip/poetry index access; drop to "off" for offline tools
+
+# "." = your project (launch directory), mounted READ-ONLY. Add more RO paths if
+# the tool imports code or reads data from outside the project.
+allow_read  = ["."]
+
+# The one writable sink. ADJUST the name to match what you pass the tool
+# (e.g. "./output", "./build", "./.cache"). It must exist before the run.
+allow_write = ["./out"]
+
+# Nothing forwarded by default — the whole point is a scrubbed environment. Add a
+# name here only if the tool truly needs it (e.g. a single private-index token).
+allow_env   = []
+
+# --- Environment scrub -------------------------------------------------------
+# The built-in heuristic already drops *_TOKEN/*_SECRET/*_KEY/AWS_*/... . These
+# EXTEND it and are strong enough to override an accidental allow_env. Add your
+# own prefixes as needed.
+[environment]
+scrub_patterns = ["*_TOKEN", "*_SECRET", "*_KEY", "AWS_*", "OPENAI_*", "ANTHROPIC_*"]
+deny = ["SSH_AUTH_SOCK", "KUBECONFIG", "PYPI_TOKEN"]
+
+[env]
+TZ     = "UTC"
+LANG   = "en_US.UTF-8"
+LC_ALL = "en_US.UTF-8"
+
+[fontconfig]
+enabled = true
+
+[audit]
+log_file = ".raincoat/audit.log"
+
+# --- OPTIONAL: lock egress to the Python index (uncomment to enable) --------
+# Confine network access to just your package index. Real firewall only WITH the
+# strict pasta netns jail (needs `pasta`; see docs/EGRESS.md + examples/guarded.toml).
+#
+# [network_policy]
+# enabled = true
+# default_action = "deny"
+# allow_hosts = ["pypi.org", "files.pythonhosted.org"]   # replace with YOUR index
+# block_private_metadata_endpoints = true
+#
+# [egress]
+# isolate_netns = "strict"                # REQUIRED for a hard firewall; needs pasta

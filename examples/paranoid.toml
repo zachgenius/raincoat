@@ -1,0 +1,82 @@
+# Raincoat profile — PARANOID: maximum lockdown.
+#
+# Everything Raincoat can turn on is on, and everything it can deny is denied.
+# Use this for running a fully untrusted blob that should touch as little of your
+# machine as physically possible.
+#
+#   * strict        : the working directory is NOT auto-mounted — nothing on the
+#                     host is exposed unless you list it below.
+#   * network off   : no network namespace access at all (isolated loopback only).
+#   * deny-by-default filesystem, identity fully genericized, curated fonts on,
+#     minimal /etc, tripwire decoys planted in the fake home, JSON audit.
+#
+# SAFE TO RUN AS-IS (it grants no host paths):
+#   raincoat --profile examples/paranoid.toml -- true
+# It warns that no writable paths were allowed and falls back to the fake home.
+# To let the tool actually do something, add real paths to allow_read/allow_write.
+
+strict  = true
+network = "off"
+
+# Grant NOTHING by default. Add absolute paths (that exist) only as needed:
+#   allow_read  = ["/abs/path/to/input"]     # mounted read-only
+#   allow_write = ["/abs/path/to/output"]    # mounted read-write
+allow_read  = []
+allow_write = []
+
+# No credentials forwarded. Add names here only if the tool genuinely needs them.
+allow_env   = []
+
+# --- Identity: force generic, low-information values -------------------------
+# USER/LOGNAME -> "user", the sandbox hostname -> "sandbox", tz/locale neutral.
+# (Your numeric uid/gid are NOT remapped — see README "Security limitations".)
+[identity]
+username = "user"
+hostname = "sandbox"
+timezone = "UTC"
+locale   = "en_US.UTF-8"
+language = "en-US"
+
+# --- Environment: scrub aggressively ----------------------------------------
+# These patterns EXTEND Raincoat's built-in sensitive-name heuristic and are
+# strong enough to override an accidental allow_env of a matching name. Add your
+# own organisation-specific prefixes here.
+[environment]
+scrub_patterns = [
+  "*_TOKEN", "*_SECRET", "*_KEY", "*_PASSWORD",
+  "AWS_*", "GITHUB_*", "GOOGLE_*", "OPENAI_*", "ANTHROPIC_*", "AZURE_*",
+]
+# Names that must NEVER be copied from the parent, even if allow_env'd.
+deny = ["SSH_AUTH_SOCK", "KUBECONFIG", "DOCKER_HOST", "NPM_TOKEN", "PYPI_TOKEN"]
+
+# --- Filesystem: deny by default --------------------------------------------
+# deny-by-default means the working directory is never auto-mounted (same posture
+# as strict). The `deny` list is an explicit never-mount belt-and-braces guard.
+[filesystem]
+mode = "deny-by-default"
+deny = [
+  "~/.ssh", "~/.aws", "~/.config/gcloud", "~/.kube", "~/.gnupg",
+  "~/.docker", "~/.npmrc", "~/.git-credentials", "~/.gitconfig", "~/.config/gh",
+]
+
+# --- Tripwire: plant inert decoy "credentials" in the fake home -------------
+# Harmless bait files (clearly labelled "not a real credential") placed inside
+# the throwaway fake home. A tool that goes looking for ~/.ssh/id_rsa or
+# ~/.aws/credentials finds decoys instead of nothing. The paths are relative to
+# the fake home root; your REAL home is never touched.
+[filesystem.tripwire]
+enabled = true
+fake_sensitive_files = [
+  "~/.ssh/id_rsa",
+  "~/.aws/credentials",
+  "~/.config/gcloud/application_default_credentials.json",
+]
+
+# --- Fonts: curated Noto/DejaVu set, host font list masked ------------------
+[fontconfig]
+enabled = true
+
+# --- Audit: structured JSON, written outside the child's reach --------------
+[audit]
+log_file = ".raincoat/audit.log"
+format   = "json"          # "text" (human block) | "json" (one object per run)

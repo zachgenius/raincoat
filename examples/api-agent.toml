@@ -1,0 +1,105 @@
+# Raincoat profile — FLAGSHIP: run an untrusted agent that may talk to ONE API.
+#
+# The scenario: you want to run an untrusted AI agent / tool on your project, it
+# needs to reach exactly one HTTP API (a model endpoint, an internal service),
+# and it must reach NOTHING ELSE on your network or the internet — no exfil, no
+# calling home, no scanning your LAN.
+#
+# How this profile delivers that:
+#   * EGRESS BRIDGE — the child is handed only a generic loopback endpoint via one
+#     injected env var (API_BASE_URL below). Raincoat forwards it privately to the
+#     real upstream, which the child NEVER sees (not in its env, not in the audit).
+#   * STRICT NETNS JAIL — `isolate_netns = "strict"` runs the child in an isolated
+#     pasta network namespace with outbound bound to loopback (-o 127.0.0.1), and
+#     forwards ONLY the bridge port. Result: the ONLY thing the child can reach is
+#     the bridge → the one upstream. General internet and your LAN are BLOCKED.
+#     This is a REAL per-destination (bridge-only) egress firewall.
+#
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │ KEEP THIS PROFILE OUTSIDE ANY MOUNTED PATH.  It contains the real upstream   │
+# │ endpoint (and possibly an injected credential). Do NOT place it inside the   │
+# │ project you allow_read/allow_write, and do NOT --allow-* the dir holding it. │
+# │ Store it somewhere the sandbox never sees (e.g. ~/.config/raincoat/).        │
+# │ (If Raincoat detects the profile is reachable in-sandbox it masks it with an │
+# │  empty file, but keeping it outside mounted paths is the correct habit.)     │
+# └─────────────────────────────────────────────────────────────────────────────┘
+#
+# REQUIRES `pasta` (passt) for the strict jail. Check with `raincoat doctor`.
+# If pasta is ABSENT, strict fails CLOSED (the run is refused) rather than
+# silently granting general internet.
+#
+# GENERIC BY CONSTRUCTION: no real provider/host/secret values below — only
+# placeholders. Replace `env`, `child_endpoint`, and `upstream_endpoint`.
+#
+# Run it (from your project dir, with this profile stored ELSEWHERE):
+#   cd /path/to/your/project
+#   raincoat --profile ~/.config/raincoat/api-agent.toml -- your-agent ...
+# Inside the sandbox the agent sees only e.g. API_BASE_URL=http://127.0.0.1:18080.
+
+strict  = false
+network = "full"          # the bridge needs loopback reachability; CONFLICTS with --net off
+
+# Your project (launch dir), so the agent can read and edit it. Narrow to
+# allow_read only if the agent should not modify your files.
+allow_read  = ["."]
+allow_write = ["."]
+
+# Do NOT forward the upstream credential here — inject it upstream-side via
+# [egress.bridge.inject_headers] below so the child never holds the secret.
+allow_env   = []
+
+[env]
+TZ     = "UTC"
+LANG   = "en_US.UTF-8"
+LC_ALL = "en_US.UTF-8"
+
+[fontconfig]
+enabled = true
+
+[audit]
+log_file = ".raincoat/audit.log"
+
+[egress]
+mode = "bridge"                     # off | bridge  (bridge = forwarding active)
+redact_upstreams_in_audit = true    # record upstreams as "hidden" in the audit
+streaming = true                    # stream responses (important for LLM/agent APIs)
+timeout_seconds = 120
+
+# STRICT = the whole point of this profile: isolated pasta netns with outbound
+# bound to loopback, ONLY the bridge port forwarded → the child can reach the one
+# upstream and NOTHING else. REQUIRES pasta; fails CLOSED if pasta is absent.
+# Drop to "auto" only if you accept general outbound internet (NAT jail) and just
+# want the upstream URL hidden — see docs/EGRESS.md for the honest threat model.
+isolate_netns = "strict"
+
+# The single API the agent is allowed to reach. Add more [[egress.bridge]] blocks
+# for additional upstreams — each gets its own loopback port + injected env var,
+# and strict forwards all of them (and nothing else).
+[[egress.bridge]]
+name = "primary-api"
+
+# The ONLY env var injected into the child for this bridge. Pick the name your
+# agent already reads as its API base URL (e.g. OPENAI_BASE_URL, a custom var).
+env = "API_BASE_URL"
+
+# What the child connects to (loopback). Use a port that is free on your host.
+child_endpoint = "http://127.0.0.1:18080"
+
+# The real upstream — host-side ONLY, never shown to the child. May be https://
+# (Raincoat terminates TLS to the upstream via OpenSSL). REPLACE THIS.
+upstream_endpoint = "https://upstream.example.com"
+
+# false => send the upstream's Host header (usual for API forwarding).
+preserve_host = false
+preserve_path = true
+preserve_query = true
+preserve_method = true
+
+# Strip hop-by-hop / forwarding headers the child might set.
+strip_headers = ["Proxy-Authorization", "Forwarded", "X-Forwarded-For", "X-Real-IP"]
+
+# Headers Raincoat injects into the UPSTREAM request (the child never sees them).
+# Put the upstream credential HERE so the agent authenticates without ever holding
+# the secret. Do NOT commit a real secret to a shared/checked-in profile.
+[egress.bridge.inject_headers]
+# "Authorization" = "Bearer REPLACE_ME"
