@@ -79,7 +79,27 @@ TEST(Seatbelt, MacOsCapabilities) {
     EXPECT_FALSE(c.supports_minimal_etc);
     EXPECT_FALSE(c.supports_curated_fonts);
     EXPECT_FALSE(c.supports_netns_jail);
+    EXPECT_FALSE(c.supports_proc_overlays);
+    EXPECT_FALSE(c.supports_seccomp_identity);
+    EXPECT_FALSE(c.supports_path_remap);
+    EXPECT_TRUE(c.supports_dyld_interpose);  // in-process sandbox_init preserves DYLD injection
     EXPECT_EQ(c.label, "Seatbelt (sandbox-exec, best-effort)");
+}
+
+// The generated profile must re-allow reading the injected interposer dylib (last-match-wins,
+// after the denies) so dyld can load it even when it lives under a denied path.
+TEST(Seatbelt, InterposeDylibReAllowed) {
+    Fixture f;
+    f.in.interpose_dylib = "/opt/raincoat/rc_interpose.dylib";
+    std::string err;
+    std::string p = f.build(err);
+    EXPECT_TRUE(err.empty());
+    EXPECT_NE(p.find("(allow file-read* (subpath \"/opt/raincoat/rc_interpose.dylib\"))"),
+              std::string::npos);
+    // Empty interpose_dylib -> no such allow rule emitted.
+    f.in.interpose_dylib.clear();
+    std::string p2 = f.build(err);
+    EXPECT_EQ(p2.find("rc_interpose.dylib"), std::string::npos);
 }
 
 // ===========================================================================
