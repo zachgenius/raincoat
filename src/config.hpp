@@ -205,6 +205,11 @@ struct BackendConfig {
     bool unshare_net_when_off = true;   // honor NetMode::Off with --unshare-net
     bool mount_proc     = true;
     bool fake_cpuinfo   = true;         // shadow /proc/cpuinfo with a generic block (x86 hosts)
+    // Identity strings written into the fake /proc/cpuinfo (when fake_cpuinfo is on).
+    // Configurable so a profile can present a chosen CPU rather than the built-in generic.
+    // The logical-processor COUNT is always taken from the host (kept for functionality).
+    std::string cpu_vendor_id  = "GenuineIntel";
+    std::string cpu_model_name = "Generic x86_64 Processor";
     bool mount_dev      = true;
     bool mount_tmpfs_tmp = true;
     bool die_with_parent = true;

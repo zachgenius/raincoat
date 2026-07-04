@@ -245,6 +245,10 @@ std::optional<Options> load_profile(const std::string& path, std::string& err) {
                      o.ext.backend.unshare_net_when_off);
     set_backend_bool("backend.mount_proc", o.ext.backend.mount_proc);
     set_backend_bool("backend.fake_cpuinfo", o.ext.backend.fake_cpuinfo);
+    if (auto s = t.get_string("backend.cpu_vendor_id"); s.has_value())
+        o.ext.backend.cpu_vendor_id = *s;
+    if (auto s = t.get_string("backend.cpu_model_name"); s.has_value())
+        o.ext.backend.cpu_model_name = *s;
     set_backend_bool("backend.mount_dev", o.ext.backend.mount_dev);
     set_backend_bool("backend.mount_tmpfs_tmp", o.ext.backend.mount_tmpfs_tmp);
     set_backend_bool("backend.die_with_parent", o.ext.backend.die_with_parent);

@@ -508,6 +508,11 @@ mount_proc = true
 # mount_proc = true and the host is x86 (a wrong-arch fake would mislead tools, so it is
 # skipped elsewhere). Best-effort: the uname() kernel/arch string is NOT faked.
 fake_cpuinfo = true
+# The identity strings written into the fake /proc/cpuinfo. Configure these to present a
+# chosen CPU instead of the built-in generic. (The logical-processor count is always taken
+# from the host so thread-pool sizing stays correct.)
+cpu_vendor_id = "GenuineIntel"
+cpu_model_name = "Generic x86_64 Processor"
 mount_dev = true
 mount_tmpfs_tmp = true
 

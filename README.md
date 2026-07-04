@@ -276,7 +276,8 @@ Verdict: this tool did not get to see you naked.
   reads a neutral `Generic x86_64 Processor` instead of your exact CPU model, stepping,
   microcode, clock, and flags (a strong, trivially-read machine fingerprint). The
   logical-processor *count* is preserved so tools that size thread pools still work. Toggle with
-  `[backend].fake_cpuinfo`. **Honest caveat:** this is best-effort normalization — the `uname()`
+  `[backend].fake_cpuinfo`, and set the presented `[backend].cpu_vendor_id` /
+  `[backend].cpu_model_name` if you want a specific CPU instead of the generic one. **Honest caveat:** this is best-effort normalization — the `uname()`
   kernel/arch string is **not** faked (bwrap can't intercept the syscall), and other `/proc` and
   `/sys` entries remain the host's. On non-x86 hosts the real `/proc/cpuinfo` is left in place
   (a wrong-arch fake would mislead tools more than the leak it prevents).

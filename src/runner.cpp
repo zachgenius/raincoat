@@ -89,8 +89,11 @@ bool host_is_x86() {
 // strong machine fingerprint) while keeping the logical-processor COUNT and a common
 // baseline flag set, so tools that size thread pools from cpuinfo or probe for SSE2
 // still behave. Two different machines with the same core count emit byte-identical
-// output — that is the anti-fingerprint goal. Not meant to be a faithful CPU report.
-std::string generic_cpuinfo(unsigned nproc) {
+// output — that is the anti-fingerprint goal. `vendor_id` and `model_name` are profile-
+// configurable (backend.cpu_vendor_id / backend.cpu_model_name) so a profile can present
+// a chosen CPU. Not meant to be a faithful CPU report.
+std::string generic_cpuinfo(unsigned nproc, const std::string& vendor_id,
+                            const std::string& model_name) {
     if (nproc == 0) nproc = 1;
     const char* kFlags =
         "fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 "
@@ -98,10 +101,10 @@ std::string generic_cpuinfo(unsigned nproc) {
     std::ostringstream ss;
     for (unsigned i = 0; i < nproc; ++i) {
         ss << "processor\t: " << i << "\n"
-           << "vendor_id\t: GenuineIntel\n"
+           << "vendor_id\t: " << vendor_id << "\n"
            << "cpu family\t: 6\n"
            << "model\t\t: 60\n"
-           << "model name\t: Generic x86_64 Processor\n"
+           << "model name\t: " << model_name << "\n"
            << "stepping\t: 3\n"
            << "microcode\t: 0x1\n"
            << "cpu MHz\t\t: 2000.000\n"
@@ -1163,7 +1166,9 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         if (host_is_x86()) {
             const std::string path = root + "/.rc-cpuinfo";
             std::ofstream cf(path, std::ios::binary | std::ios::trunc);
-            cf << generic_cpuinfo(std::thread::hardware_concurrency());
+            cf << generic_cpuinfo(std::thread::hardware_concurrency(),
+                                  cfg.ext.backend.cpu_vendor_id,
+                                  cfg.ext.backend.cpu_model_name);
             if (cf) {
                 fake_cpuinfo_file = path;
                 cpuinfo_masked = true;
