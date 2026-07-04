@@ -246,33 +246,30 @@ std::optional<Options> load_profile(const std::string& path, std::string& err) {
     set_backend_bool("backend.unshare_net_when_off",
                      o.ext.backend.unshare_net_when_off);
     set_backend_bool("backend.mount_proc", o.ext.backend.mount_proc);
-    set_backend_bool("backend.fake_cpuinfo", o.ext.backend.fake_cpuinfo);
-    if (auto s = t.get_string("backend.cpu_vendor_id"); s.has_value())
-        o.ext.backend.cpu_vendor_id = *s;
-    if (auto s = t.get_string("backend.cpu_model_name"); s.has_value())
-        o.ext.backend.cpu_model_name = *s;
-    set_backend_bool("backend.fake_kernel", o.ext.backend.fake_kernel);
-    if (auto s = t.get_string("backend.kernel_osrelease"); s.has_value())
-        o.ext.backend.kernel_osrelease = *s;
-    if (auto s = t.get_string("backend.kernel_version"); s.has_value())
-        o.ext.backend.kernel_version = *s;
-    set_backend_bool("backend.fake_machine_id", o.ext.backend.fake_machine_id);
-    if (auto s = t.get_string("backend.machine_id"); s.has_value())
-        o.ext.backend.machine_id = *s;
-    set_backend_bool("backend.fake_uname", o.ext.backend.fake_uname);
-    set_backend_bool("backend.fake_sysinfo", o.ext.backend.fake_sysinfo);
-    set_backend_bool("backend.fake_meminfo", o.ext.backend.fake_meminfo);
-    set_backend_bool("backend.fake_uptime", o.ext.backend.fake_uptime);
-    set_backend_bool("backend.fake_boot_id", o.ext.backend.fake_boot_id);
-    if (auto s = t.get_string("backend.mem_total_kb"); s.has_value()) {
-        errno = 0;
-        char* end = nullptr;
-        const unsigned long long v = std::strtoull(s->c_str(), &end, 10);
-        if (errno == 0 && end != s->c_str() && *end == '\0')
-            o.ext.backend.mem_total_kb = static_cast<std::uint64_t>(v);
-    }
-    if (auto s = t.get_string("backend.boot_id"); s.has_value())
-        o.ext.backend.boot_id = *s;
+    // Fingerprint masks: value-driven. Each optional is SET only when the key is present in
+    // the profile; an absent key leaves it nullopt => the real system value is shown. There
+    // are no on/off booleans (see BackendConfig).
+    auto set_opt_str = [&](const char* key, std::optional<std::string>& dst) {
+        if (auto s = t.get_string(key); s.has_value()) dst = *s;
+    };
+    auto set_opt_u64 = [&](const char* key, std::optional<std::uint64_t>& dst) {
+        if (auto s = t.get_string(key); s.has_value()) {
+            errno = 0;
+            char* end = nullptr;
+            const unsigned long long v = std::strtoull(s->c_str(), &end, 10);
+            if (errno == 0 && end != s->c_str() && *end == '\0')
+                dst = static_cast<std::uint64_t>(v);
+        }
+    };
+    set_opt_str("backend.cpu_vendor_id", o.ext.backend.cpu_vendor_id);
+    set_opt_str("backend.cpu_model_name", o.ext.backend.cpu_model_name);
+    set_opt_str("backend.kernel_osrelease", o.ext.backend.kernel_osrelease);
+    set_opt_str("backend.kernel_version", o.ext.backend.kernel_version);
+    set_opt_str("backend.kernel_cmdline", o.ext.backend.kernel_cmdline);
+    set_opt_str("backend.machine_id", o.ext.backend.machine_id);
+    set_opt_str("backend.boot_id", o.ext.backend.boot_id);
+    set_opt_u64("backend.mem_total_kb", o.ext.backend.mem_total_kb);
+    set_opt_u64("backend.uptime_seconds", o.ext.backend.uptime_seconds);
     set_backend_bool("backend.mount_dev", o.ext.backend.mount_dev);
     set_backend_bool("backend.mount_tmpfs_tmp", o.ext.backend.mount_tmpfs_tmp);
     set_backend_bool("backend.die_with_parent", o.ext.backend.die_with_parent);

@@ -14,6 +14,7 @@
 #include <atomic>
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -26,7 +27,7 @@ constexpr std::size_t kUtsField = 65;
 constexpr std::size_t kUtsFields = 6;
 constexpr std::size_t kUtsBufLen = kUtsField * kUtsFields;  // 390
 
-// What the child sees from uname(2). Kept consistent with the /proc file masks.
+// The six resolved fields of `struct new_utsname` the supervisor packs onto a uname(2) caller.
 struct UtsnameSpoof {
     std::string sysname = "Linux";
     std::string nodename = "sandbox";
@@ -36,22 +37,18 @@ struct UtsnameSpoof {
     std::string domainname = "(none)";
 };
 
-// What the child sees from sysinfo(2). Kept consistent with the /proc/meminfo + /proc/uptime
-// overlays. Values are bytes / seconds / counts; the supervisor packs them into `struct
-// sysinfo` (mem_unit = 1).
-struct SysinfoSpoof {
-    std::uint64_t uptime_seconds = 3600;                     // 1h — a neutral constant
-    std::uint64_t total_ram_bytes = 16ULL * 1024 * 1024 * 1024;  // 16 GiB
-    std::uint64_t free_ram_bytes = 8ULL * 1024 * 1024 * 1024;    // 8 GiB
-    std::uint16_t procs = 128;
-};
-
-// The full set of values the supervisor hands back, plus which syscalls to trap.
+// Override intent handed to the supervisor. It baselines each call from the host's REAL
+// uname/sysinfo (read per-notification, so unset fields stay the true system value) and
+// applies only the fields set here. `uts_nodename` is always applied (the sandbox hostname);
+// the optionals are applied only when present.
 struct IdentitySpoof {
     bool trap_uname = false;
     bool trap_sysinfo = false;
-    UtsnameSpoof uts;
-    SysinfoSpoof sys;
+    std::string uts_nodename = "sandbox";
+    std::optional<std::string> uts_release;         // -> uname release  (unset => real)
+    std::optional<std::string> uts_version;         // -> uname version  (unset => real)
+    std::optional<std::uint64_t> sys_uptime_seconds;   // -> sysinfo uptime (unset => real)
+    std::optional<std::uint64_t> sys_total_ram_bytes;  // -> sysinfo totalram (unset => real)
 };
 
 // PURE + testable. Classic-BPF program: USER_NOTIF for the requested syscalls on x86_64,

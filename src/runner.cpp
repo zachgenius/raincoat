@@ -861,12 +861,12 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         const std::string etc_dir = root + "/etc";
         std::string derr;
         if (make_dirs(etc_dir, derr)) {
-            // Constant generic /etc/machine-id — masks the stable per-install identifier the
-            // host would otherwise expose. Configurable via backend.machine_id.
-            if (cfg.ext.backend.fake_machine_id) {
+            // Generic /etc/machine-id — masks the stable per-install identifier. Value-driven:
+            // set backend.machine_id to present it; unset leaves the host file exposed.
+            if (cfg.ext.backend.machine_id) {
                 const std::string mid_path = etc_dir + "/machine-id";
                 std::ofstream mf(mid_path, std::ios::binary | std::ios::trunc);
-                mf << cfg.ext.backend.machine_id << "\n";
+                mf << *cfg.ext.backend.machine_id << "\n";
                 if (mf) {
                     mounts.push_back(Mount{mid_path, "/etc/machine-id", MountMode::ReadOnly});
                     etc_machine_id = true;
@@ -1242,7 +1242,8 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // /proc to overlay, e.g. Seatbelt) so it is a no-op there and proc_overlays stays empty.
     std::vector<std::pair<std::string, std::string>> proc_overlays;
     bool cpuinfo_masked = false, cpuinfo_skipped_arch = false, kernel_masked = false;
-    bool meminfo_masked = false, uptime_masked = false, boot_id_masked = false;
+    bool cmdline_masked = false, meminfo_masked = false, uptime_masked = false;
+    bool boot_id_masked = false;
     if (caps.supports_proc_overlays && cfg.ext.backend.mount_proc) {
         auto write_overlay = [&](const std::string& name, const std::string& target,
                                  const std::string& content) -> bool {
@@ -1253,37 +1254,54 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             proc_overlays.emplace_back(path, target);
             return true;
         };
-        if (cfg.ext.backend.fake_cpuinfo) {
+        const BackendConfig& bk = cfg.ext.backend;
+        // Value-driven: each mask is active when its config value is set; an unset value on a
+        // composite (/proc/version) falls back to the host's REAL value ("unset => system").
+        if (bk.cpu_vendor_id || bk.cpu_model_name) {
             if (host_is_x86()) {
                 cpuinfo_masked = write_overlay(
                     ".rc-cpuinfo", "/proc/cpuinfo",
                     generic_cpuinfo(std::thread::hardware_concurrency(),
-                                    cfg.ext.backend.cpu_vendor_id,
-                                    cfg.ext.backend.cpu_model_name));
+                                    bk.cpu_vendor_id.value_or("GenuineIntel"),
+                                    bk.cpu_model_name.value_or("Generic x86_64 Processor")));
             } else {
                 cpuinfo_skipped_arch = true;
             }
         }
-        if (cfg.ext.backend.fake_kernel) {
-            const std::string& rel = cfg.ext.backend.kernel_osrelease;
-            const std::string& ver = cfg.ext.backend.kernel_version;
+        if (bk.kernel_osrelease || bk.kernel_version) {
+            struct utsname real;
+            const bool have_real = (::uname(&real) == 0);
+            const std::string rel =
+                bk.kernel_osrelease.value_or(have_real ? real.release : "6.1.0-generic");
+            const std::string ver = bk.kernel_version.value_or(
+                have_real ? real.version : "#1 SMP PREEMPT_DYNAMIC Generic");
             bool v = write_overlay(".rc-version", "/proc/version", generic_proc_version(rel, ver));
-            bool r = write_overlay(".rc-osrelease", "/proc/sys/kernel/osrelease", rel + "\n");
-            bool k = write_overlay(".rc-kversion", "/proc/sys/kernel/version", ver + "\n");
-            kernel_masked = v || r || k;
+            bool r = true, k = true;
+            if (bk.kernel_osrelease)
+                r = write_overlay(".rc-osrelease", "/proc/sys/kernel/osrelease",
+                                  *bk.kernel_osrelease + "\n");
+            if (bk.kernel_version)
+                k = write_overlay(".rc-kversion", "/proc/sys/kernel/version",
+                                  *bk.kernel_version + "\n");
+            kernel_masked = v && r && k;
         }
-        if (cfg.ext.backend.fake_meminfo) {
+        if (bk.kernel_cmdline) {
+            cmdline_masked =
+                write_overlay(".rc-cmdline", "/proc/cmdline", *bk.kernel_cmdline + "\n");
+        }
+        if (bk.mem_total_kb) {
             meminfo_masked = write_overlay(".rc-meminfo", "/proc/meminfo",
-                                           generic_meminfo(cfg.ext.backend.mem_total_kb));
+                                           generic_meminfo(*bk.mem_total_kb));
         }
-        if (cfg.ext.backend.fake_uptime) {
-            bool up = write_overlay(".rc-uptime", "/proc/uptime", "3600.00 3600.00\n");
+        if (bk.uptime_seconds) {
+            const std::string u = std::to_string(*bk.uptime_seconds) + ".00";
+            bool up = write_overlay(".rc-uptime", "/proc/uptime", u + " " + u + "\n");
             bool la = write_overlay(".rc-loadavg", "/proc/loadavg", "0.00 0.00 0.00 1/128 1\n");
-            uptime_masked = up || la;
+            uptime_masked = up && la;
         }
-        if (cfg.ext.backend.fake_boot_id) {
+        if (bk.boot_id) {
             boot_id_masked = write_overlay(".rc-bootid", "/proc/sys/kernel/random/boot_id",
-                                           cfg.ext.backend.boot_id + "\n");
+                                           *bk.boot_id + "\n");
         }
     }
 
@@ -1517,13 +1535,18 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             "MHz/cache/bogomips hidden; core count + baseline flags kept).");
     } else if (cpuinfo_skipped_arch) {
         rec.active_policy_notes.push_back(
-            "/proc/cpuinfo left unmasked: fake_cpuinfo only synthesizes an x86 block, and this "
-            "host is not x86 (a wrong generic block would confuse tools more than the leak).");
+            "/proc/cpuinfo left unmasked: the cpuinfo mask only synthesizes an x86 block, and "
+            "this host is not x86 (a wrong generic block would confuse tools more than the leak).");
     }
     if (kernel_masked) {
         rec.active_policy_notes.push_back(
             "Kernel identity masked: /proc/version and /proc/sys/kernel/{osrelease,version} "
             "present generic values (host kernel release + distro build host hidden).");
+    }
+    if (cmdline_masked) {
+        rec.active_policy_notes.push_back(
+            "/proc/cmdline masked (boot command line hidden — root/resume disk UUID, distro "
+            "boot image).");
     }
     if (meminfo_masked) {
         rec.active_policy_notes.push_back(
@@ -1537,10 +1560,14 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         rec.active_policy_notes.push_back(
             "/proc/sys/kernel/random/boot_id masked with a constant (per-boot correlation ID).");
     }
-    if (cfg.ext.backend.fake_uname || cfg.ext.backend.fake_sysinfo) {
+    const bool cfg_want_uname =
+        cfg.ext.backend.kernel_osrelease.has_value() || cfg.ext.backend.kernel_version.has_value();
+    const bool cfg_want_sysinfo =
+        cfg.ext.backend.mem_total_kb.has_value() || cfg.ext.backend.uptime_seconds.has_value();
+    if (cfg_want_uname || cfg_want_sysinfo) {
         std::string which;
-        if (cfg.ext.backend.fake_uname) which += "uname(2)";
-        if (cfg.ext.backend.fake_sysinfo)
+        if (cfg_want_uname) which += "uname(2)";
+        if (cfg_want_sysinfo)
             which += (which.empty() ? "" : " + ") + std::string("sysinfo(2)");
         bool active = false;
 #ifdef __linux__
@@ -1732,8 +1759,12 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // (any setup failure disables it and leaves the syscalls real). The BPF program is built
     // HERE so the child path stays allocation-free; the listener fd comes back over a socketpair.
 #ifdef __linux__
-    const bool want_uname = caps.supports_seccomp_identity && cfg.ext.backend.fake_uname;
-    const bool want_sysinfo = caps.supports_seccomp_identity && cfg.ext.backend.fake_sysinfo;
+    const bool want_uname = caps.supports_seccomp_identity &&
+        (cfg.ext.backend.kernel_osrelease.has_value() ||
+         cfg.ext.backend.kernel_version.has_value());
+    const bool want_sysinfo = caps.supports_seccomp_identity &&
+        (cfg.ext.backend.mem_total_kb.has_value() ||
+         cfg.ext.backend.uptime_seconds.has_value());
     bool id_hook = (want_uname || want_sysinfo) && seccomp_identity_supported();
     std::vector<sock_filter> id_prog;
     int sc_sock[2] = {-1, -1};
@@ -1810,12 +1841,12 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             IdentitySpoof spoof;
             spoof.trap_uname = want_uname;
             spoof.trap_sysinfo = want_sysinfo;
-            spoof.uts.nodename = identity_host;
-            spoof.uts.release = cfg.ext.backend.kernel_osrelease;
-            spoof.uts.version = cfg.ext.backend.kernel_version;
-            spoof.sys.total_ram_bytes =
-                static_cast<std::uint64_t>(cfg.ext.backend.mem_total_kb) * 1024;
-            spoof.sys.free_ram_bytes = spoof.sys.total_ram_bytes / 2;
+            spoof.uts_nodename = identity_host;
+            spoof.uts_release = cfg.ext.backend.kernel_osrelease;
+            spoof.uts_version = cfg.ext.backend.kernel_version;
+            if (cfg.ext.backend.mem_total_kb)
+                spoof.sys_total_ram_bytes = *cfg.ext.backend.mem_total_kb * 1024;
+            spoof.sys_uptime_seconds = cfg.ext.backend.uptime_seconds;
             sigset_t block, old;
             sigemptyset(&block);
             sigaddset(&block, SIGINT);
