@@ -617,3 +617,176 @@ TEST(AuditEgress, NoEgressSectionWhenEmpty) {
     const std::string out = format_audit_start(sample_record());
     EXPECT_FALSE(contains(out, "Egress bridge enabled:"));
 }
+
+// ---------------------------------------------------------------------------
+// format_audit_json — structured JSON audit (same info, never secret VALUES)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// A minimal, dependency-free JSON well-formedness check: balanced braces/brackets
+// outside of strings, and balanced double quotes (respecting backslash escapes).
+// Sufficient to catch the shapes format_audit_json could plausibly get wrong; the
+// integration test additionally validates with a real JSON parser (python).
+bool json_wellformed(const std::string& s) {
+    int braces = 0, brackets = 0;
+    bool in_str = false, esc = false;
+    for (char c : s) {
+        if (in_str) {
+            if (esc) { esc = false; continue; }
+            if (c == '\\') { esc = true; continue; }
+            if (c == '"') in_str = false;
+            continue;
+        }
+        switch (c) {
+            case '"': in_str = true; break;
+            case '{': ++braces; break;
+            case '}': if (--braces < 0) return false; break;
+            case '[': ++brackets; break;
+            case ']': if (--brackets < 0) return false; break;
+            default: break;
+        }
+    }
+    return braces == 0 && brackets == 0 && !in_str;
+}
+
+}  // namespace
+
+TEST(AuditJson, IsWellFormedAndSingleObject) {
+    const std::string out = format_audit_json(sample_record(), 0);
+    ASSERT_FALSE(out.empty());
+    EXPECT_TRUE(json_wellformed(out)) << out;
+    // A single object: starts with '{' and (ignoring a trailing newline) ends '}'.
+    std::string trimmed = out;
+    while (!trimmed.empty() && (trimmed.back() == '\n' || trimmed.back() == '\r'))
+        trimmed.pop_back();
+    ASSERT_FALSE(trimmed.empty());
+    EXPECT_EQ(trimmed.front(), '{');
+    EXPECT_EQ(trimmed.back(), '}');
+}
+
+TEST(AuditJson, ContainsExpectedKeys) {
+    const std::string out = format_audit_json(sample_record(), 7);
+    for (const char* key : {"\"command\"", "\"mode\"", "\"network\"", "\"fake_home\"",
+                            "\"workdir\"", "\"allowed_read_paths\"",
+                            "\"allowed_write_paths\"", "\"env_allowed\"", "\"env_set\"",
+                            "\"env_scrubbed\"", "\"timezone\"", "\"locale\"",
+                            "\"fontconfig\"", "\"bwrap_command\"", "\"exit_code\""}) {
+        EXPECT_TRUE(contains(out, key)) << "missing key " << key << " in:\n" << out;
+    }
+}
+
+TEST(AuditJson, ExitCodeIsRawNumber) {
+    EXPECT_TRUE(contains(format_audit_json(sample_record(), 42), "\"exit_code\":42"));
+    EXPECT_TRUE(contains(format_audit_json(sample_record(), 0), "\"exit_code\":0"));
+}
+
+TEST(AuditJson, RecordsModeNetworkAndEnvNames) {
+    const std::string out = format_audit_json(sample_record(), 0);
+    EXPECT_TRUE(contains(out, "\"mode\":\"normal\""));
+    EXPECT_TRUE(contains(out, "\"network\":\"full\""));
+    // Env NAMES appear (they are safe); values must not (checked below).
+    EXPECT_TRUE(contains(out, "OPENAI_API_KEY"));
+    EXPECT_TRUE(contains(out, "MY_SET_VAR"));
+    EXPECT_TRUE(contains(out, "AWS_SECRET_ACCESS_KEY"));
+}
+
+// SECURITY: no secret VALUE from the resolved env may appear in the JSON.
+TEST(AuditJson, NeverLeaksSecretValues) {
+    AuditRecord r = sample_record();
+    r.env.resolved["EXTRA_SECRET"] = "zzz-json-secret-marker-77";
+    r.bwrap_command =
+        "/usr/bin/bwrap --clearenv --setenv OPENAI_API_KEY <redacted> "
+        "--setenv MY_SET_VAR <redacted> --chdir /w python train.py";
+    const std::string out = format_audit_json(r, 0);
+    EXPECT_FALSE(contains(out, "sk-SECRETVALUE123")) << out;
+    EXPECT_FALSE(contains(out, "supersecretset")) << out;
+    EXPECT_FALSE(contains(out, "zzz-json-secret-marker-77")) << out;
+    EXPECT_FALSE(contains(out, "/usr/bin:/bin")) << "leaked PATH value";
+    // Still well-formed with the redacted bwrap command embedded.
+    EXPECT_TRUE(json_wellformed(out)) << out;
+}
+
+// Strings with JSON metacharacters (quotes/backslashes/newlines) are escaped so the
+// object stays well-formed.
+TEST(AuditJson, EscapesSpecialCharacters) {
+    AuditRecord r = sample_record();
+    r.command_line = "echo \"hi\"\tand\\back\nnewline";
+    r.warnings = "a \"quoted\" warning\nline2";
+    const std::string out = format_audit_json(r, 0);
+    EXPECT_TRUE(json_wellformed(out)) << out;
+    // The raw (unescaped) quote-run must not appear verbatim; escaped form does.
+    EXPECT_TRUE(contains(out, "\\\"hi\\\"")) << out;
+    EXPECT_TRUE(contains(out, "\\n")) << out;
+    EXPECT_TRUE(contains(out, "\\t")) << out;
+}
+
+// Egress upstreams stay hidden by default in the JSON too.
+TEST(AuditJson, HidesEgressUpstreamByDefault) {
+    const std::string out = format_audit_json(egress_record(), 0);
+    EXPECT_TRUE(json_wellformed(out)) << out;
+    EXPECT_TRUE(contains(out, "\"upstream_hidden\":true"));
+    EXPECT_FALSE(contains(out, "real-upstream.example.com"));
+    EXPECT_FALSE(contains(out, "api.openai.com"));
+}
+
+// -------------------------------------------------------------------------
+// RFC 8259 requires JSON text to be valid UTF-8. A command argument or env var
+// NAME on Linux is an arbitrary byte string (filenames are not required to be
+// UTF-8), so a run over e.g. a Latin-1 filename feeds non-UTF-8 bytes into the
+// record. json_escape passes every byte >= 0x20 through verbatim, so those bytes
+// land raw in the "command"/"env_*" fields and the audit is no longer valid JSON:
+// a strict parser (`python -m json.tool`, the acceptance criterion) rejects it.
+// -------------------------------------------------------------------------
+
+// Strict UTF-8 validator (RFC 3629 well-formed byte sequences). No decoding of
+// meaning — only structural validity, which is all JSON requires of its text.
+static bool is_valid_utf8(const std::string& s) {
+    std::size_t i = 0, n = s.size();
+    while (i < n) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        std::size_t extra;
+        unsigned char lo = 0x80, hi = 0xBF;
+        if (c < 0x80) { ++i; continue; }
+        else if (c >= 0xC2 && c <= 0xDF) { extra = 1; }
+        else if (c == 0xE0) { extra = 2; lo = 0xA0; }
+        else if (c >= 0xE1 && c <= 0xEC) { extra = 2; }
+        else if (c == 0xED) { extra = 2; hi = 0x9F; }
+        else if (c >= 0xEE && c <= 0xEF) { extra = 2; }
+        else if (c == 0xF0) { extra = 3; lo = 0x90; }
+        else if (c >= 0xF1 && c <= 0xF3) { extra = 3; }
+        else if (c == 0xF4) { extra = 3; hi = 0x8F; }
+        else return false;  // 0x80-0xC1, 0xF5-0xFF are never valid lead bytes
+        if (i + extra >= n) return false;
+        for (std::size_t k = 1; k <= extra; ++k) {
+            unsigned char cc = static_cast<unsigned char>(s[i + k]);
+            unsigned char lob = (k == 1) ? lo : 0x80;
+            unsigned char hib = (k == 1) ? hi : 0xBF;
+            if (cc < lob || cc > hib) return false;
+        }
+        i += extra + 1;
+    }
+    return true;
+}
+
+// DEFECT (currently RED): a non-UTF-8 byte in a command arg yields invalid JSON.
+TEST(AuditJson, IsValidUtf8EvenWithNonUtf8CommandBytes) {
+    AuditRecord r = sample_record();
+    // A filename with a lone 0xFF byte (e.g. Latin-1 "ÿ") — legal on Linux.
+    r.command_line = std::string("/bin/cat file-\xFF-name");
+    const std::string out = format_audit_json(r, 0);
+    EXPECT_TRUE(is_valid_utf8(out))
+        << "format_audit_json emitted non-UTF-8 (invalid JSON per RFC 8259); a "
+           "strict parser like `python -m json.tool` rejects it. Offending byte "
+           "reached the output verbatim through json_escape.";
+}
+
+// DEFECT (currently RED): the same hole via a non-UTF-8 env var NAME.
+TEST(AuditJson, IsValidUtf8EvenWithNonUtf8EnvName) {
+    AuditRecord r = sample_record();
+    r.env.scrubbed.push_back(std::string("BAD_\xFF_NAME"));
+    const std::string out = format_audit_json(r, 0);
+    EXPECT_TRUE(is_valid_utf8(out))
+        << "a non-UTF-8 env NAME leaks a raw byte into env_scrubbed, making the "
+           "JSON audit invalid UTF-8.";
+}

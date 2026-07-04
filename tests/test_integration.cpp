@@ -1067,6 +1067,234 @@ TEST(Integration, FontconfigFileIsCatReadableInsideSandbox) {
 }
 
 // ---------------------------------------------------------------------------
+// 19. Curated generic font set: inside the sandbox `/usr/share/fonts` exposes ONLY
+//     the curated dirs; a known host font family that is NOT curated is gone.
+// ---------------------------------------------------------------------------
+
+TEST(Integration, FontsAreCuratedGenericSetOnly) {
+    SKIP_UNLESS_SANDBOXABLE(bin);
+
+    // Determine which curated dirs exist on THIS host (robust across machines).
+    const std::vector<std::string> known = {
+        "/usr/share/fonts/truetype/dejavu",
+        "/usr/share/fonts/truetype/noto",
+        "/usr/share/fonts/opentype/noto",
+    };
+    std::set<std::string> curated_basenames;  // leaf names that must survive
+    std::set<std::string> curated_parents;    // parent dirs that get re-bound
+    for (const auto& d : known) {
+        std::error_code ec;
+        if (fs::is_directory(d, ec)) {
+            curated_basenames.insert(fs::path(d).filename().string());
+            curated_parents.insert(fs::path(d).parent_path().string());
+        }
+    }
+    if (curated_basenames.empty()) {
+        GTEST_SKIP() << "host has none of the curated font dirs; nothing to isolate";
+    }
+
+    // Find a NON-curated font directory the host actually has, so we can assert it
+    // disappears inside the sandbox. Look one level under /usr/share/fonts/*/.
+    std::string noncurated_parent, noncurated_leaf;
+    for (const auto& parent : {"/usr/share/fonts/truetype", "/usr/share/fonts/opentype"}) {
+        std::error_code ec;
+        for (fs::directory_iterator it(parent, ec), end; !ec && it != end;
+             it.increment(ec)) {
+            if (!it->is_directory()) continue;
+            std::string leaf = it->path().filename().string();
+            if (curated_basenames.count(leaf)) continue;  // a curated dir
+            noncurated_parent = parent;
+            noncurated_leaf = leaf;
+            break;
+        }
+        if (!noncurated_leaf.empty()) break;
+    }
+
+    std::string real_home = make_temp_dir("realhome");
+    std::string cwd = make_temp_dir("cwd");
+    auto env = base_env(real_home);
+
+    // (a) Under a curated parent, ONLY the curated leaf dirs are visible.
+    for (const auto& parent : curated_parents) {
+        RunResult r = run_proc(bin, {"--", "ls", parent}, env, cwd);
+        ASSERT_TRUE(r.spawn_ok);
+        EXPECT_EQ(r.exit_code, 0) << r.output;
+        // The curated leaf under this parent is present.
+        for (const auto& d : known) {
+            if (fs::path(d).parent_path().string() != parent) continue;
+            EXPECT_NE(r.output.find(fs::path(d).filename().string()), std::string::npos)
+                << "curated dir missing under " << parent << ":\n" << r.output;
+        }
+    }
+
+    // (b) A known NON-curated host font dir is absent inside the sandbox.
+    if (!noncurated_leaf.empty()) {
+        RunResult r = run_proc(bin, {"--", "ls", noncurated_parent}, env, cwd);
+        ASSERT_TRUE(r.spawn_ok);
+        EXPECT_EQ(r.exit_code, 0) << r.output;
+        EXPECT_EQ(r.output.find(noncurated_leaf), std::string::npos)
+            << "non-curated host font dir '" << noncurated_leaf
+            << "' leaked into the sandbox under " << noncurated_parent << ":\n"
+            << r.output;
+    }
+
+    // (c) When fontconfig is DISABLED, the host fonts are NOT masked (the
+    //     non-curated dir reappears) — the documented disabled behavior.
+    if (!noncurated_leaf.empty()) {
+        std::string profile_dir = make_temp_dir("nofc");
+        std::string ppath = (fs::path(profile_dir) / "p.toml").string();
+        std::ofstream(ppath) << "[fontconfig]\nenabled = false\n";
+        RunResult r =
+            run_proc(bin, {"--profile", ppath, "--", "ls", noncurated_parent}, env, cwd);
+        ASSERT_TRUE(r.spawn_ok);
+        EXPECT_EQ(r.exit_code, 0) << r.output;
+        EXPECT_NE(r.output.find(noncurated_leaf), std::string::npos)
+            << "with fontconfig disabled the host font dir should be visible:\n"
+            << r.output;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 19b. Curated fonts must still yield a USABLE generic font view: the single most
+//      common generic family, `sans-serif`, must resolve to a real sans body font
+//      (Noto Sans / DejaVu Sans), NOT to a decorative/math face.
+//
+//      DEFECT (attack round 2): the curated dejavu dir that Raincoat re-binds also
+//      contains DejaVuMathTeXGyre.ttf. fontconfig classifies that math face as a
+//      sans candidate, and because Raincoat's minimal fonts.conf lacks the strong
+//      generic-family bindings the host's /etc/fonts conf.d normally supplies, the
+//      weak `sans-serif` alias loses to it. Inside the sandbox `fc-match sans-serif`
+//      then returns "DejaVu Math TeX Gyre" instead of "DejaVu Sans" — so every tool
+//      that renders with the default sans-serif family gets a math-symbol font.
+//      On the host (full fontconfig) the same query correctly returns Noto/DejaVu
+//      Sans, so this is a regression the curated view introduces.
+// ---------------------------------------------------------------------------
+
+TEST(Integration, SansSerifResolvesToARealSansFontNotMath) {
+    SKIP_UNLESS_SANDBOXABLE(bin);
+
+    // The defect requires the curated dejavu dir (home of the math face) and the
+    // fc-match tool. Skip cleanly where either is absent.
+    std::error_code ec;
+    if (!fs::is_directory("/usr/share/fonts/truetype/dejavu", ec)) {
+        GTEST_SKIP() << "host lacks the curated dejavu dir; nothing to exercise";
+    }
+    if (::access("/usr/bin/fc-match", X_OK) != 0) {
+        GTEST_SKIP() << "fc-match not available on host";
+    }
+
+    std::string real_home = make_temp_dir("realhome");
+    std::string cwd = make_temp_dir("cwd");
+    auto env = base_env(real_home);
+
+    RunResult r = run_proc(bin, {"--", "fc-match", "sans-serif"}, env, cwd);
+    ASSERT_TRUE(r.spawn_ok);
+    EXPECT_EQ(r.exit_code, 0) << r.output;
+
+    // The generic sans-serif family must NOT collapse onto the math face.
+    EXPECT_EQ(r.output.find("Math TeX Gyre"), std::string::npos)
+        << "sans-serif resolved to a math/symbol font inside the sandbox; the "
+           "curated fonts.conf does not pin the generic family to a real sans "
+           "face:\n"
+        << r.output;
+
+    // Positively: it should be one of the curated sans body faces.
+    const bool is_real_sans =
+        r.output.find("DejaVu Sans") != std::string::npos ||
+        r.output.find("Noto Sans") != std::string::npos;
+    EXPECT_TRUE(is_real_sans)
+        << "sans-serif did not resolve to a real sans body font:\n" << r.output;
+}
+
+// ---------------------------------------------------------------------------
+// 20. Minimal /etc view: generic hostname/hosts/localtime; real host name hidden.
+// ---------------------------------------------------------------------------
+
+TEST(Integration, MinimalEtcViewIsGenericAndHidesHost) {
+    SKIP_UNLESS_SANDBOXABLE(bin);
+
+    char host_buf[256] = {0};
+    ::gethostname(host_buf, sizeof(host_buf) - 1);
+    std::string real_host(host_buf);
+
+    std::string real_home = make_temp_dir("realhome");
+    std::string cwd = make_temp_dir("cwd");
+    auto env = base_env(real_home);
+
+    RunResult r = run_proc(
+        bin,
+        {"--", "sh", "-c",
+         "echo HN=$(cat /etc/hostname); echo HOSTS_OK=$(grep -c localhost /etc/hosts); "
+         "if [ -e /etc/localtime ]; then echo LT_OK; else echo LT_MISSING; fi"},
+        env, cwd);
+    ASSERT_TRUE(r.spawn_ok);
+    EXPECT_EQ(r.exit_code, 0) << r.output;
+
+    // /etc/hostname is the generic sandbox name, never the real host.
+    EXPECT_NE(r.output.find("HN=sandbox"), std::string::npos) << r.output;
+    // /etc/hosts has a localhost mapping.
+    EXPECT_EQ(r.output.find("HOSTS_OK=0"), std::string::npos) << r.output;
+    EXPECT_NE(r.output.find("HOSTS_OK="), std::string::npos) << r.output;
+    // /etc/localtime resolves inside the sandbox.
+    EXPECT_NE(r.output.find("LT_OK"), std::string::npos) << r.output;
+    EXPECT_EQ(r.output.find("LT_MISSING"), std::string::npos) << r.output;
+
+    // The real host name must not leak through /etc.
+    if (!real_host.empty() && real_host != "sandbox") {
+        EXPECT_EQ(r.output.find(real_host), std::string::npos)
+            << "real host name leaked via /etc:\n" << r.output;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 21. JSON audit format: --audit-format json writes a single valid JSON object with
+//     the expected keys and NO secret value.
+// ---------------------------------------------------------------------------
+
+TEST(Integration, JsonAuditFormatIsValidAndSecretFree) {
+    SKIP_UNLESS_SANDBOXABLE(bin);
+
+    std::string real_home = make_temp_dir("realhome");
+    std::string cwd = make_temp_dir("cwd");
+    auto env = base_env(real_home);
+    env["OPENAI_API_KEY"] = "leakme-json-secret";
+
+    RunResult r = run_proc(
+        bin, {"--audit-format", "json", "--", "sh", "-c", "true"}, env, cwd);
+    ASSERT_TRUE(r.spawn_ok);
+    EXPECT_EQ(r.exit_code, 0) << r.output;
+
+    std::string audit_path = (fs::path(cwd) / ".raincoat" / "audit.log").string();
+    ASSERT_TRUE(fs::exists(audit_path)) << audit_path;
+    std::string audit = read_file(audit_path);
+
+    // Single JSON object: starts with '{', ends with '}' (ignoring trailing newline).
+    std::string t = audit;
+    while (!t.empty() && (t.back() == '\n' || t.back() == '\r')) t.pop_back();
+    ASSERT_FALSE(t.empty());
+    EXPECT_EQ(t.front(), '{') << audit;
+    EXPECT_EQ(t.back(), '}') << audit;
+    // No plain-text start/end blocks in JSON mode.
+    EXPECT_EQ(audit.find("=== Raincoat started ==="), std::string::npos) << audit;
+
+    // Expected keys present.
+    for (const char* key : {"\"mode\"", "\"network\"", "\"env_scrubbed\"",
+                            "\"exit_code\"", "\"fontconfig\""}) {
+        EXPECT_NE(audit.find(key), std::string::npos) << key << " missing:\n" << audit;
+    }
+    EXPECT_NE(audit.find("\"exit_code\":0"), std::string::npos) << audit;
+
+    // The secret VALUE never appears; its NAME (scrubbed) may.
+    EXPECT_EQ(audit.find("leakme-json-secret"), std::string::npos) << audit;
+
+    // `raincoat report` produces a reasonable summary over the JSON log.
+    RunResult rep = run_proc(bin, {"report", audit_path}, env, cwd);
+    ASSERT_TRUE(rep.spawn_ok);
+    EXPECT_EQ(rep.exit_code, 0) << rep.output;
+    EXPECT_NE(rep.output.find("HOME"), std::string::npos) << rep.output;
+}
+
+// ---------------------------------------------------------------------------
 // Rich sectioned-profile wiring (phase: wire ext into the live sandbox).
 // ---------------------------------------------------------------------------
 
@@ -1330,4 +1558,65 @@ TEST(IntegrationProfile, TripwirePlantsBaitInFakeHome) {
     EXPECT_NE(r.output.find("BAIT_PRESENT"), std::string::npos) << r.output;
     // The bait is inert, clearly labeled decoy content.
     EXPECT_NE(r.output.find("tripwire decoy"), std::string::npos) << r.output;
+}
+
+// ---------------------------------------------------------------------------
+// 22. REGRESSION (attack round 1): the curated-font mask must COEXIST with the
+//     /etc binds in one live run — the font tmpfs on /usr/share/fonts must not
+//     disturb the TLS store (/etc/ssl), the DNS resolver (/etc/resolv.conf, bound
+//     under the default net=full), or the generic /etc/hostname. A single run
+//     asserts all four at once, so a reordering that breaks the mask/etc interplay
+//     is caught even if the piecemeal tests (#19 fonts, #20 /etc) still pass.
+// ---------------------------------------------------------------------------
+
+TEST(Integration, FontMaskCoexistsWithEtcBindsInOneRun) {
+    SKIP_UNLESS_SANDBOXABLE(bin);
+
+    // A curated font dir this host actually has (robust: skip if none).
+    const std::vector<std::string> known = {
+        "/usr/share/fonts/truetype/dejavu",
+        "/usr/share/fonts/truetype/noto",
+        "/usr/share/fonts/opentype/noto",
+    };
+    std::string curated_leaf, curated_parent;
+    for (const auto& d : known) {
+        std::error_code ec;
+        if (fs::is_directory(d, ec)) {
+            curated_leaf = fs::path(d).filename().string();
+            curated_parent = fs::path(d).parent_path().string();
+            break;
+        }
+    }
+    if (curated_leaf.empty()) {
+        GTEST_SKIP() << "host has none of the curated font dirs; nothing to isolate";
+    }
+
+    std::string real_home = make_temp_dir("realhome");
+    std::string cwd = make_temp_dir("cwd");
+    auto env = base_env(real_home);
+
+    // Default (net=full) run: fonts curated AND /etc/ssl + /etc/resolv.conf +
+    // /etc/hostname all present/generic in the SAME sandbox.
+    std::string probe =
+        "echo FONT=$(ls " + curated_parent + " | grep -c '^" + curated_leaf + "$'); "
+        "if [ -e /etc/ssl ]; then echo SSL_OK; else echo SSL_MISSING; fi; "
+        "if [ -e /etc/resolv.conf ]; then echo RESOLV_OK; else echo RESOLV_MISSING; fi; "
+        "echo HN=$(cat /etc/hostname)";
+    RunResult r = run_proc(bin, {"--", "sh", "-c", probe}, env, cwd);
+    ASSERT_TRUE(r.spawn_ok);
+    EXPECT_EQ(r.exit_code, 0) << r.output;
+
+    // Font mask still curates (the curated leaf is visible under its parent).
+    EXPECT_NE(r.output.find("FONT=1"), std::string::npos)
+        << "curated font dir missing while /etc binds present -> mask/etc ordering "
+           "regression:\n"
+        << r.output;
+    // TLS store survived the font mask.
+    EXPECT_NE(r.output.find("SSL_OK"), std::string::npos) << r.output;
+    EXPECT_EQ(r.output.find("SSL_MISSING"), std::string::npos) << r.output;
+    // DNS resolver survived (net=full binds resolv.conf; --ro-bind-try tolerates a
+    // host without one, but SSL_OK above already proves /etc itself is intact).
+    EXPECT_EQ(r.output.find("RESOLV_MISSING\nRESOLV_MISSING"), std::string::npos) << r.output;
+    // Generic /etc/hostname, never the real host, alongside the font mask.
+    EXPECT_NE(r.output.find("HN=sandbox"), std::string::npos) << r.output;
 }

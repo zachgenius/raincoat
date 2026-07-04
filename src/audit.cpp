@@ -32,6 +32,82 @@ std::string join_names(const std::vector<std::string>& names) {
     return ss.str();
 }
 
+// Escape a string for embedding as a JSON string value (RFC 8259). Control
+// characters below 0x20 become \uXXXX; the mandatory escapes handle ", \, and the
+// common whitespace controls. This is display-only and never inspects env VALUES.
+//
+// RFC 8259 requires JSON TEXT to be valid UTF-8. Command args and env var NAMES on
+// Linux are arbitrary byte strings (filenames need not be UTF-8), so this validates
+// each byte: well-formed UTF-8 multibyte sequences (RFC 3629) pass through verbatim
+// (preserving accents/emoji), while any invalid or stray high byte is replaced with
+// U+FFFD (emitted as the ASCII escape �) so the audit is always valid JSON.
+std::string json_escape(const std::string& s) {
+    std::ostringstream o;
+    static const char* hex = "0123456789abcdef";
+    const std::size_t n = s.size();
+    std::size_t i = 0;
+    while (i < n) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c < 0x80) {  // ASCII: apply the standard JSON escapes.
+            switch (c) {
+                case '"':  o << "\\\""; break;
+                case '\\': o << "\\\\"; break;
+                case '\b': o << "\\b";  break;
+                case '\f': o << "\\f";  break;
+                case '\n': o << "\\n";  break;
+                case '\r': o << "\\r";  break;
+                case '\t': o << "\\t";  break;
+                default:
+                    if (c < 0x20)
+                        o << "\\u00" << hex[(c >> 4) & 0xF] << hex[c & 0xF];
+                    else
+                        o << static_cast<char>(c);
+            }
+            ++i;
+            continue;
+        }
+
+        // Multibyte lead byte: determine the expected length and the allowed range
+        // of the FIRST continuation byte (RFC 3629 well-formed sequences only).
+        std::size_t extra;
+        unsigned char lo = 0x80, hi = 0xBF;
+        if (c >= 0xC2 && c <= 0xDF)      { extra = 1; }
+        else if (c == 0xE0)              { extra = 2; lo = 0xA0; }
+        else if (c >= 0xE1 && c <= 0xEC) { extra = 2; }
+        else if (c == 0xED)              { extra = 2; hi = 0x9F; }
+        else if (c >= 0xEE && c <= 0xEF) { extra = 2; }
+        else if (c == 0xF0)              { extra = 3; lo = 0x90; }
+        else if (c >= 0xF1 && c <= 0xF3) { extra = 3; }
+        else if (c == 0xF4)              { extra = 3; hi = 0x8F; }
+        else { o << "\\ufffd"; ++i; continue; }  // 0x80-0xC1, 0xF5-0xFF: never a lead
+
+        bool ok = (i + extra < n);
+        for (std::size_t k = 1; ok && k <= extra; ++k) {
+            unsigned char cc = static_cast<unsigned char>(s[i + k]);
+            unsigned char lob = (k == 1) ? lo : 0x80;
+            unsigned char hib = (k == 1) ? hi : 0xBF;
+            if (cc < lob || cc > hib) ok = false;
+        }
+        if (!ok) { o << "\\ufffd"; ++i; continue; }  // truncated / invalid sequence
+
+        for (std::size_t k = 0; k <= extra; ++k) o << static_cast<char>(s[i + k]);
+        i += extra + 1;
+    }
+    return o.str();
+}
+
+// Emit a JSON array of strings from a vector (NAMES/paths only — never values).
+std::string json_array(const std::vector<std::string>& v) {
+    std::ostringstream o;
+    o << '[';
+    for (std::size_t i = 0; i < v.size(); ++i) {
+        if (i) o << ',';
+        o << '"' << json_escape(v[i]) << '"';
+    }
+    o << ']';
+    return o.str();
+}
+
 }  // namespace
 
 std::string format_audit_start(const AuditRecord& r) {
@@ -122,6 +198,77 @@ std::string format_audit_end(int exit_code) {
     std::ostringstream ss;
     ss << "=== Raincoat finished (exit code " << exit_code << ") ===\n";
     return ss.str();
+}
+
+std::string format_audit_json(const AuditRecord& r, int exit_code) {
+    // Split mounts into read-only / read-write path lists (paths only, no values),
+    // mirroring the text formatter.
+    std::vector<std::string> read_paths, write_paths;
+    for (const auto& m : r.mounts) {
+        if (m.mode == MountMode::ReadWrite) write_paths.push_back(m.host_path);
+        else read_paths.push_back(m.host_path);
+    }
+
+    std::ostringstream o;
+    o << '{';
+    auto str_field = [&](const char* key, const std::string& val, bool& first) {
+        if (!first) o << ',';
+        first = false;
+        o << '"' << key << "\":\"" << json_escape(val) << '"';
+    };
+    auto raw_field = [&](const char* key, const std::string& raw, bool& first) {
+        if (!first) o << ',';
+        first = false;
+        o << '"' << key << "\":" << raw;
+    };
+
+    bool first = true;
+    str_field("event", "run", first);
+    str_field("command", r.command_line, first);
+    if (r.profile_name.has_value() && !r.profile_name->empty())
+        str_field("profile", *r.profile_name, first);
+    str_field("mode", r.strict ? "strict" : "normal", first);
+    str_field("network", to_string(r.net), first);
+    str_field("fake_home", r.fake_home, first);
+    str_field("workdir", r.workdir, first);
+    raw_field("allowed_read_paths", json_array(read_paths), first);
+    raw_field("allowed_write_paths", json_array(write_paths), first);
+    // Environment: NAMES ONLY, never values.
+    raw_field("env_allowed", json_array(r.env.allowed), first);
+    raw_field("env_set", json_array(r.env.set), first);
+    raw_field("env_scrubbed", json_array(r.env.scrubbed), first);
+    str_field("timezone", r.timezone, first);
+    str_field("locale", r.locale, first);
+    str_field("fontconfig", to_string(r.font), first);
+    raw_field("active_policy_notes", json_array(r.active_policy_notes), first);
+    raw_field("reserved_notes", json_array(r.reserved_notes), first);
+
+    // Egress bridges: child-visible endpoint + injected env NAME; the real upstream is
+    // recorded ONLY when redaction was explicitly disabled (upstream_hidden == false).
+    {
+        if (!first) o << ',';
+        first = false;
+        o << "\"egress_bridges\":[";
+        for (std::size_t i = 0; i < r.egress_bridges.size(); ++i) {
+            const auto& b = r.egress_bridges[i];
+            if (i) o << ',';
+            o << "{\"name\":\"" << json_escape(b.name) << "\",";
+            o << "\"child_endpoint\":\"" << json_escape(b.child_endpoint) << "\",";
+            o << "\"injected_env\":\"" << json_escape(b.injected_env) << "\",";
+            o << "\"upstream_hidden\":" << (b.upstream_hidden ? "true" : "false");
+            if (!b.upstream_hidden)
+                o << ",\"upstream\":\"" << json_escape(b.upstream) << '"';
+            o << '}';
+        }
+        o << ']';
+    }
+
+    if (!r.warnings.empty()) str_field("warnings", r.warnings, first);
+    // bwrap_command arrives ALREADY redacted (see the header banner); embed verbatim.
+    str_field("bwrap_command", r.bwrap_command, first);
+    raw_field("exit_code", std::to_string(exit_code), first);
+    o << "}\n";
+    return o.str();
 }
 
 bool write_audit(const std::string& path, const std::string& content, std::string& err) {

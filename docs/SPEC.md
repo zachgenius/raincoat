@@ -34,8 +34,19 @@ raincoat --help / -h / --version / -V
 --net <full|off>
 --workdir <path>
 --audit-log <path>
+--audit-format <text|json>
 --keep-temp
 ```
+
+### CLI grammar (global options before the subcommand)
+Global options may appear **before** a bare subcommand keyword (`run|doctor|init|report`):
+the first such keyword found before the `--` separator selects the subcommand and the
+surrounding options apply to it (`raincoat --profile p init`, `raincoat --strict doctor`,
+`raincoat --audit-format json run -- cmd`). Everything after the first `--` is the verbatim
+target command, so `raincoat -- init` RUNS `init` as a command — it does NOT select the init
+subcommand. A value that follows a value-taking flag (e.g. `--profile init`) is that flag's
+value, never a subcommand keyword. `raincoat run -- <cmd>` and `raincoat init --force` are
+unchanged.
 
 ## Default (non-strict) behavior
 1. Create a temporary sandbox directory.
@@ -85,17 +96,39 @@ raincoat --help / -h / --version / -V
 
 ## Locale & timezone
 - Defaults: `TZ=UTC`, `LANG=en_US.UTF-8`, `LC_ALL=en_US.UTF-8`.
-- If practical, provide a minimal `/etc` view: `/etc/hostname`, `/etc/hosts`,
-  `/etc/resolv.conf` (only when network enabled), `/etc/localtime` (if needed).
-  Do not overcomplicate in MVP.
+- Minimal `/etc` view (implemented): generic files written into the sandbox temp tree and
+  bound read-only, so the host's real `/etc/hostname`/`/etc/hosts` are NEVER exposed:
+  - `/etc/hostname` = the generic hostname (`ext.hostname`, default `sandbox`).
+  - `/etc/hosts` = `127.0.0.1 localhost` / `::1 localhost` / `127.0.1.1 <hostname>`.
+  - `/etc/localtime` = read-only bind of `/usr/share/zoneinfo/<TZ or UTC>` when it exists.
+  - `/etc/resolv.conf` is bound only when network is enabled (existing behavior).
 
-## Fonts / fontconfig (best-effort in MVP)
-- Goal: target program cannot easily inspect host's full installed font list.
-- Create a minimal fontconfig dir inside the sandbox; provide a minimal `fonts.conf`.
-- Set `FONTCONFIG_PATH`, `FONTCONFIG_FILE`, and `XDG_DATA_DIRS` if needed.
-- If bundling fonts is too much for pass 1, create the abstraction + leave clear TODOs.
-- README: font isolation is best-effort in MVP. Longer-term generic set: Noto Sans/Serif/Sans
-  Mono/Color Emoji, DejaVu Sans.
+## Fonts / fontconfig (curated generic set — real fs-level isolation)
+- Goal: target program cannot inspect the host's full installed font list.
+- The base `--ro-bind /usr` exposes the host's full `/usr/share/fonts`. When fontconfig is
+  ENABLED, Raincoat MASKS it with `--tmpfs /usr/share/fonts` (emitted AFTER `--ro-bind /usr`)
+  and then re-binds read-only ONLY the curated generic dirs that exist on the host:
+  `/usr/share/fonts/truetype/dejavu`, `/usr/share/fonts/truetype/noto`,
+  `/usr/share/fonts/opentype/noto` (Noto Sans/Serif/Sans Mono/Color Emoji + DejaVu Sans).
+  The child therefore enumerates only the generic set.
+- A curated `fonts.conf` is written into the sandbox fontconfig dir listing ONLY those curated
+  dirs plus generic aliases (`sans-serif`→Noto Sans, `serif`→Noto Serif, `monospace`→Noto Sans
+  Mono, `emoji`→Noto Color Emoji), with DejaVu as a secondary fallback.
+- `FONTCONFIG_PATH`, `FONTCONFIG_FILE`, and a minimal `XDG_DATA_DIRS` are set.
+- When fontconfig is DISABLED, `/usr/share/fonts` is NOT masked (current behavior preserved).
+- Robust to which curated dirs exist: only existing dirs are re-bound; if none exist, the host
+  font tree is left unmasked rather than leaving the child with no fonts.
+
+## Audit format
+- `[audit].format = "text" | "json"` (default `text`); CLI `--audit-format <text|json>` overrides.
+- `text`: the human-friendly start/end blocks (start written before the fork for tamper-evidence).
+- `json`: a single valid JSON object per run written after the child exits (it carries the exit
+  code), to the same `audit_log_path`. Same information as the text audit — command, mode, network,
+  fake_home, workdir, mounts, env allowed/set/scrubbed NAMES only, timezone, locale, fontconfig,
+  egress bridges (upstream "hidden" unless redaction disabled), reserved/active-policy notes,
+  already-redacted bwrap command, exit_code — and NEVER any secret VALUE. Strings are JSON-escaped.
+- Multiple JSON runs append as JSON-Lines; `raincoat report` parses the latest JSON object (or the
+  text blocks) and prints a summary either way.
 
 ## Network modes
 - Enum reserves: `full | off | allowlist | ask`. MVP implements `full` and `off` only.

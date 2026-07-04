@@ -16,6 +16,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -505,6 +506,73 @@ TEST(FontGuard, TrailingSlashSandboxDir) {
     ASSERT_EQ(r.env.count("FONTCONFIG_FILE"), 1u);
     EXPECT_TRUE(fs::exists(r.env.at("FONTCONFIG_FILE")));
     EXPECT_TRUE(fs::is_directory(r.dir));
+}
+
+// ---------------------------------------------------------------------------
+// Curated generic font set (real fs-level isolation)
+// ---------------------------------------------------------------------------
+
+// curated_font_dirs() returns only existing dirs, all under the known curated set,
+// each an absolute, existing directory. Robust to which curated dirs the host has.
+TEST(FontGuard, CuratedDirsAreExistingAbsoluteSubsetOfKnownSet) {
+    static const std::vector<std::string> kKnown = {
+        "/usr/share/fonts/truetype/dejavu",
+        "/usr/share/fonts/truetype/noto",
+        "/usr/share/fonts/opentype/noto",
+    };
+    std::vector<std::string> dirs = curated_font_dirs();
+    for (const auto& d : dirs) {
+        EXPECT_TRUE(fs::is_directory(d)) << d << " should exist";
+        EXPECT_EQ(d.rfind("/usr/share/fonts/", 0), 0u) << d;
+        EXPECT_NE(std::find(kKnown.begin(), kKnown.end(), d), kKnown.end())
+            << d << " is not in the curated set";
+    }
+    // No duplicates.
+    std::vector<std::string> sorted = dirs;
+    std::sort(sorted.begin(), sorted.end());
+    EXPECT_EQ(std::adjacent_find(sorted.begin(), sorted.end()), sorted.end());
+}
+
+// When enabled, setup_fontconfig reports the curated dirs it detected (so the runner
+// can mask /usr/share/fonts and re-bind only these). They match curated_font_dirs().
+TEST(FontGuard, EnabledPopulatesFontDirs) {
+    TmpSandbox sb;
+    ASSERT_FALSE(sb.dir.empty());
+    std::string err;
+
+    FontSetup r = setup_fontconfig(sb.dir, true, "", err);
+    EXPECT_EQ(r.font_dirs, curated_font_dirs());
+}
+
+// Disabled must not report curated dirs (no masking when fontconfig is off).
+TEST(FontGuard, DisabledHasNoFontDirs) {
+    TmpSandbox sb;
+    ASSERT_FALSE(sb.dir.empty());
+    std::string err;
+
+    FontSetup r = setup_fontconfig(sb.dir, false, "", err);
+    EXPECT_TRUE(r.font_dirs.empty());
+}
+
+// The generated (no-source) fonts.conf lists the curated dirs and the generic
+// aliases (sans-serif/serif/monospace/emoji) so fontconfig enumerates only the
+// generic set.
+TEST(FontGuard, GeneratedFontsConfListsCuratedDirsAndAliases) {
+    TmpSandbox sb;
+    ASSERT_FALSE(sb.dir.empty());
+    std::string err;
+
+    FontSetup r = setup_fontconfig(sb.dir, true, "", err);
+    const std::string conf = read_file((fs::path(r.dir) / "fonts.conf").string());
+
+    EXPECT_NE(conf.find("sans-serif"), std::string::npos) << conf;
+    EXPECT_NE(conf.find("monospace"), std::string::npos) << conf;
+    EXPECT_NE(conf.find("emoji"), std::string::npos) << conf;
+    EXPECT_NE(conf.find("Noto Sans"), std::string::npos) << conf;
+    // Every detected curated dir must be listed as a <dir> entry.
+    for (const auto& d : r.font_dirs) {
+        EXPECT_NE(conf.find("<dir>" + d + "</dir>"), std::string::npos) << conf;
+    }
 }
 
 // Disabled must win even when a perfectly good source is supplied.

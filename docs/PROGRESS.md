@@ -61,14 +61,14 @@ Legend for "Where": module source + test file that owns the behavior.
 ### 1.7 Locale & timezone
 - [x] Defaults `TZ=UTC`, `LANG`/`LC_ALL=en_US.UTF-8` — *env_guard / runner*
 - [x] Audit reflects actual TZ/locale even when `--set-env` overrides them — *runner* (verified)
-- [-] Full `/etc` view (hostname/hosts/localtime) — *bwrap* (best-effort; resolv.conf + /etc/ssl bound on net full; rest kept minimal per SPEC)
+- [x] Minimal `/etc` view: generic `/etc/hostname`, `/etc/hosts`, `/etc/localtime`=UTC (+ resolv.conf/ssl on net full) — *bwrap/runner* (Phase 3; verified)
 
 ### 1.8 Fonts / fontconfig  (font_guard)  — best-effort MVP
 - [x] Minimal fontconfig dir + `fonts.conf` written into sandbox — *font_guard / test_font_guard*
 - [x] Sets `FONTCONFIG_PATH`, `FONTCONFIG_FILE` — *font_guard / test_font_guard*
 - [x] Status enum Enabled/BestEffort/Unavailable/Disabled — *font_guard*
 - [x] Wired into runner env + audit (shows "Fontconfig: enabled") — *runner* (verified)
-- [-] Bundle a generic Noto/DejaVu font set — *deferred (README notes best-effort)*
+- [x] Curated generic Noto/DejaVu font set with real fs-level isolation (host font families masked) — *font_guard/bwrap/runner* (Phase 3; verified: sandbox shows only dejavu+noto vs 12 host families)
 
 ### 1.9 Network  (net_guard, bwrap, runner)
 - [x] Enum reserves `full|off|allowlist|ask`; MVP implements full/off — *config.hpp / net_guard*
@@ -217,3 +217,28 @@ stay honest `[-]` (a true network jail, guarded/DNS policy, transparent/MITM mod
 - [x] Committed + pushed to master — egress module (68e702d), egress wiring (99e698e)
 
 **PHASE 2 (egress bridge MVP): COMPLETE ✅**
+
+---
+
+## Phase 3 — Privacy hardening: curated fonts, minimal /etc, JSON audit, CLI grammar
+
+### 3.1 Curated generic font set (real fs-level isolation)
+- [x] `font_guard::curated_font_dirs()` probes the known curated dirs (dejavu, noto TrueType, noto OpenType); `FontSetup.font_dirs` populated on the enabled path — *font_guard / test_font_guard*
+- [x] bwrap masks `/usr/share/fonts` with `--tmpfs` (after `--ro-bind /usr`) and re-binds ONLY the curated dirs read-only — *bwrap / runner* (verified e2e: sandbox shows only dejavu/noto; host `lato`/`ubuntu`/… gone)
+- [x] Generated `fonts.conf` lists only curated dirs + generic aliases (sans-serif→Noto Sans, serif→Noto Serif, monospace→Noto Sans Mono, emoji→Noto Color Emoji) — *font_guard*
+- [x] Disabled fontconfig ⇒ `/usr/share/fonts` NOT masked (current behavior preserved) — *runner* (verified)
+
+### 3.2 Minimal /etc view
+- [x] Generic `/etc/hostname` (= `ext.hostname`/`sandbox`), `/etc/hosts` (localhost + generic), `/etc/localtime` (RO bind of zoneinfo for resolved TZ/UTC) — *runner* (verified: host `/etc/hostname`/`hosts` never exposed; real host name hidden)
+- [x] Audit records "Minimal /etc provided: …" active-policy note — *runner / audit*
+
+### 3.3 JSON audit logs
+- [x] `[audit].format = "text"|"json"` + `--audit-format <text|json>` override (CLI wins) — *profile / cli / runner*
+- [x] `audit::format_audit_json(rec, exit_code)` — single valid JSON object per run, same info as text, NAMES only, egress upstreams hidden, JSON-escaped, redacted bwrap command; `AuditRecord.warnings` added — *audit / test_audit* (validated with a real JSON parser e2e)
+- [x] `raincoat report` detects + summarizes JSON logs (last JSON object) as well as text — *report* (verified)
+
+### 3.4 CLI grammar: global options before the subcommand
+- [x] First bare `run|doctor|init|report` keyword before `--` selects the subcommand with preceding options applied; value-flag values are never keywords — *cli / test_cli*
+- [x] Ambiguity honored: `-- init` RUNS `init` as a command (not the subcommand); `run -- cmd`, `init --force` unchanged — *cli* (verified: `-- init` actually exec'd the init binary)
+
+**PHASE 3 (privacy hardening): COMPLETE ✅ — 28 suites / 800+ tests green, -Wall -Wextra clean**

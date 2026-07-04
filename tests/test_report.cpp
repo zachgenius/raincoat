@@ -306,3 +306,76 @@ TEST(Report, PlainModeDoesNotBrandVarsAsSecrets) {
     const std::string out = summarize_audit(kStrictAudit, /*playful=*/false);
     EXPECT_FALSE(icontains(out, "secret")) << out;
 }
+
+// ---------------------------------------------------------------------------
+// JSON-format audit summaries. report.cpp carries a whole JSON-parsing path
+// (last_json_line / json_string / json_array_* ) that had NO test coverage.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// One-line JSON audit object as emitted by audit.cpp::format_audit_json. Field
+// order matches the writer; report parses by key so order is irrelevant.
+std::string json_audit_line(const std::string& mode, const std::string& network,
+                            const std::string& fake_home, int scrubbed) {
+    std::string scrubbed_arr;
+    for (int i = 0; i < scrubbed; ++i) {
+        if (i) scrubbed_arr += ',';
+        scrubbed_arr += "\"S" + std::to_string(i) + "\"";
+    }
+    return "{\"event\":\"run\",\"command\":\"agent\",\"mode\":\"" + mode +
+           "\",\"network\":\"" + network + "\",\"fake_home\":\"" + fake_home +
+           "\",\"workdir\":\"/w\",\"allowed_read_paths\":[],"
+           "\"allowed_write_paths\":[],\"env_allowed\":[],\"env_set\":[],"
+           "\"env_scrubbed\":[" + scrubbed_arr +
+           "],\"timezone\":\"UTC\",\"locale\":\"en_US.UTF-8\","
+           "\"fontconfig\":\"enabled\",\"active_policy_notes\":[],"
+           "\"reserved_notes\":[],\"egress_bridges\":[],"
+           "\"bwrap_command\":\"/usr/bin/bwrap --clearenv\",\"exit_code\":0}\n";
+}
+
+}  // namespace
+
+// Sanity: a pure JSON audit is summarized just like a text one (same facts).
+TEST(Report, JsonAuditSummarizedLikeText) {
+    const std::string out =
+        summarize_audit(json_audit_line("strict", "off", "/tmp/rc/home/user", 4));
+    EXPECT_FALSE(out.empty());
+    EXPECT_TRUE(icontains(out, "strict")) << out;
+    EXPECT_TRUE(icontains(out, "off")) << out;       // network
+    EXPECT_TRUE(contains(out, "4")) << "scrubbed count from JSON array:\n" << out;
+    EXPECT_TRUE(icontains(out, "/tmp/rc/home/user")) << out;
+}
+
+TEST(Report, JsonAuditPlainModeSummarizesFacts) {
+    const std::string out = summarize_audit(
+        json_audit_line("normal", "full", "/tmp/rc/home/user", 2), /*playful=*/false);
+    EXPECT_TRUE(icontains(out, "normal")) << out;
+    EXPECT_TRUE(icontains(out, "full")) << out;
+    EXPECT_TRUE(contains(out, "2")) << out;
+}
+
+// DEFECT (currently RED): when a single audit log accumulates runs in BOTH
+// formats — e.g. the user tries `--audit-format json` once, then goes back to the
+// default TEXT runs (all appended to the same `.raincoat/audit.log`) — `raincoat
+// report` must summarize the LATEST run. It does not: summarize_audit() short-
+// circuits on the FIRST/only line that starts with '{' (last_json_line) and never
+// looks at the newer text block, so it reports the STALE json run's posture
+// forever. Here the newest (text) run is normal/full, but the summary reflects the
+// older json run's strict/off — silently misreporting the current privacy posture.
+TEST(Report, MixedFormatLogSummarizesLatestRunNotStaleJson) {
+    // Older run (json, strict/off) written first, newer run (text, normal/full) after.
+    const std::string log =
+        json_audit_line("strict", "off", "/tmp/old/home/user", 5) + kNormalAudit;
+    const std::string out = summarize_audit(log);
+    // The latest run is NORMAL mode with network FULL (left open) — the summary
+    // must reflect it, not the stale strict/off json run.
+    EXPECT_TRUE(icontains(out, "normal mode"))
+        << "report summarized a stale earlier json run instead of the latest text "
+           "run (expected 'normal mode'):\n" << out;
+    EXPECT_TRUE(icontains(out, "left open"))
+        << "report reported the stale json run's network posture ('off') instead of "
+           "the latest text run's ('full'):\n" << out;
+    EXPECT_FALSE(icontains(out, "strict mode"))
+        << "stale json run's mode leaked into the summary:\n" << out;
+}

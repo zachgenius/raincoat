@@ -38,6 +38,10 @@ enum class MountMode { ReadOnly, ReadWrite };
 //   Unavailable -> requested but could not be set up at all
 enum class FontStatus { Disabled, Enabled, BestEffort, Unavailable };
 
+// Audit-log output format. Text is the default human-friendly block format; Json
+// emits a single structured JSON object per run (same information, never secrets).
+enum class AuditFormat { Text, Json };
+
 // ---------------------------------------------------------------------------
 // Enum <-> string helpers (inline, no link deps)
 // ---------------------------------------------------------------------------
@@ -68,6 +72,20 @@ inline const char* to_string(FontStatus s) {
         case FontStatus::Unavailable: return "unavailable";
     }
     return "disabled";
+}
+
+inline const char* to_string(AuditFormat f) {
+    switch (f) {
+        case AuditFormat::Text: return "text";
+        case AuditFormat::Json: return "json";
+    }
+    return "text";
+}
+
+inline std::optional<AuditFormat> audit_format_from_string(const std::string& s) {
+    if (s == "text") return AuditFormat::Text;
+    if (s == "json") return AuditFormat::Json;
+    return std::nullopt;
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +138,13 @@ struct FontSetup {
     std::map<std::string, std::string> env;  // FONTCONFIG_PATH, FONTCONFIG_FILE, XDG_DATA_DIRS ...
     std::string dir;   // fontconfig directory created inside the sandbox (may be empty)
     std::string note;  // short human-readable note for the audit log
+    // Curated host font directories that exist on this host and should be the ONLY
+    // font dirs exposed inside the sandbox (Noto Sans/Serif/Sans Mono/Color Emoji +
+    // DejaVu Sans). The runner masks /usr/share/fonts with a tmpfs and re-binds ONLY
+    // these read-only, so the child enumerates a generic set instead of the host's
+    // full font list. Empty when fontconfig is disabled or none of the curated dirs
+    // exist on the host (in which case the runner leaves /usr/share/fonts unmasked).
+    std::vector<std::string> font_dirs;
 };
 
 // Bubblewrap backend knobs (from the profile's [backend] section). Defaults match the
@@ -208,6 +233,7 @@ struct ExtendedConfig {
     std::vector<std::string> init_create_dirs; // [init].create_dirs
     std::optional<bool> playful_report;        // [report].playful_summary
     std::optional<std::string> report_log;     // [report].latest_log
+    AuditFormat audit_format = AuditFormat::Text;  // [audit].format ("text"|"json")
     EgressConfig egress;                       // [egress] + [[egress.bridge]] (phase 2)
     // A RESERVED restrictive network mode ("proxy"/"bridge"/"guarded") was requested but
     // is not yet enforced. Carries the requested mode name so resolve_config can fail
@@ -237,6 +263,11 @@ struct Options {
     std::optional<std::string> workdir;
     std::optional<std::string> audit_log;
     std::optional<std::string> profile_path;
+
+    // Audit-log format override (CLI --audit-format / profile [audit].format). Optional
+    // so the profile merge can let a CLI value win over the profile value; unset falls
+    // back to the default (text) in resolve_config.
+    std::optional<AuditFormat> audit_format;
 
     bool keep_temp = false;
     bool keep_temp_set = false;

@@ -15,57 +15,29 @@ CliInvocation parse_cli(const std::vector<std::string>& args) {
     CliInvocation inv;
     inv.sub = Subcommand::Run;
 
-    size_t i = 0;
-
-    // Leading subcommand keyword selection.
-    if (!args.empty()) {
-        const std::string& first = args[0];
-        if (first == "doctor") {
-            inv.sub = Subcommand::Doctor;
-            return inv;
-        }
-        if (first == "init") {
-            inv.sub = Subcommand::Init;
-            // `raincoat init [--force|-f] [--profile <path>]`: --force overwrites an
-            // existing .raincoat.toml; --profile names a profile whose [init].create_dirs
-            // are also created. Anything else is ignored (init takes no other options).
-            for (size_t j = 1; j < args.size(); ++j) {
-                if (args[j] == "--force" || args[j] == "-f") {
-                    inv.options.init_force = true;
-                } else if (args[j] == "--profile" && j + 1 < args.size()) {
-                    inv.options.profile_path = args[++j];
-                }
-            }
-            return inv;
-        }
-        if (first == "report") {
-            inv.sub = Subcommand::Report;
-            // `raincoat report [path] [--profile <path>]`: an optional positional audit
-            // path and an optional profile (its [report].latest_log / playful_summary
-            // shape the default path and output style).
-            for (size_t j = 1; j < args.size(); ++j) {
-                if (args[j] == "--profile" && j + 1 < args.size()) {
-                    inv.options.profile_path = args[++j];
-                } else if (!args[j].empty() && args[j][0] != '-') {
-                    inv.options.command.push_back(args[j]);  // positional audit path
-                }
-            }
-            return inv;
-        }
-        if (first == "run") {
-            inv.sub = Subcommand::Run;
-            i = 1;  // consume the keyword
-        }
-    }
-
     Options& opt = inv.options;
-    bool saw_dashdash = false;
 
-    for (; i < args.size(); ++i) {
+    // Grammar: global options may precede a bare subcommand keyword
+    // (run|doctor|init|report). The FIRST such keyword appearing BEFORE the `--`
+    // separator selects the subcommand; the options around it still apply. Once `--`
+    // is seen, everything after it is the verbatim target command (so `-- init` RUNS
+    // `init` as a command, it does NOT select the init subcommand). Only the first
+    // keyword counts; later keyword-looking tokens are treated as positionals/unknown.
+    bool sub_explicit = false;
+    std::vector<std::string> positionals;  // non-option tokens before `--` (report path)
+
+    auto subcommand_of = [](const std::string& a) -> std::optional<Subcommand> {
+        if (a == "run") return Subcommand::Run;
+        if (a == "doctor") return Subcommand::Doctor;
+        if (a == "init") return Subcommand::Init;
+        if (a == "report") return Subcommand::Report;
+        return std::nullopt;
+    };
+
+    for (size_t i = 0; i < args.size(); ++i) {
         const std::string& a = args[i];
 
         if (a == "--") {
-            saw_dashdash = true;
             ++i;
             for (; i < args.size(); ++i) opt.command.push_back(args[i]);
             break;
@@ -81,22 +53,92 @@ CliInvocation parse_cli(const std::vector<std::string>& args) {
             return inv;
         }
 
-        if (a == "--strict") {
+        // A bare subcommand keyword in option position selects the subcommand.
+        if (!sub_explicit) {
+            if (auto s = subcommand_of(a); s.has_value()) {
+                inv.sub = *s;
+                sub_explicit = true;
+                continue;
+            }
+        }
+
+        // Support the `--flag=value` equals form for long options. Split the token
+        // into its NAME (`--flag`) and an inline VALUE once, on the FIRST '=', so a
+        // value that itself contains '=' (e.g. --set-env=FOO=a=b) is preserved. Short
+        // flags (`-f`) and the already-handled `--` terminator never carry an inline
+        // value. Previously the equals form was silently dropped by the catch-all and
+        // the flag fell back to its default — e.g. `--audit-format=json` produced a
+        // text log — so this closes a silent fail-open on value-taking security flags.
+        std::string name = a;
+        std::optional<std::string> inline_val;
+        if (a.rfind("--", 0) == 0 && a.size() > 2) {
+            const auto eq = a.find('=');
+            if (eq != std::string::npos) {
+                name = a.substr(0, eq);
+                inline_val = a.substr(eq + 1);
+            }
+        }
+        // True when a value is available for a value-taking flag: an inline `=value`,
+        // or a following token that is not the `--` command terminator.
+        auto has_value = [&]() -> bool {
+            return inline_val.has_value() ||
+                   (i + 1 < args.size() && args[i + 1] != "--");
+        };
+        // Consume and return the flag's value (inline if present, else the next token).
+        // Only call after has_value() returned true.
+        auto take_value = [&]() -> std::string {
+            return inline_val ? *inline_val : args[++i];
+        };
+        // A boolean flag must not be given an inline value (`--strict=x` is a typo).
+        auto reject_inline = [&](const char* flag) -> bool {
+            if (inline_val) {
+                inv.error =
+                    std::string("Error: option '") + flag + "' does not take a value";
+                return true;
+            }
+            return false;
+        };
+
+        if (name == "--strict") {
+            if (reject_inline("--strict")) return inv;
             opt.strict = true;
             opt.strict_set = true;
             continue;
         }
-        if (a == "--keep-temp") {
+        if (name == "--keep-temp") {
+            if (reject_inline("--keep-temp")) return inv;
             opt.keep_temp = true;
             opt.keep_temp_set = true;
             continue;
         }
-        if (a == "--net") {
-            if (i + 1 >= args.size() || args[i + 1] == "--") {
+        // `--force` / `-f` is only meaningful for `init`, but accepting it anywhere
+        // before `--` keeps the parser uniform; other subcommands ignore init_force.
+        if (name == "--force" || a == "-f") {
+            if (name == "--force" && reject_inline("--force")) return inv;
+            opt.init_force = true;
+            continue;
+        }
+        if (name == "--audit-format") {
+            if (!has_value()) {
+                inv.error = "Error: --audit-format requires a value (text|json)";
+                return inv;
+            }
+            const std::string v = take_value();
+            if (auto f = audit_format_from_string(v); f.has_value()) {
+                opt.audit_format = *f;
+            } else {
+                inv.error = "Error: invalid --audit-format value '" + v +
+                            "' (expected text|json)";
+                return inv;
+            }
+            continue;
+        }
+        if (name == "--net") {
+            if (!has_value()) {
                 inv.error = "Error: --net requires a value (full|off)";
                 return inv;
             }
-            const std::string& v = args[++i];
+            const std::string v = take_value();
             if (v == "full") {
                 opt.net = NetMode::Full;
             } else if (v == "off") {
@@ -108,27 +150,24 @@ CliInvocation parse_cli(const std::vector<std::string>& args) {
             }
             continue;
         }
-        if (a == "--allow-read") {
-            if (i + 1 < args.size() && args[i + 1] != "--")
-                opt.allow_read.push_back(args[++i]);
+        if (name == "--allow-read") {
+            if (has_value()) opt.allow_read.push_back(take_value());
             continue;
         }
-        if (a == "--allow-write") {
-            if (i + 1 < args.size() && args[i + 1] != "--")
-                opt.allow_write.push_back(args[++i]);
+        if (name == "--allow-write") {
+            if (has_value()) opt.allow_write.push_back(take_value());
             continue;
         }
-        if (a == "--allow-env") {
-            if (i + 1 < args.size() && args[i + 1] != "--")
-                opt.allow_env.push_back(args[++i]);
+        if (name == "--allow-env") {
+            if (has_value()) opt.allow_env.push_back(take_value());
             continue;
         }
-        if (a == "--set-env") {
-            if (i + 1 >= args.size() || args[i + 1] == "--") {
+        if (name == "--set-env") {
+            if (!has_value()) {
                 inv.error = kSetEnvErr;
                 return inv;
             }
-            const std::string& kv = args[++i];
+            const std::string kv = take_value();
             auto eq = kv.find('=');
             if (eq == std::string::npos || eq == 0) {
                 inv.error = kSetEnvErr;
@@ -137,23 +176,38 @@ CliInvocation parse_cli(const std::vector<std::string>& args) {
             opt.set_env.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
             continue;
         }
-        if (a == "--profile") {
-            if (i + 1 < args.size() && args[i + 1] != "--") opt.profile_path = args[++i];
+        if (name == "--profile") {
+            if (has_value()) opt.profile_path = take_value();
             continue;
         }
-        if (a == "--workdir") {
-            if (i + 1 < args.size() && args[i + 1] != "--") opt.workdir = args[++i];
+        if (name == "--workdir") {
+            if (has_value()) opt.workdir = take_value();
             continue;
         }
-        if (a == "--audit-log") {
-            if (i + 1 < args.size() && args[i + 1] != "--") opt.audit_log = args[++i];
+        if (name == "--audit-log") {
+            if (has_value()) opt.audit_log = take_value();
             continue;
         }
 
-        // Unknown token before `--`: ignore (kept lenient for the MVP parser).
+        // A non-option token (not starting with '-') before `--` is a positional.
+        if (!a.empty() && a[0] != '-') {
+            positionals.push_back(a);
+            continue;
+        }
+
+        // Any other `-`-prefixed token before `--` is an unrecognized option. Reject
+        // it with a hard error instead of silently ignoring it: a mistyped
+        // security-relevant flag (e.g. `--stric`, `--no-fontconfig`, `--audit-fromat`)
+        // must fail loudly, never be dropped and fall back to a weaker default.
+        inv.error = "Error: unknown option '" + a + "'";
+        return inv;
     }
 
-    (void)saw_dashdash;
+    // `report` consumes a positional token as its audit-log path (command[0]); every
+    // other subcommand ignores positionals (only the post-`--` command matters).
+    if (inv.sub == Subcommand::Report) {
+        for (const auto& p : positionals) opt.command.push_back(p);
+    }
 
     if (inv.sub == Subcommand::Run && opt.command.empty()) {
         inv.error = kNoCommandErr;

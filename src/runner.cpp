@@ -150,6 +150,10 @@ Config resolve_config(const CliInvocation& inv,
     // the live sandbox (identity, env policy, backend toggles, fs deny, tripwire, audit).
     cfg.ext = options.ext;
 
+    // Audit-log format: a CLI/profile override (options.audit_format) wins; otherwise
+    // keep the default (text). Stored on ext so run() can select the writer.
+    cfg.ext.audit_format = options.audit_format.value_or(AuditFormat::Text);
+
     // Reconcile the reserved network-mode note with the RESOLVED network. The note was
     // recorded at profile-load time, BEFORE resolution knew whether an explicit --net
     // would override the fail-closed fallback (options.net wins above). Rewriting it from
@@ -489,6 +493,71 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             "fail. Grant one with --allow-write <path>.";
     }
 
+    // ---- 5b. Minimal /etc view -------------------------------------------
+    // Provide GENERIC /etc files so the child sees a neutral machine identity and a
+    // usable timezone, WITHOUT ever exposing the host's real /etc/hostname or
+    // /etc/hosts (which are trivial fingerprints). The files are written into the
+    // sandbox temp tree and bound read-only at their canonical /etc paths; they are
+    // destroyed with the sandbox root. /etc/localtime is bound from the host zoneinfo
+    // for the resolved TZ (falling back to UTC) only when that file exists.
+    bool etc_hostname = false, etc_hosts = false, etc_localtime = false;
+    {
+        const std::string etc_dir = root + "/etc";
+        std::string derr;
+        if (make_dirs(etc_dir, derr)) {
+            const std::string hostname_path = etc_dir + "/hostname";
+            const std::string hosts_path = etc_dir + "/hosts";
+            {
+                std::ofstream hf(hostname_path, std::ios::binary | std::ios::trunc);
+                hf << identity_host << "\n";
+                if (hf) {
+                    mounts.push_back(
+                        Mount{hostname_path, "/etc/hostname", MountMode::ReadOnly});
+                    etc_hostname = true;
+                }
+            }
+            {
+                std::ofstream hf(hosts_path, std::ios::binary | std::ios::trunc);
+                hf << "127.0.0.1 localhost\n::1 localhost\n127.0.1.1 " << identity_host
+                   << "\n";
+                if (hf) {
+                    mounts.push_back(
+                        Mount{hosts_path, "/etc/hosts", MountMode::ReadOnly});
+                    etc_hosts = true;
+                }
+            }
+            std::string tz = default_or_empty(env.resolved, "TZ");
+            if (tz.empty()) tz = "UTC";
+            const std::string zoneinfo = "/usr/share/zoneinfo/" + tz;
+            std::error_code zec;
+            if (std::filesystem::is_regular_file(zoneinfo, zec) && !zec) {
+                mounts.push_back(
+                    Mount{zoneinfo, "/etc/localtime", MountMode::ReadOnly});
+                etc_localtime = true;
+            }
+        }
+    }
+
+    // ---- 5c. Disabled-fontconfig main config -----------------------------
+    // When fontconfig isolation is DISABLED, font_guard writes no fonts.conf and
+    // sets no FONTCONFIG_FILE, and the base sandbox never binds the host /etc. With
+    // no main config, every fontconfig client prints "Cannot load default config
+    // file" on stderr and falls back to compiled-in defaults. Disabled is meant to
+    // mean "host fonts, NORMAL fontconfig" — so bind the host's real /etc/fonts
+    // read-only, giving fontconfig its usual config over the (unmasked) host font
+    // tree. Read-only and best-effort: absence just restores the prior behavior. In
+    // the ENABLED path this is intentionally skipped (FONTCONFIG_FILE is pinned and
+    // the curated conf must win, not the host /etc/fonts).
+    bool etc_fonts_bound = false;
+    if (!cfg.fontconfig_enabled) {
+        std::error_code fec;
+        if (std::filesystem::is_directory("/etc/fonts", fec) && !fec) {
+            mounts.push_back(Mount{"/etc/fonts", "/etc/fonts", MountMode::ReadOnly});
+            etc_fonts_bound = true;
+        }
+    }
+    (void)etc_fonts_bound;
+
     // ---- 6. Effective working directory ----------------------------------
     // Prefer cfg.workdir when it lands inside a mounted path; otherwise fall
     // back to the fake HOME (the cwd was withheld: strict, or the home guard).
@@ -713,10 +782,29 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         }
     }
 
+    // Curated font isolation: when fontconfig is enabled and at least one curated
+    // font dir exists on the host, pass them so build_bwrap_argv masks
+    // /usr/share/fonts and re-binds ONLY the curated set (see font_guard). Empty when
+    // fontconfig is disabled (font.font_dirs is only populated on the enabled path),
+    // leaving the host font tree untouched — the documented disabled behavior.
+    // Only ask build_bwrap_argv to mask /usr/local/share/fonts when that dir actually
+    // exists on the host. It sits under /usr/local (an FHS "local admin install" tree
+    // no distro package populates), so it is frequently absent even when curated fonts
+    // exist under /usr/share/fonts. bwrap cannot mkdir a tmpfs mountpoint under the
+    // read-only /usr bind, so an unconditional `--tmpfs /usr/local/share/fonts` aborts
+    // the WHOLE run on such hosts. When the dir is absent there is nothing to leak, so
+    // skipping the mask is safe. /usr/share/fonts needs no such guard: a non-empty
+    // curated list guarantees it exists (every curated dir lives beneath it).
+    bool mask_usr_local_fonts = false;
+    {
+        std::error_code lec;
+        mask_usr_local_fonts =
+            std::filesystem::is_directory("/usr/local/share/fonts", lec) && !lec;
+    }
     std::vector<std::string> argv =
         build_bwrap_argv(*bwrap_path, cfg_copy, mounts, env, fake_home, sandbox_tmp,
                          binds_resolv_conf(cfg.net), font.dir, mask_dir, sandbox_out,
-                         mask_empty_file, mask_files);
+                         mask_empty_file, mask_files, font.font_dirs, mask_usr_local_fonts);
 
     // ---- 9. Audit record -------------------------------------------------
     AuditRecord rec;
@@ -802,6 +890,18 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             "tripwire bait planted in the fake home (" +
             std::to_string(tripwire_planted) + " file(s))");
     }
+    if (etc_hostname || etc_hosts || etc_localtime) {
+        std::string files;
+        auto add = [&](const char* f) {
+            if (!files.empty()) files += ", ";
+            files += f;
+        };
+        if (etc_hostname) add("hostname");
+        if (etc_hosts) add("hosts");
+        if (etc_localtime) add("localtime");
+        rec.active_policy_notes.push_back(
+            "Minimal /etc provided (generic, host /etc never exposed): " + files);
+    }
 
     // Egress bridge transparency. Honest network-model disclosure + one summary per
     // bridge (name, child-visible endpoint, injected env var name). The real upstream is
@@ -848,10 +948,16 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     }
 
     // ---- 10. Write the audit "start" block (+ any warnings) --------------
+    // JSON format emits a SINGLE object per run (it carries the exit code, so it can
+    // only be written AFTER the child is reaped — see step 12). Text format writes the
+    // truthful "start" block BEFORE the fork (tamper-evidence: the child cannot forge
+    // facts recorded before it ran). Warnings always go to stderr regardless of format.
+    rec.warnings = warning;
+    const bool audit_json = cfg.ext.audit_format == AuditFormat::Json;
     if (!warning.empty()) std::cerr << warning << "\n";
-    std::string start_content = format_audit_start(rec);
-    if (!warning.empty()) start_content += "Warnings:\n  " + warning + "\n";
-    {
+    if (!audit_json) {
+        std::string start_content = format_audit_start(rec);
+        if (!warning.empty()) start_content += "Warnings:\n  " + warning + "\n";
         std::string aerr;
         if (!write_audit(cfg.audit_log_path, start_content, aerr)) {
             std::cerr << "raincoat: note: " << aerr << "\n";
@@ -927,10 +1033,14 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         exit_code = 1;
     }
 
-    // ---- 12. Write the audit "end" block ---------------------------------
+    // ---- 12. Write the audit "end"/JSON block ----------------------------
+    // Text: append the one-line "finished" block after the pre-fork start block.
+    // JSON: write the complete single-object record now (it needs the exit code).
     {
+        std::string content = audit_json ? format_audit_json(rec, exit_code)
+                                         : format_audit_end(exit_code);
         std::string aerr;
-        if (!write_audit(cfg.audit_log_path, format_audit_end(exit_code), aerr)) {
+        if (!write_audit(cfg.audit_log_path, content, aerr)) {
             std::cerr << "raincoat: note: " << aerr << "\n";
         }
     }

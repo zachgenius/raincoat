@@ -126,6 +126,104 @@ TEST(Cli, UnknownFirstTokenDefaultsToRun) {
 }
 
 // ---------------------------------------------------------------------------
+// Global options BEFORE the subcommand keyword (grammar extension)
+// ---------------------------------------------------------------------------
+
+// `raincoat --profile X init` selects Init and applies the preceding --profile.
+TEST(Cli, GlobalProfileBeforeInitSelectsInitWithProfile) {
+    auto inv = parse({"--profile", "/p/.raincoat.toml", "init"});
+    EXPECT_FALSE(inv.has_error()) << inv.error;
+    EXPECT_EQ(inv.sub, Subcommand::Init);
+    ASSERT_TRUE(inv.options.profile_path.has_value());
+    EXPECT_EQ(*inv.options.profile_path, "/p/.raincoat.toml");
+}
+
+// The value of a value-flag must NOT be mistaken for a subcommand keyword.
+TEST(Cli, ProfileValueEqualToKeywordIsNotASubcommand) {
+    // `--profile init` consumes "init" as the profile PATH; no subcommand keyword
+    // remains, so this defaults to Run (and errors: no command).
+    auto inv = parse({"--profile", "init", "--", "x"});
+    EXPECT_FALSE(inv.has_error()) << inv.error;
+    EXPECT_EQ(inv.sub, Subcommand::Run);
+    ASSERT_TRUE(inv.options.profile_path.has_value());
+    EXPECT_EQ(*inv.options.profile_path, "init");
+}
+
+// `raincoat --strict doctor` selects Doctor even though --strict precedes it.
+TEST(Cli, GlobalStrictBeforeDoctorSelectsDoctor) {
+    auto inv = parse({"--strict", "doctor"});
+    EXPECT_FALSE(inv.has_error()) << inv.error;
+    EXPECT_EQ(inv.sub, Subcommand::Doctor);
+    EXPECT_TRUE(inv.options.strict);
+}
+
+// AMBIGUITY RESOLUTION: `-- init` RUNS `init` as a command (everything after the
+// first -- is the verbatim command); it does NOT select the init subcommand.
+TEST(Cli, DashDashInitRunsInitAsCommandNotSubcommand) {
+    auto inv = parse({"--", "init"});
+    EXPECT_FALSE(inv.has_error()) << inv.error;
+    EXPECT_EQ(inv.sub, Subcommand::Run);
+    ASSERT_EQ(inv.options.command.size(), 1u);
+    EXPECT_EQ(inv.options.command[0], "init");
+}
+
+// A global option before `report`, plus its positional audit path, all apply.
+TEST(Cli, GlobalOptionsBeforeReportWithPositionalPath) {
+    auto inv = parse({"--profile", "p.toml", "report", "/var/log/a.log"});
+    EXPECT_FALSE(inv.has_error()) << inv.error;
+    EXPECT_EQ(inv.sub, Subcommand::Report);
+    ASSERT_TRUE(inv.options.profile_path.has_value());
+    EXPECT_EQ(*inv.options.profile_path, "p.toml");
+    ASSERT_EQ(inv.options.command.size(), 1u);
+    EXPECT_EQ(inv.options.command[0], "/var/log/a.log");
+}
+
+// `raincoat init --force` (subcommand first, option after) is unchanged.
+TEST(Cli, InitFirstThenForceStillWorks) {
+    auto inv = parse({"init", "--force"});
+    EXPECT_EQ(inv.sub, Subcommand::Init);
+    EXPECT_FALSE(inv.has_error()) << inv.error;
+    EXPECT_TRUE(inv.options.init_force);
+}
+
+// ---------------------------------------------------------------------------
+// --audit-format
+// ---------------------------------------------------------------------------
+
+TEST(Cli, AuditFormatJson) {
+    auto inv = parse({"run", "--audit-format", "json", "--", "x"});
+    EXPECT_FALSE(inv.has_error()) << inv.error;
+    ASSERT_TRUE(inv.options.audit_format.has_value());
+    EXPECT_EQ(*inv.options.audit_format, AuditFormat::Json);
+}
+
+TEST(Cli, AuditFormatTextExplicit) {
+    auto inv = parse({"run", "--audit-format", "text", "--", "x"});
+    EXPECT_FALSE(inv.has_error()) << inv.error;
+    ASSERT_TRUE(inv.options.audit_format.has_value());
+    EXPECT_EQ(*inv.options.audit_format, AuditFormat::Text);
+}
+
+TEST(Cli, AuditFormatDefaultsUnset) {
+    auto inv = parse({"run", "--", "x"});
+    EXPECT_FALSE(inv.options.audit_format.has_value());
+}
+
+TEST(Cli, AuditFormatBeforeSubcommandApplies) {
+    auto inv = parse({"--audit-format", "json", "doctor"});
+    EXPECT_EQ(inv.sub, Subcommand::Doctor);
+    ASSERT_TRUE(inv.options.audit_format.has_value());
+    EXPECT_EQ(*inv.options.audit_format, AuditFormat::Json);
+}
+
+TEST(Cli, AuditFormatInvalidValueErrors) {
+    auto inv = parse({"run", "--audit-format", "yaml", "--", "x"});
+    ASSERT_TRUE(inv.has_error());
+    EXPECT_NE(inv.error.find("text"), std::string::npos) << inv.error;
+    EXPECT_NE(inv.error.find("json"), std::string::npos) << inv.error;
+}
+
+// ---------------------------------------------------------------------------
 // Help / Version (only before `--`)
 // ---------------------------------------------------------------------------
 
@@ -482,4 +580,106 @@ TEST(Cli, FullKitchenSink) {
     EXPECT_EQ(inv.options.command[0], "python");
     EXPECT_EQ(inv.options.command[1], "agent.py");
     EXPECT_EQ(inv.options.command[2], "--flag");
+}
+
+// ---------------------------------------------------------------------------
+// `--flag=value` equals form + rejection of unknown options (round-1 fix)
+// ---------------------------------------------------------------------------
+
+// The equals form must be honored, not silently dropped: `--audit-format=json`
+// previously fell through to the default and produced a TEXT log, defeating the
+// user's explicit request for JSON.
+TEST(Cli, AuditFormatEqualsFormJson) {
+    auto inv = parse({"run", "--audit-format=json", "--", "x"});
+    EXPECT_FALSE(inv.has_error()) << inv.error;
+    ASSERT_TRUE(inv.options.audit_format.has_value());
+    EXPECT_EQ(*inv.options.audit_format, AuditFormat::Json);
+}
+
+TEST(Cli, AuditFormatEqualsFormTextExplicit) {
+    auto inv = parse({"run", "--audit-format=text", "--", "x"});
+    EXPECT_FALSE(inv.has_error()) << inv.error;
+    ASSERT_TRUE(inv.options.audit_format.has_value());
+    EXPECT_EQ(*inv.options.audit_format, AuditFormat::Text);
+}
+
+TEST(Cli, AuditFormatEqualsFormInvalidErrors) {
+    auto inv = parse({"run", "--audit-format=yaml", "--", "x"});
+    ASSERT_TRUE(inv.has_error());
+    EXPECT_NE(inv.error.find("text"), std::string::npos) << inv.error;
+    EXPECT_NE(inv.error.find("json"), std::string::npos) << inv.error;
+}
+
+TEST(Cli, NetEqualsFormOff) {
+    auto inv = parse({"run", "--net=off", "--", "x"});
+    EXPECT_FALSE(inv.has_error()) << inv.error;
+    ASSERT_TRUE(inv.options.net.has_value());
+    EXPECT_EQ(*inv.options.net, NetMode::Off);
+}
+
+TEST(Cli, NetEqualsFormBadValueErrors) {
+    auto inv = parse({"run", "--net=bogus", "--", "x"});
+    ASSERT_TRUE(inv.has_error());
+    EXPECT_NE(inv.error.find("full"), std::string::npos) << inv.error;
+    EXPECT_NE(inv.error.find("off"), std::string::npos) << inv.error;
+}
+
+TEST(Cli, ProfileEqualsForm) {
+    auto inv = parse({"run", "--profile=/p/.raincoat.toml", "--", "x"});
+    EXPECT_FALSE(inv.has_error()) << inv.error;
+    ASSERT_TRUE(inv.options.profile_path.has_value());
+    EXPECT_EQ(*inv.options.profile_path, "/p/.raincoat.toml");
+}
+
+TEST(Cli, SetEnvEqualsFormPreservesInnerEquals) {
+    // `--set-env=FOO=a=b` -> split off the flag on the first '=', then the env
+    // assignment splits on ITS first '=' => key=FOO, value="a=b".
+    auto inv = parse({"run", "--set-env=FOO=a=b", "--", "x"});
+    EXPECT_FALSE(inv.has_error()) << inv.error;
+    EXPECT_TRUE(hasSetEnv(inv.options, "FOO", "a=b"));
+}
+
+TEST(Cli, AllowReadEqualsForm) {
+    auto inv = parse({"run", "--allow-read=./src", "--", "x"});
+    EXPECT_FALSE(inv.has_error()) << inv.error;
+    ASSERT_EQ(inv.options.allow_read.size(), 1u);
+    EXPECT_EQ(inv.options.allow_read[0], "./src");
+}
+
+// Unknown `--` options before `--` are a HARD ERROR, never silently ignored — a
+// mistyped security-relevant flag must fail loudly rather than fall back to a default.
+TEST(Cli, UnknownLongOptionIsRejected) {
+    auto inv = parse({"run", "--totally-bogus-flag", "--", "x"});
+    ASSERT_TRUE(inv.has_error());
+    EXPECT_NE(inv.error.find("--totally-bogus-flag"), std::string::npos) << inv.error;
+}
+
+TEST(Cli, NoFontconfigFlagIsRejectedNotSilentlyAccepted) {
+    // fontconfig toggling is profile-only; a bogus `--no-fontconfig` CLI flag must
+    // be rejected rather than silently accepted (exit 0) as before.
+    auto inv = parse({"run", "--no-fontconfig", "--", "x"});
+    ASSERT_TRUE(inv.has_error());
+    EXPECT_NE(inv.error.find("--no-fontconfig"), std::string::npos) << inv.error;
+}
+
+TEST(Cli, MisspelledStrictIsRejected) {
+    auto inv = parse({"run", "--stric", "--", "x"});
+    ASSERT_TRUE(inv.has_error());
+    EXPECT_NE(inv.error.find("--stric"), std::string::npos) << inv.error;
+}
+
+TEST(Cli, BooleanFlagWithInlineValueIsRejected) {
+    auto inv = parse({"run", "--strict=yes", "--", "x"});
+    ASSERT_TRUE(inv.has_error());
+    EXPECT_NE(inv.error.find("--strict"), std::string::npos) << inv.error;
+}
+
+// The unknown-option rejection must NOT fire after `--`: a bogus-looking flag there
+// is the verbatim target command, not a raincoat option.
+TEST(Cli, UnknownOptionAfterDashDashIsVerbatimCommand) {
+    auto inv = parse({"run", "--", "tool", "--totally-bogus-flag"});
+    EXPECT_FALSE(inv.has_error()) << inv.error;
+    ASSERT_EQ(inv.options.command.size(), 2u);
+    EXPECT_EQ(inv.options.command[0], "tool");
+    EXPECT_EQ(inv.options.command[1], "--totally-bogus-flag");
 }

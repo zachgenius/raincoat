@@ -147,13 +147,23 @@ Leaf helpers. No raincoat-specific types.
   BestEffort if the file could be created but the source copy failed, Unavailable if the directory
   could not be created. Fill `note` for the audit log. The runner binds `<dir>` read-only into the
   sandbox (see bwrap) so `FONTCONFIG_FILE` actually resolves inside the namespace.
+- `std::vector<std::string> curated_font_dirs();` — probe the host for the curated generic font
+  dirs (`/usr/share/fonts/truetype/dejavu`, `.../truetype/noto`, `.../opentype/noto`) and return
+  those that exist. `FontSetup` gains `std::vector<std::string> font_dirs` (populated on the enabled
+  path with `curated_font_dirs()`); the runner passes them to bwrap to mask `/usr/share/fonts` and
+  re-bind ONLY the curated set. The generated (no-source) `fonts.conf` lists exactly those dirs plus
+  the generic aliases (sans-serif→Noto Sans, serif→Noto Serif, monospace→Noto Sans Mono, emoji→Noto
+  Color Emoji, DejaVu fallback) so fontconfig enumerates only the generic set. Empty `font_dirs`
+  when disabled or when no curated dir exists (runner then leaves `/usr/share/fonts` unmasked).
 
 ### bwrap  (deps: config, util) — PURE argv assembly, no side effects
 - `std::vector<std::string> build_bwrap_argv(const std::string& bwrap_path, const Config& cfg,`
   `  const std::vector<Mount>& mounts, const EnvResolution& env,`
   `  const std::string& fake_home, const std::string& sandbox_tmp, bool bind_resolv_conf,`
   `  const std::string& font_dir = "", const std::string& audit_mask_dir = "",`
-  `  const std::string& sandbox_out = "");`
+  `  const std::string& sandbox_out = "", const std::string& mask_empty_file = "",`
+  `  const std::vector<std::string>& mask_files = {},`
+  `  const std::vector<std::string>& curated_font_dirs = {});`
   Emits (argv[0] = bwrap_path). Every namespace/mount flag below is gated on the matching
   `cfg.ext.backend` toggle (`BackendConfig`); the defaults reproduce the MVP argv exactly, so an
   absent profile is unchanged:
@@ -164,8 +174,10 @@ Leaf helpers. No raincoat-specific types.
   - `--hostname <cfg.ext.hostname>` (default `sandbox`) emitted **only when `--unshare-uts`** is
     (it requires the fresh UTS namespace so the real machine name never leaks)
   - `--unshare-net` iff `cfg.net == NetMode::Off` **and** `backend.unshare_net_when_off` (default true)
-  - base system: `--ro-bind /usr /usr`, the four `--symlink`s, `--proc /proc` (iff
-    `backend.mount_proc`), `--dev /dev` (iff `backend.mount_dev`)
+  - base system: `--ro-bind /usr /usr`, the four `--symlink`s, then (iff `curated_font_dirs`
+    non-empty) `--tmpfs /usr/share/fonts` followed by `--ro-bind <d> <d>` for each curated font dir
+    — masks the host font tree and re-binds ONLY the curated generic set (Noto/DejaVu). `--proc /proc`
+    (iff `backend.mount_proc`), `--dev /dev` (iff `backend.mount_dev`)
   - `--ro-bind-try /etc/ssl /etc/ssl` and (iff bind_resolv_conf) `--ro-bind-try /etc/resolv.conf /etc/resolv.conf`
   - `--bind <fake_home> <fake_home>`, `--bind <sandbox_tmp> <sandbox_tmp>` (the temp scratch bind is
     gated on `backend.mount_tmpfs_tmp`, default true), and (iff `sandbox_out` non-empty)
@@ -205,6 +217,14 @@ Leaf helpers. No raincoat-specific types.
   `Reserved (configured, not enforced):` section (sections parsed but not yet enforced).
 - `std::string format_audit_start(const AuditRecord& r);`  // the multi-line "Raincoat started" block
 - `std::string format_audit_end(int exit_code);`
+- `std::string format_audit_json(const AuditRecord& r, int exit_code);` — the `[audit].format="json"`
+  path: renders the whole run as a SINGLE valid JSON object (one line + trailing newline) with the
+  same information as the text start+end blocks and the exit code. Emits env NAMES only (never a
+  secret VALUE), keeps egress upstreams "hidden" unless redaction was disabled, prints the
+  already-redacted `bwrap_command` verbatim, and JSON-escapes all strings. The runner writes this
+  once AFTER the child is reaped (JSON needs the exit code); text mode still writes the start block
+  before the fork. `AuditRecord` also carries `std::string warnings` (included in the JSON object).
+  `raincoat report` detects a JSON log (last line starting with `{`) and summarizes it.
 - `bool write_audit(const std::string& path, const std::string& content, std::string& err);` // append, mkdir -p parent
 - MUST NOT print secret values — only NAMES from env.allowed/set/scrubbed.
 - `AuditRecord.bwrap_command` is an **already-redacted, display-safe string** produced upstream by
@@ -241,13 +261,20 @@ Leaf helpers. No raincoat-specific types.
 
 ### cli  (deps: config)
 - `CliInvocation parse_cli(const std::vector<std::string>& args);`  // args EXCLUDE argv[0]
-  - `run|doctor|init|report` as first token selects the subcommand; otherwise default to Run.
+  - Global options may PRECEDE the subcommand: the FIRST bare `run|doctor|init|report` keyword
+    appearing before the `--` separator selects the subcommand, and the options around it apply
+    (`--profile p init`, `--strict doctor`, `--audit-format json run -- cmd`). A value consumed by a
+    value-taking flag (e.g. `--profile init`) is that flag's value, never a keyword. No keyword
+    before `--` -> default Run. Everything after the first `--` is the verbatim command, so `-- init`
+    RUNS `init` (does NOT select the init subcommand).
   - `--help`/`-h` -> Help; `--version`/`-V` -> Version (only when they appear before `--`).
-  - Everything after the first `--` is the target command (verbatim; not parsed).
+  - `--audit-format <text|json>` -> `options.audit_format` (optional; profile `[audit].format` is the
+    base, CLI wins in merge; resolve_config defaults unset to text).
   - Parses all run options into `Options`. Repeatable flags accumulate.
   - Errors (set `error` to the exact text, then return):
     - malformed set-env (no `=`): `"Error: expected --set-env KEY=VALUE"`
     - unknown `--net` value: a clear message naming valid values (full|off)
+    - unknown `--audit-format` value: a clear message naming valid values (text|json)
     - Run subcommand with an empty command: `"Error: no command provided.\n\nUsage:\n  raincoat -- <command> [args...]"`
   - `--profile <path>` records the path into `options.profile_path`. The `init` and `report`
     subcommands also accept `--profile <path>` (init -> `[init].create_dirs`; report ->
@@ -332,11 +359,17 @@ The `toml` module must support `[[array-of-tables]]` and nested `[a.b.c]` tables
   as inert bait UNDER the fake home when `ext.tripwire_enabled` (a leading `~/` maps to the fake-home
   root; writes can never escape it; the real home is never touched); plan_mounts (validate; enforce
   `ext.fs_deny`/`ext.fs_deny_by_default`; propagate the exact missing-path/denied-path error); pick
-  workdir; compute `audit_mask_dir`; build_bwrap_argv (font dir bound RO, out dir bound RW, audit dir
-  tmpfs-masked; hostname + backend toggles read from `cfg.ext`); locate bwrap — an executable
-  `ext.backend.bwrap_path` (must contain a `/` and be X_OK) overrides auto-find, else `find_bwrap`
-  (missing -> the bubblewrap error text); populate the AuditRecord's profile_name/active_policy_notes/
-  reserved_notes; write audit start; fork/exec bwrap; wait; write audit end; cleanup temp unless keep_temp.
+  workdir; write a MINIMAL /etc view (generic `/etc/hostname` + `/etc/hosts` into the sandbox temp
+  tree, bound read-only at their canonical paths, plus a read-only `/etc/localtime` bind of
+  `/usr/share/zoneinfo/<TZ or UTC>` when it exists — the host's real /etc is never exposed);
+  compute `audit_mask_dir`; build_bwrap_argv (font dir bound RO, curated font dirs re-bound after a
+  `/usr/share/fonts` tmpfs mask, out dir bound RW, audit dir tmpfs-masked; hostname + backend toggles
+  read from `cfg.ext`); locate bwrap — an executable `ext.backend.bwrap_path` (must contain a `/` and
+  be X_OK) overrides auto-find, else `find_bwrap` (missing -> the bubblewrap error text); populate the
+  AuditRecord's profile_name/active_policy_notes/reserved_notes/warnings; then, per `cfg.ext.audit_format`:
+  TEXT writes the audit start block before the fork (tamper-evidence) and the end block after; JSON
+  writes a single `format_audit_json(rec, exit_code)` object after the child is reaped. fork/exec bwrap;
+  wait; write audit; cleanup temp unless keep_temp.
   A SIGINT/SIGTERM/SIGHUP handler forwards the signal to the bwrap child so `waitpid` returns and the
   normal `cleanup_root()` still removes the temp tree (no leak on interruption). Returns the child's
   exit code (128+signal on signal death).

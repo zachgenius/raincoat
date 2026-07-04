@@ -31,7 +31,9 @@ std::vector<std::string> build_bwrap_argv(const std::string& bwrap_path, const C
                                           const std::string& audit_mask_dir,
                                           const std::string& sandbox_out,
                                           const std::string& mask_empty_file,
-                                          const std::vector<std::string>& mask_files) {
+                                          const std::vector<std::string>& mask_files,
+                                          const std::vector<std::string>& curated_font_dirs,
+                                          bool mask_usr_local_fonts) {
     std::vector<std::string> a;
     auto p1 = [&](const std::string& x) { a.push_back(x); };
     auto p2 = [&](const std::string& x, const std::string& y) {
@@ -79,6 +81,39 @@ std::vector<std::string> build_bwrap_argv(const std::string& bwrap_path, const C
     p3("--symlink", "usr/lib", "/lib");
     p3("--symlink", "usr/lib64", "/lib64");
     p3("--symlink", "usr/sbin", "/sbin");
+
+    // Curated generic font view (real fs-level isolation). The base --ro-bind /usr
+    // above exposes the host's FULL font tree at /usr/share/fonts. When curated dirs
+    // are provided (fontconfig enabled + at least one curated dir exists on the host),
+    // MASK /usr/share/fonts with a fresh tmpfs and then re-bind ONLY the curated dirs
+    // read-only. The child then enumerates a generic set (Noto/DejaVu) instead of the
+    // host's font list. Order matters: the tmpfs must come AFTER --ro-bind /usr (so it
+    // shadows it) and the re-binds AFTER the tmpfs (so they land on the fresh mount).
+    if (!curated_font_dirs.empty()) {
+        p2("--tmpfs", "/usr/share/fonts");
+        // Also mask /usr/local/share/fonts: it likewise sits under the base
+        // --ro-bind /usr, and BOTH the shipped fonts.conf (`<dir>/usr/local/share/
+        // fonts</dir>`) and the pinned XDG_DATA_DIRS ("/usr/local/share:/usr/share")
+        // steer fontconfig/toolkits at it. Left unmasked, any host font installed
+        // there (the standard admin/manual-install location) is fully enumerable in
+        // the sandbox, defeating the anti-fingerprinting guarantee even with
+        // fontconfig isolation enabled. A fresh tmpfs overlays the host tree with an
+        // empty dir; no curated dir lives under it, so nothing legitimate is lost.
+        //
+        // BUT only when the directory actually EXISTS on the host: unlike
+        // /usr/share/fonts (guaranteed present because every curated dir lives under
+        // it), /usr/local/share/fonts sits under /usr/local — a tree the FHS reserves
+        // for local admin installs and that no distro package populates. On a host
+        // where it is absent (minimal servers, CI runners, containers), bwrap cannot
+        // mkdir the tmpfs mountpoint under the read-only /usr bind and ABORTS THE
+        // ENTIRE RUN ("Can't mkdir /usr/local/share/fonts: Read-only file system") —
+        // breaking even `raincoat -- env`. The runner passes mask_usr_local_fonts only
+        // when the dir exists; when absent there is nothing there to leak, so skipping
+        // the mask is both safe and necessary. (There is no --tmpfs-try in bwrap.)
+        if (mask_usr_local_fonts) p2("--tmpfs", "/usr/local/share/fonts");
+        for (const auto& d : curated_font_dirs) p3("--ro-bind", d, d);
+    }
+
     if (backend.mount_proc) p2("--proc", "/proc");
     if (backend.mount_dev) p2("--dev", "/dev");
 

@@ -46,6 +46,10 @@ struct AuditRecord {
     std::vector<std::string> active_policy_notes;
     std::vector<std::string> reserved_notes;
 
+    // Free-form warnings surfaced for this run (also printed to stderr). Included in
+    // the JSON audit object; the text format appends them separately.
+    std::string warnings;
+
     // Egress bridges that are ACTIVE this run (phase 2). One entry per bridge; the
     // formatter emits the child-visible endpoint and the injected env var NAME, and
     // hides the real upstream unless redaction was explicitly disabled. Empty => no
@@ -55,6 +59,15 @@ struct AuditRecord {
 
 std::string format_audit_start(const AuditRecord& r);
 std::string format_audit_end(int exit_code);
+
+// PURE. Render the whole run as a SINGLE valid JSON object (one line + trailing
+// newline) carrying the same information as the text audit start+end blocks and the
+// given process exit code. Like the text formatter it emits env NAMES only (never a
+// secret VALUE), keeps every egress upstream "hidden" unless redaction was disabled,
+// and prints the already-redacted bwrap command verbatim. All strings are properly
+// JSON-escaped.
+std::string format_audit_json(const AuditRecord& r, int exit_code);
+
 bool write_audit(const std::string& path, const std::string& content, std::string& err);
 
 }  // namespace raincoat

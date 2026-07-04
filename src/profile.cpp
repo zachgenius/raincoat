@@ -155,6 +155,22 @@ std::optional<Options> load_profile(const std::string& path, std::string& err) {
         return std::nullopt;
     }
 
+    // [audit].format -> optional<AuditFormat> ("text"|"json"). A wrong value/type is
+    // rejected rather than silently ignored (which would leave the default text and
+    // surprise a user who asked for json).
+    if (auto s = t.get_string("audit.format"); s.has_value()) {
+        if (auto f = audit_format_from_string(*s); f.has_value()) {
+            o.audit_format = *f;
+        } else {
+            err = "Error: invalid audit.format value in profile: \"" + *s +
+                  "\" (expected text|json)";
+            return std::nullopt;
+        }
+    } else if (t.contains("audit.format")) {
+        err = "Error: invalid audit.format value in profile (expected text|json)";
+        return std::nullopt;
+    }
+
     // -----------------------------------------------------------------------
     // Rich sectioned schema (phase 1.5). Everything below is TOLERANT: absent
     // sections leave the MVP defaults; unknown keys/sections are ignored (never
@@ -410,6 +426,8 @@ Options merge(const Options& profile, const Options& cli) {
     // workdir / audit_log: CLI when present, else profile.
     m.workdir = cli.workdir.has_value() ? cli.workdir : profile.workdir;
     m.audit_log = cli.audit_log.has_value() ? cli.audit_log : profile.audit_log;
+    m.audit_format =
+        cli.audit_format.has_value() ? cli.audit_format : profile.audit_format;
     m.profile_path = cli.profile_path.has_value() ? cli.profile_path : profile.profile_path;
 
     // keep_temp: CLI wins when explicitly set, else profile.

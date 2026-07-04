@@ -11,16 +11,66 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// Minimal embedded fontconfig document used when no usable source is provided.
-const char* kFallbackFontsConf =
-    "<?xml version=\"1.0\"?>\n"
-    "<!DOCTYPE fontconfig SYSTEM \"fonts.dtd\">\n"
-    "<fontconfig>\n"
-    "  <!-- Raincoat minimal fallback: hide the host's full font list. -->\n"
-    "  <dir>/usr/share/fonts</dir>\n"
-    "  <cachedir>/tmp/fontconfig-cache</cachedir>\n"
-    "  <config></config>\n"
-    "</fontconfig>\n";
+// The curated generic font directories, in probe order. Only those that exist on
+// the host are exposed inside the sandbox (see curated_font_dirs()).
+const char* kCuratedFontDirs[] = {
+    "/usr/share/fonts/truetype/dejavu",  // DejaVu Sans/Serif/Sans Mono
+    "/usr/share/fonts/truetype/noto",    // Noto Sans/Serif/... (TrueType)
+    "/usr/share/fonts/opentype/noto",    // Noto (OpenType, incl. Color Emoji)
+};
+
+// Build a curated fonts.conf that lists ONLY the given generic font dirs plus the
+// four generic-family aliases (sans-serif/serif/monospace/emoji). Combined with the
+// runner's tmpfs mask of /usr/share/fonts + read-only re-bind of exactly these dirs,
+// fontconfig enumerates a generic set instead of the host's full font list. Falls
+// back to a bare /usr/share/fonts <dir> when no curated dir exists so the document
+// is still a valid, non-empty fontconfig.
+std::string build_curated_fonts_conf(const std::vector<std::string>& dirs) {
+    std::ostringstream ss;
+    ss << "<?xml version=\"1.0\"?>\n"
+          "<!DOCTYPE fontconfig SYSTEM \"urn:fontconfig:fonts.dtd\">\n"
+          "<fontconfig>\n"
+          "  <!-- Raincoat curated generic font set: hide the host's full font list. -->\n";
+    if (dirs.empty()) {
+        ss << "  <dir>/usr/share/fonts</dir>\n";
+    } else {
+        for (const auto& d : dirs) ss << "  <dir>" << d << "</dir>\n";
+    }
+    ss << "  <cachedir>/tmp/fontconfig-cache</cachedir>\n"
+          // The curated dejavu dir also ships DejaVuMathTeXGyre.ttf, a math/symbol
+          // face fontconfig treats as a sans candidate. Reject it outright so it can
+          // never satisfy a generic-family query (sans-serif would otherwise collapse
+          // onto it, since a weak alias loses to it without the host conf.d bindings).
+          "  <selectfont><rejectfont><pattern>"
+          "<patelt name=\"family\"><string>DejaVu Math TeX Gyre</string></patelt>"
+          "</pattern></rejectfont></selectfont>\n"
+          // Pin the generic families to real body faces with a STRONG binding so they
+          // win regardless of what else is present in the curated dirs.
+          "  <match target=\"pattern\"><test name=\"family\"><string>sans-serif</string></test>"
+          "<edit name=\"family\" mode=\"prepend\" binding=\"strong\">"
+          "<string>Noto Sans</string><string>DejaVu Sans</string></edit></match>\n"
+          "  <match target=\"pattern\"><test name=\"family\"><string>serif</string></test>"
+          "<edit name=\"family\" mode=\"prepend\" binding=\"strong\">"
+          "<string>Noto Serif</string><string>DejaVu Serif</string></edit></match>\n"
+          "  <match target=\"pattern\"><test name=\"family\"><string>monospace</string></test>"
+          "<edit name=\"family\" mode=\"prepend\" binding=\"strong\">"
+          "<string>Noto Sans Mono</string><string>DejaVu Sans Mono</string></edit></match>\n"
+          // Emoji needs the same STRONG pin: with only the weak alias below, a bare
+          // `fc-match emoji` loses to DejaVu Sans even though Noto Color Emoji exists.
+          "  <match target=\"pattern\"><test name=\"family\"><string>emoji</string></test>"
+          "<edit name=\"family\" mode=\"prepend\" binding=\"strong\">"
+          "<string>Noto Color Emoji</string></edit></match>\n"
+          "  <alias><family>sans-serif</family><prefer>"
+          "<family>Noto Sans</family><family>DejaVu Sans</family></prefer></alias>\n"
+          "  <alias><family>serif</family><prefer>"
+          "<family>Noto Serif</family><family>DejaVu Serif</family></prefer></alias>\n"
+          "  <alias><family>monospace</family><prefer>"
+          "<family>Noto Sans Mono</family><family>DejaVu Sans Mono</family></prefer></alias>\n"
+          "  <alias><family>emoji</family><prefer>"
+          "<family>Noto Color Emoji</family></prefer></alias>\n"
+          "</fontconfig>\n";
+    return ss.str();
+}
 
 // Try to read the entire source file. Returns true and fills `out` only if the
 // file exists, is a regular file, and could actually be opened for reading.
@@ -46,6 +96,15 @@ bool write_all(const std::string& path, const std::string& content) {
 }
 
 }  // namespace
+
+std::vector<std::string> curated_font_dirs() {
+    std::vector<std::string> out;
+    std::error_code ec;
+    for (const char* d : kCuratedFontDirs) {
+        if (fs::is_directory(d, ec) && !ec) out.emplace_back(d);
+    }
+    return out;
+}
 
 FontSetup setup_fontconfig(const std::string& sandbox_dir, bool enabled,
                            const std::string& fonts_conf_source, std::string& err) {
@@ -86,6 +145,10 @@ FontSetup setup_fontconfig(const std::string& sandbox_dir, bool enabled,
 
     result.dir = dir;
 
+    // Detect the curated generic font directories that exist on this host. The runner
+    // uses these to mask /usr/share/fonts and re-bind ONLY the curated set read-only.
+    result.font_dirs = curated_font_dirs();
+
     // Decide the fonts.conf contents: prefer copying the provided source verbatim.
     std::string source_contents;
     const bool source_requested = !fonts_conf_source.empty();
@@ -101,10 +164,11 @@ FontSetup setup_fontconfig(const std::string& sandbox_dir, bool enabled,
     }
 
     if (!wrote) {
-        // Fallback: write the minimal embedded document. A source that was requested
-        // but could not be copied (missing / unreadable / write failed) is reported as
-        // a copy failure; the absence of any source is reported as "no usable source".
-        if (write_all(conf, kFallbackFontsConf)) {
+        // Fallback: write the curated generic fonts.conf (lists only the curated dirs
+        // that exist + generic aliases). A source that was requested but could not be
+        // copied (missing / unreadable / write failed) is reported as a copy failure;
+        // the absence of any source is reported as "no usable source".
+        if (write_all(conf, build_curated_fonts_conf(result.font_dirs))) {
             result.status = FontStatus::BestEffort;
             result.note = source_requested
                               ? "source copy failed; wrote minimal fallback fonts.conf"

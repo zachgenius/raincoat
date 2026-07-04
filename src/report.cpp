@@ -86,6 +86,115 @@ bool looks_sensitive_path(const std::string& path) {
     return false;
 }
 
+// -------------------------------------------------------------------------
+// Minimal JSON helpers (for a JSON-format audit line). These are intentionally
+// tiny: the audit JSON is emitted by audit.cpp::format_audit_json with a known,
+// flat shape (string scalars + arrays-of-strings), so a full parser is overkill.
+// -------------------------------------------------------------------------
+
+// Read the string value for "<key>":"..." (first match). Handles the standard JSON
+// backslash escapes the writer emits.
+bool json_string(const std::string& j, const std::string& key, std::string& out) {
+    const std::string pat = "\"" + key + "\":\"";
+    std::size_t p = j.find(pat);
+    if (p == std::string::npos) return false;
+    p += pat.size();
+    std::string v;
+    for (; p < j.size(); ++p) {
+        char c = j[p];
+        if (c == '\\' && p + 1 < j.size()) {
+            char n = j[++p];
+            switch (n) {
+                case 'n': v += '\n'; break;
+                case 't': v += '\t'; break;
+                case 'r': v += '\r'; break;
+                case 'b': v += '\b'; break;
+                case 'f': v += '\f'; break;
+                default:  v += n;    break;  // ", \, /, and \uXXXX tail approx.
+            }
+            continue;
+        }
+        if (c == '"') break;
+        v += c;
+    }
+    out = v;
+    return true;
+}
+
+// Extract the inner text of an array value "<key>":[ ... ]. The audit arrays hold
+// only strings, so there are no nested brackets to balance.
+bool json_array_inner(const std::string& j, const std::string& key, std::string& inner) {
+    const std::string pat = "\"" + key + "\":[";
+    std::size_t p = j.find(pat);
+    if (p == std::string::npos) return false;
+    p += pat.size();
+    std::size_t e = j.find(']', p);
+    if (e == std::string::npos) return false;
+    inner = j.substr(p, e - p);
+    return true;
+}
+
+// Number of quoted string elements in a JSON array inner text.
+int json_array_count(const std::string& inner) {
+    int quotes = 0;
+    for (std::size_t i = 0; i < inner.size(); ++i) {
+        if (inner[i] == '\\') { ++i; continue; }
+        if (inner[i] == '"') ++quotes;
+    }
+    return quotes / 2;
+}
+
+// True if a (trimmed) line opens a text-format run block. The real audit writes
+// "=== Raincoat started ===" and the test fixtures use "Raincoat started"; both
+// carry the phrase, so a substring probe covers either shape.
+bool is_text_start_marker(const std::string& trimmed_line) {
+    return trimmed_line.find("Raincoat started") != std::string::npos;
+}
+
+// Locate the LATEST run in an audit log that may interleave both formats. A single
+// `.raincoat/audit.log` accumulates across invocations, and --audit-format is a
+// per-invocation flag, so a log can hold an older JSON run followed by a newer text
+// run (or vice-versa). We must summarize whichever run appears LAST — never
+// unconditionally prefer JSON, which would silently misreport the current posture.
+//
+// Returns via out-params the 0-based line index at which the latest run begins
+// (`start_line`, -1 if none found), whether that run is JSON (`is_json`), and, when
+// JSON, the trimmed content of that single-line object (`json_content`).
+void locate_latest_run(const std::string& audit_text, long& start_line, bool& is_json,
+                       std::string& json_content) {
+    start_line = -1;
+    is_json = false;
+    json_content.clear();
+
+    long last_json_line = -1, last_text_line = -1;
+    std::string last_json_content;
+
+    std::istringstream in(audit_text);
+    std::string line;
+    long idx = -1;
+    while (std::getline(in, line)) {
+        ++idx;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const std::string t = trim(line);
+        if (!t.empty() && t.front() == '{') {
+            last_json_line = idx;
+            last_json_content = t;
+        }
+        if (is_text_start_marker(t)) last_text_line = idx;
+    }
+
+    if (last_json_line < 0 && last_text_line < 0) return;  // no recognizable run
+
+    if (last_json_line > last_text_line) {
+        start_line = last_json_line;
+        is_json = true;
+        json_content = last_json_content;
+    } else {
+        start_line = last_text_line;  // may be -1 → parse from the top (no marker)
+        is_json = false;
+    }
+}
+
 }  // namespace
 
 std::string summarize_audit(const std::string& audit_text, bool playful) {
@@ -108,10 +217,54 @@ std::string summarize_audit(const std::string& audit_text, bool playful) {
         }
     };
 
+    // Find the LATEST run in the log, regardless of format (the log can interleave
+    // JSON and text runs across invocations; we summarize whichever appears last, not
+    // whichever happens to be JSON).
+    long run_start_line = -1;
+    bool run_is_json = false;
+    std::string json;  // trimmed JSON object of the latest run, when it is JSON
+    locate_latest_run(audit_text, run_start_line, run_is_json, json);
+
+    // JSON-format latest run: parse its single-line object. Extract the same facts the
+    // text path derives so the rendering below is shared.
+    if (run_is_json && !json.empty()) {
+        json_string(json, "mode", mode);
+        json_string(json, "network", network);
+        json_string(json, "fake_home", fake_home);
+        std::string scrubbed_inner;
+        if (json_array_inner(json, "env_scrubbed", scrubbed_inner)) {
+            have_scrubbed = true;
+            scrubbed_count = json_array_count(scrubbed_inner);
+        }
+        // Scan the allowed read/write path arrays for deliberately-mounted sensitive
+        // paths (each element is a quoted string).
+        auto scan_json_paths = [&](const std::string& key) {
+            std::string inner;
+            if (!json_array_inner(json, key, inner)) return;
+            std::stringstream ss(inner);
+            std::string tok;
+            while (std::getline(ss, tok, ',')) {
+                // strip surrounding quotes/space
+                std::string p = trim(tok);
+                if (p.size() >= 2 && p.front() == '"' && p.back() == '"')
+                    p = p.substr(1, p.size() - 2);
+                if (!p.empty() && looks_sensitive_path(p)) sensitive_mount = true;
+            }
+        };
+        scan_json_paths("allowed_read_paths");
+        scan_json_paths("allowed_write_paths");
+    }
+
     std::stringstream in(audit_text);
     std::string line;
     bool collecting_paths = false;  // inside an "Allowed ... paths:" block
-    while (std::getline(in, line)) {
+    long line_idx = -1;
+    // Parse ONLY the latest text run: skip everything before its start marker so an
+    // older run's facts (mode/network/scrubbed) cannot leak into the summary.
+    const long text_start = run_start_line;  // -1 when no marker → parse from the top
+    while (!run_is_json && std::getline(in, line)) {
+        ++line_idx;
+        if (line_idx < text_start) continue;
         // Strip a trailing carriage return in case of CRLF input.
         if (!line.empty() && line.back() == '\r') line.pop_back();
 
