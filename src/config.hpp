@@ -255,6 +255,22 @@ struct EgressConfig {
     std::vector<EgressBridge> bridges;
 };
 
+// The [network_policy] section: a host-based egress allow/block policy enforced by Raincoat's
+// own filtering forward proxy (phase 4). When `enabled`, the runner starts a local HTTP(S)
+// proxy that checks each request's target host against these rules and injects http_proxy/
+// https_proxy/all_proxy into the child pointing at it. Composes with the strict netns jail: the
+// jail blocks all direct egress and forwards only the proxy port, so the proxy becomes the
+// child's ONLY way out and the allow/block list becomes a real domain-level firewall. WITHOUT
+// the jail it only constrains proxy-aware clients (honest limitation).
+struct NetworkPolicy {
+    bool enabled = false;
+    std::string default_action = "allow";   // "allow" | "deny" (deny => allow-list mode)
+    std::vector<std::string> allow_hosts;    // hostnames (and suffix matches) permitted
+    std::vector<std::string> block_hosts;    // hostnames always blocked (wins over allow)
+    bool block_private_metadata_endpoints = true;  // block cloud metadata IPs by default
+    std::vector<std::string> metadata_endpoints;   // extra metadata hosts/IPs to block
+};
+
 // True when a bridge's real upstream MUST be recorded as "hidden" in the audit rather than
 // disclosed. Redaction is forced ON when ANY of:
 //   * the global egress.redact_upstreams_in_audit is set (default true), OR
@@ -292,6 +308,7 @@ struct ExtendedConfig {
     std::optional<std::string> report_log;     // [report].latest_log
     AuditFormat audit_format = AuditFormat::Text;  // [audit].format ("text"|"json")
     EgressConfig egress;                       // [egress] + [[egress.bridge]] (phase 2)
+    NetworkPolicy network_policy;              // [network_policy] guarded proxy (phase 4)
     // A RESERVED restrictive network mode ("proxy"/"bridge"/"guarded") was requested but
     // is not yet enforced. Carries the requested mode name so resolve_config can fail
     // CLOSED (fall back to NetMode::Off, never Full) and the runner can warn on stderr.

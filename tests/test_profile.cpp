@@ -33,6 +33,7 @@
 
 using raincoat::Options;
 using raincoat::NetMode;
+using raincoat::NetworkPolicy;
 using raincoat::load_profile;
 using raincoat::merge;
 
@@ -1051,10 +1052,19 @@ TEST(Profile, LoadFullReferenceConfigMapsEverySection) {
     // Egress is enforced this phase, so it must NOT appear as a reserved note.
     EXPECT_FALSE(any_contains(o.ext.reserved_notes, "egress"));
 
-    // ---- reserved sections still recorded (browser/dns/network_policy) ----
+    // ---- reserved sections still recorded (browser/dns) ----
     EXPECT_TRUE(any_contains(o.ext.reserved_notes, "browser"));
     EXPECT_TRUE(any_contains(o.ext.reserved_notes, "dns"));
-    EXPECT_TRUE(any_contains(o.ext.reserved_notes, "network_policy"));
+
+    // ---- network_policy: PARSED into ext.network_policy this phase (no reserved note) ----
+    EXPECT_TRUE(o.ext.network_policy.enabled);
+    EXPECT_EQ(o.ext.network_policy.default_action, "allow");
+    EXPECT_EQ(o.ext.network_policy.allow_hosts,
+              (std::vector<std::string>{"github.com", "api.github.com"}));
+    EXPECT_EQ(o.ext.network_policy.block_hosts, (std::vector<std::string>{"ipinfo.io"}));
+    // block_private_metadata_endpoints keeps its secure-by-default true when unspecified.
+    EXPECT_TRUE(o.ext.network_policy.block_private_metadata_endpoints);
+    EXPECT_FALSE(any_contains(o.ext.reserved_notes, "network_policy"));
 }
 
 // Regression (fix round 1): egress.timeout_seconds must be CLAMPED to a positive
@@ -1363,4 +1373,75 @@ TEST(Profile, MergeCarriesProfileExt) {
     EXPECT_EQ(m.ext.backend.bwrap_path, "bwrap");
     // Profile-derived set_env ([environment.set]) survives the merge.
     EXPECT_NE(find_set_env(m.set_env, "HOME"), nullptr);
+}
+
+// ===========================================================================
+// [network_policy] parsing (phase 4). Enforced by the filtering forward proxy,
+// so it is REAL parsed config (not a reserved note). An invalid default_action
+// must be REJECTED, never silently defaulted to the fail-open "allow".
+// ===========================================================================
+
+TEST(Profile, NetworkPolicyDenyModeParsesEveryField) {
+    std::string path = write_temp_file(
+        "[network_policy]\n"
+        "enabled = true\n"
+        "default_action = \"deny\"\n"
+        "allow_hosts = [\"github.com\", \"api.github.com\"]\n"
+        "block_hosts = [\"evil.com\"]\n"
+        "block_private_metadata_endpoints = false\n"
+        "metadata_endpoints = [\"metadata.example.internal\"]\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    EXPECT_TRUE(err.empty());
+    const NetworkPolicy& np = opt->ext.network_policy;
+    EXPECT_TRUE(np.enabled);
+    EXPECT_EQ(np.default_action, "deny");
+    EXPECT_EQ(np.allow_hosts, (std::vector<std::string>{"github.com", "api.github.com"}));
+    EXPECT_EQ(np.block_hosts, (std::vector<std::string>{"evil.com"}));
+    EXPECT_FALSE(np.block_private_metadata_endpoints);
+    EXPECT_EQ(np.metadata_endpoints,
+              (std::vector<std::string>{"metadata.example.internal"}));
+    // Enforced this phase: never surfaced as a reserved (unenforced) note.
+    EXPECT_FALSE(any_contains(opt->ext.reserved_notes, "network_policy"));
+}
+
+TEST(Profile, NetworkPolicyDefaultsWhenSectionAbsent) {
+    std::string path = write_temp_file("strict = true\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    const NetworkPolicy& np = opt->ext.network_policy;
+    EXPECT_FALSE(np.enabled);
+    EXPECT_EQ(np.default_action, "allow");
+    EXPECT_TRUE(np.allow_hosts.empty());
+    EXPECT_TRUE(np.block_hosts.empty());
+    EXPECT_TRUE(np.block_private_metadata_endpoints);  // secure-by-default
+}
+
+TEST(Profile, NetworkPolicyRejectsInvalidDefaultAction) {
+    std::string path = write_temp_file(
+        "[network_policy]\n"
+        "enabled = true\n"
+        "default_action = \"den\"\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    EXPECT_FALSE(opt.has_value());
+    EXPECT_NE(err.find("default_action"), std::string::npos) << "err=" << err;
+}
+
+TEST(Profile, NetworkPolicyMergeCarriesThrough) {
+    std::string path = write_temp_file(
+        "[network_policy]\n"
+        "enabled = true\n"
+        "default_action = \"deny\"\n"
+        "allow_hosts = [\"localhost\"]\n");
+    std::string err;
+    auto profile = load_profile(path, err);
+    ASSERT_TRUE(profile.has_value()) << "err=" << err;
+    Options cli;
+    Options m = merge(*profile, cli);
+    EXPECT_TRUE(m.ext.network_policy.enabled);
+    EXPECT_EQ(m.ext.network_policy.default_action, "deny");
+    EXPECT_EQ(m.ext.network_policy.allow_hosts, (std::vector<std::string>{"localhost"}));
 }

@@ -1,6 +1,7 @@
 // Raincoat — audit: audit record + formatting. AuditRecord lives here.
 #pragma once
 
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <vector>
@@ -55,6 +56,18 @@ struct AuditRecord {
     // hides the real upstream unless redaction was explicitly disabled. Empty => no
     // egress bridges (nothing printed).
     std::vector<EgressBridgeAudit> egress_bridges;
+
+    // Network policy / guarded proxy (phase 4). Populated ONLY when
+    // network_policy.enabled. Carries no secret VALUE: the proxy endpoint is a bare
+    // loopback host:port, allow/block are COUNTS (never the host names), and the
+    // metadata flag is a boolean. The honest firewall-vs-proxy-aware reality is carried
+    // as an active_policy_note (above), not here.
+    bool network_policy_enabled = false;
+    std::string network_policy_default_action;   // "allow" | "deny"
+    std::string guarded_proxy_endpoint;          // http://127.0.0.1:<port> (safe to log)
+    std::size_t network_policy_allow_count = 0;
+    std::size_t network_policy_block_count = 0;
+    bool network_policy_metadata_blocked = false;
 };
 
 std::string format_audit_start(const AuditRecord& r);

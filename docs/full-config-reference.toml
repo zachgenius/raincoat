@@ -15,8 +15,10 @@
 #     [audit] (log_file/redact_*/log_*/format), [backend] (bwrap_path/unshare_*/mount_*/
 #     die_with_parent; seccomp reserved), [init], [report].
 #   PARSED + RESERVED (honest "configured, not yet enforced"): [filesystem.tripwire], [browser],
-#     [dns], [network_policy], [proxy] mechanism, network modes "proxy"/"bridge"/"guarded".
+#     [dns], network modes "proxy"/"bridge"/"guarded".
 #   PHASE 2 (egress bridge forwarding): [egress] + [[egress.bridge]] actual HTTP forwarding.
+#   PHASE 4 (guarded proxy): [network_policy] enforced by the built-in filtering forward proxy
+#     (proxy-aware clients only, unless composed with [egress].isolate_netns = "strict").
 #
 # Backward compatible: the flat MVP schema (top-level allow_read/allow_write/allow_env,
 # [env], [fontconfig].enabled, [audit].log_file) still loads.
@@ -406,7 +408,11 @@ ip = "203.0.113.10"
 # --------------------------------------------------------------------
 
 [network_policy]
-# Future guarded mode.
+# Enforced by Raincoat's built-in filtering forward proxy: when enabled, the runner
+# starts a loopback proxy and points the child's http_proxy/https_proxy/all_proxy at it,
+# then allow/block each request's target host per the rules below. This constrains
+# PROXY-AWARE clients only; a client that ignores the proxy env or dials a raw IP can
+# still egress unless you also isolate the network (egress.isolate_netns = "strict").
 enabled = true
 
 # Allow/block is mainly useful for guarded egress.

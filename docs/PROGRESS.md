@@ -217,7 +217,8 @@ the bridge-only strict case, guarded/DNS policy, transparent/MITM modes).
 - [x] **Per-destination egress firewall (bridge-only) — for `isolate_netns = "strict"`** — adds `-o 127.0.0.1` (pasta outbound bound to loopback) so general internet is BLOCKED and ONLY the forwarded bridge port(s) are reachable; requires pasta (fails CLOSED if absent) — *runner / test_egress_jail_netns* (MEASURED: child reaches the bridge, but 1.1.1.1 and off-bridge loopback both fail). The `auto`/`on` NAT jail still retains general internet by IP (honest non-goal for those levels).
 - [-] **General domain/CIDR allow-list egress firewall** (an arbitrary configurable set of upstreams, not just the bridge) — the `strict` bridge-only case landed above; a configurable per-domain policy remains future
 - [-] Host-loopback mapping on newer pasta (`--map-host-loopback`, so the host is at the child's `127.0.0.1`) — this pasta build lacks it
-- [-] `guarded` mode + domain allow/block · [-] DNS policy · [-] transparent egress · [-] explicit MITM (off by default)
+- [x] `guarded` mode + domain allow/block policy (`[network_policy]`) — LANDED in Phase 4 below (guarded proxy `src/proxy.*`)
+- [-] DNS policy · [-] transparent egress · [-] explicit MITM (off by default)
 
 ### 2.7 Limitations documented (honest)
 - [x] Hides upstream URL from child env, not the fact a custom endpoint is used — *EGRESS.md / README*
@@ -259,3 +260,52 @@ the bridge-only strict case, guarded/DNS policy, transparent/MITM modes).
 - [x] Ambiguity honored: `-- init` RUNS `init` as a command (not the subcommand); `run -- cmd`, `init --force` unchanged — *cli* (verified: `-- init` actually exec'd the init binary)
 
 **PHASE 3 (privacy hardening): COMPLETE ✅ — 28 suites / 800+ tests green, -Wall -Wextra clean**
+
+---
+
+## Phase 4 — Network policy / guarded proxy  (see docs/EGRESS.md § Network policy / guarded proxy)
+
+Generic, profile-driven domain allow/block policy over the child's general HTTP(S) egress,
+enforced by a host-side filtering forward proxy (`src/proxy.*`). Distinct from the egress bridge
+(which redirects one known upstream). Composes with the strict pasta netns jail: with the jail
+the allow/block list is a REAL domain-level egress firewall; WITHOUT it, only proxy-aware clients
+are constrained (honest, disclosed every run). No provider/service names hard-coded.
+
+### 4.1 Profile schema & parsing  (config, profile)
+- [x] `[network_policy]` → `NetworkPolicy` (`enabled`, `default_action`, `allow_hosts`, `block_hosts`, `block_private_metadata_endpoints`, `metadata_endpoints`) — *config.hpp / profile*
+- [x] Typo'd `default_action` REJECTED (not silently defaulted — no privacy downgrade) — *profile / test_profile*
+
+### 4.2 Pure policy engine  (proxy::host_allowed — no sockets, unit-tested)
+- [x] `block_hosts` wins (exact + dot-suffix match); blocked host never allowed regardless of default_action — *proxy / test_proxy*
+- [x] Metadata blocking: 169.254.169.254, [fd00:ec2::254], metadata.google.internal, bare "metadata", link-local 169.254.0.0/16, numeric forms, + `metadata_endpoints` — *proxy / test_proxy*
+- [x] `default_action` = deny (allow-list) / allow (block-list); empty/unparseable host FAILS CLOSED — *proxy / test_proxy*
+
+### 4.3 Runnable filtering forward proxy  (ProxyServer)
+- [x] Loopback listener (ephemeral port), thread-per-conn, reaped/torn down on stop — *proxy / test_proxy_composition_teardown*
+- [x] Plain HTTP: parse absolute-form request line, apply policy, forward + stream response, 403 on block — *proxy / test_proxy_integration*
+- [x] HTTPS via CONNECT: policy-check host, 200 + blind-tunnel if allowed (NO MITM), 403 if blocked — *proxy / test_proxy_integration*
+- [x] Post-resolution SSRF / DNS-rebinding guard: recheck EVERY getaddrinfo result before dialing; 403 if a resolved addr is a block/metadata IP — *proxy / test_proxy_attack_round1/2*
+
+### 4.4 Runner wiring  (runner)
+- [x] Start guarded proxy on host loopback BEFORE sandbox when `[network_policy].enabled`; publish bound port — *runner / test_proxy_integration*
+- [x] Inject `http_proxy`/`https_proxy`/`all_proxy` (lower + UPPER); ERASE any inherited proxy vars; leave `no_proxy` ABSENT so nothing is dialed around it; guarded proxy OVERRIDES external `[proxy]`/`--set-env` — *runner / test_proxy_attack_round3_env_case*
+- [x] Conflict with `--net off` refused (guarded proxy needs loopback reachability) — *runner / test_runner*
+- [x] Compose with strict netns jail: pasta forwards ONLY the proxy port (`-o 127.0.0.1`), proxy is child's only egress — *runner / test_proxy_composition_teardown* (verified e2e: child ran, firewall note printed)
+
+### 4.5 Audit + honest disclosure
+- [x] Audit records network-policy enabled, default action, guarded-proxy endpoint, allow/block COUNTS (never host names), metadata-blocked flag; external-proxy-overridden note — *audit / runner* (text + JSON)
+- [x] stderr + audit disclose firewall-vs-proxy-only-clients per mode (strict jail = real firewall; auto/on NAT + shared = proxy-aware clients only) — *runner / test_network_policy_regression_honesty*
+
+### 4.6 Limitations documented (honest)
+- [x] Real domain-level egress firewall ONLY with `isolate_netns = "strict"` (pasta); else only proxy-aware clients constrained — *EGRESS.md / README* (disclosed every run)
+- [x] No TLS interception (CONNECT blind-tunnel); NAME-vs-IP asymmetry for name block-lists — *EGRESS.md / proxy.hpp*
+- [-] Transparent interception of non-proxy-aware clients WITHOUT the jail (a raw-IP / proxy-ignoring client bypasses the policy) — not possible without the strict jail; remains a documented non-goal
+- [-] DNS policy (`[dns]`) — parsed/reserved, not enforced
+- [-] General CIDR-based egress firewall (the guarded proxy is name-based, not CIDR) — future
+
+### 4.7 Verification gate (Phase 4)
+- [x] Unit + integration + attack-regression suites (proxy engine, HTTP/CONNECT forward, SSRF/rebinding guard, env-injection hardening, composition teardown, honesty regressions) — *tests/test_proxy*, *test_proxy_attack_round1/2/3*, *test_proxy_integration*, *test_proxy_composition_teardown*, *test_network_policy_regression_honesty*
+- [x] Real demo: `examples/guarded.toml` (network_policy + strict jail) — child ran, stderr firewall note printed; `--net off` conflict refused — verified against `./build/raincoat`
+- [x] README (Network policy section + roadmap) + docs/EGRESS.md (§ Network policy / guarded proxy) + `examples/guarded.toml`
+
+**PHASE 4 (network policy / guarded proxy): COMPLETE ✅ — 41 suites green, -Wall -Wextra clean**

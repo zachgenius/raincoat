@@ -2,6 +2,7 @@
 #include "runner.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <csignal>
 #include <cstdlib>
@@ -26,6 +27,7 @@
 #include "fs_guard.hpp"
 #include "net_guard.hpp"
 #include "profile.hpp"
+#include "proxy.hpp"
 #include "util.hpp"
 
 namespace raincoat {
@@ -111,17 +113,32 @@ Config resolve_config(const CliInvocation& inv,
     // network namespace (no --unshare-net). See run() and docs/EGRESS.md.
     const bool egress_active = options.ext.egress.enabled;
 
-    // A hard conflict: egress-bridge mode needs loopback reachability, but the user also
-    // demanded `--net off` (or profile network="off"). Honoring both is impossible, so
-    // REFUSE with an explicit error rather than silently picking a winner. (We choose to
-    // refuse rather than silently share the host net; the user must drop one flag.)
-    if (egress_active && options.net.has_value() && *options.net == NetMode::Off) {
+    // Network-policy guarded proxy (phase 4) is ACTIVE when [network_policy].enabled. Like
+    // the egress bridge it needs the child to reach a host-loopback listener (Raincoat's
+    // filtering forward proxy), so the sandbox must SHARE the host network namespace (no
+    // --unshare-net) — or, when composed with the pasta netns jail, JOIN that jail with the
+    // proxy port forwarded. Both cases require cfg.net to be a shared/Full mode below.
+    const bool netpolicy_active = options.ext.network_policy.enabled;
+    // Either feature needs the child to reach a host-loopback listener.
+    const bool shared_net_needed = egress_active || netpolicy_active;
+
+    // A hard conflict: egress-bridge / guarded-proxy mode needs loopback reachability, but
+    // the user also demanded `--net off` (or profile network="off"). Honoring both is
+    // impossible, so REFUSE with an explicit error rather than silently picking a winner.
+    if (shared_net_needed && options.net.has_value() && *options.net == NetMode::Off) {
         err =
-            "Error: egress bridge mode ([egress] mode=\"bridge\") requires network "
-            "reachability to the host loopback bridge, but network was set to \"off\" "
-            "(--net off or network = \"off\"). These conflict. Remove the off setting to "
-            "run egress (the sandbox shares the host network namespace), or disable "
-            "egress.";
+            egress_active
+                ? "Error: egress bridge mode ([egress] mode=\"bridge\") requires network "
+                  "reachability to the host loopback bridge, but network was set to \"off\" "
+                  "(--net off or network = \"off\"). These conflict. Remove the off setting "
+                  "to run egress (the sandbox shares the host network namespace), or disable "
+                  "egress."
+                : "Error: network policy ([network_policy].enabled) requires network "
+                  "reachability to the host loopback guarded proxy, but network was set to "
+                  "\"off\" (--net off or network = \"off\"). These conflict. Remove the off "
+                  "setting to run the guarded proxy (the sandbox shares the host network "
+                  "namespace, or joins the pasta netns jail with only the proxy port "
+                  "forwarded), or disable network_policy.";
         return Config{};
     }
 
@@ -138,7 +155,7 @@ Config resolve_config(const CliInvocation& inv,
     //   * Otherwise (flat/absent profile) keep the MVP default: Off in strict, Full else.
     if (options.net.has_value()) {
         cfg.net = *options.net;
-    } else if (egress_active) {
+    } else if (shared_net_needed) {
         cfg.net = NetMode::Full;
     } else if (options.ext.reserved_net_mode.has_value()) {
         cfg.net = NetMode::Off;
@@ -271,6 +288,19 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     const bool egress_active = cfg.ext.egress.enabled;
     EgressServer egress_srv;
 
+    // ---- Guarded proxy server (phase 4) ---------------------------------
+    // Declared at function scope so its destructor tears down the loopback listener +
+    // every worker thread on ANY return path (errors, signals, normal exit) — no orphaned
+    // proxy. Started() only when [network_policy].enabled; an unstarted server destructs
+    // harmlessly (stop() is idempotent). When active the sandbox SHARES the host network
+    // namespace (resolve_config forced cfg.net Full) so the child can reach the proxy at
+    // 127.0.0.1:<proxy_port>; composed with the pasta netns jail below, bwrap joins that
+    // jail and the proxy port is forwarded (-T). The actual bound port is published here so
+    // the env injection, the jail forward list, and the audit all agree on it.
+    const bool netpolicy_active = cfg.ext.network_policy.enabled;
+    ProxyServer proxy_srv;
+    int proxy_port = -1;
+
     // ---- Egress isolation mode decision (isolated netns vs shared loopback) ----
     // When egress is active AND the profile did not opt out ([egress].isolate_netns
     // != off) AND pasta is available on the host, run the child inside pasta's
@@ -298,8 +328,14 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // firewall. Strict REQUIRES pasta: there is no safe shared-loopback equivalent (shared
     // loopback would hand the child general host network), so strict-without-pasta fails
     // CLOSED (refused below) rather than silently downgrading to general internet.
+    // The netns jail composes with BOTH egress and the guarded proxy. For network policy
+    // the jail is what turns the allow/block list into a REAL egress firewall: in STRICT
+    // mode pasta forwards ONLY the proxy port and blocks general outbound, so the proxy is
+    // the child's sole way out. Without the jail (or in on/auto, which NAT general
+    // outbound) the policy only constrains proxy-aware clients — disclosed honestly below.
     const NetnsIsolation isolate_mode = cfg.ext.egress.isolate_netns;
-    const bool jail_requested = egress_active && isolate_mode != NetnsIsolation::Off;
+    const bool jail_requested =
+        (egress_active || netpolicy_active) && isolate_mode != NetnsIsolation::Off;
     std::optional<std::string> pasta_path;
     if (jail_requested) pasta_path = find_pasta();
     const bool jail_active = jail_requested && pasta_path.has_value();
@@ -313,16 +349,18 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // downgrade (fail OPEN), refuse the run with an actionable error. This returns before
     // mkdtemp(), so only the signal handlers (armed in step 0) need restoring; no sandbox
     // root exists to clean up yet.
-    if (egress_active && isolate_mode == NetnsIsolation::Strict && !pasta_path.has_value()) {
+    if ((egress_active || netpolicy_active) && isolate_mode == NetnsIsolation::Strict &&
+        !pasta_path.has_value()) {
         err =
             "Error: [egress].isolate_netns = \"strict\" blocks the child's general internet "
-            "and exposes ONLY the forwarded bridge port(s), which requires `pasta` (passt) "
-            "to run the child in an isolated network namespace — but pasta was not found on "
-            "this host. There is no safe shared-loopback equivalent of \"strict\" (sharing "
-            "the host loopback would grant the child general host network access), so the "
-            "run is refused (fail-closed) rather than silently downgraded. Install pasta, or "
-            "set isolate_netns to \"on\"/\"auto\" (jail with general internet via NAT) or "
-            "\"off\" (shared loopback).";
+            "and exposes ONLY the forwarded loopback port(s) (the egress bridge and/or the "
+            "guarded proxy), which requires `pasta` (passt) to run the child in an isolated "
+            "network namespace — but pasta was not found on this host. There is no safe "
+            "shared-loopback equivalent of \"strict\" (sharing the host loopback would grant "
+            "the child general host network access), so the run is refused (fail-closed) "
+            "rather than silently downgraded. Install pasta, or set isolate_netns to "
+            "\"on\"/\"auto\" (jail with general internet via NAT) or \"off\" (shared "
+            "loopback).";
         restore_signals();
         return 1;
     }
@@ -493,6 +531,77 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             }
             child_visible[br.name] = endpoint;
         }
+    }
+
+    // ---- 3f. Guarded proxy (phase 4): start + inject http(s)_proxy -------
+    // BEFORE launching the sandbox, bind the filtering forward proxy on a host loopback
+    // ephemeral port and inject http_proxy/https_proxy/all_proxy pointing at it. The proxy
+    // checks each request's target host against cfg.ext.network_policy and forwards or 403s.
+    // Failure to bind aborts the run (fail-closed) rather than launching the child WITHOUT
+    // the policy in force. The reused egress timeout bounds per-connection idle waits.
+    if (netpolicy_active) {
+        std::string perr;
+        if (!proxy_srv.start("127.0.0.1", 0, cfg.ext.network_policy,
+                             cfg.ext.egress.timeout_seconds, perr)) {
+            err = "Error: could not start guarded proxy: " + perr;
+            cleanup_root();
+            restore_signals();
+            return 1;
+        }
+        proxy_port = proxy_srv.port();
+        const std::string proxy_url = "http://127.0.0.1:" + std::to_string(proxy_port);
+        // Inject the proxy endpoint. This OVERRIDES any external [proxy].enabled values that
+        // resolve_env already folded into env.resolved: Raincoat's guarded proxy takes
+        // precedence, and the external proxy URL (which can carry credentials) is neither
+        // used nor logged. Assigning env.resolved[...] replaces the value; record_set files
+        // the name under "set" (and removes it from allowed/scrubbed) so the audit is honest.
+        //
+        // CASE MATTERS: real HTTP clients honour BOTH the lowercase and UPPERCASE spellings of
+        // these variables (curl/wget/Go read HTTPS_PROXY/ALL_PROXY/NO_PROXY; Python urllib folds
+        // case for NO_PROXY). If we only touched the lowercase names, a leftover UPPERCASE
+        // HTTPS_PROXY (pointing a client at an ATTACKER proxy) or NO_PROXY=* (telling a proxy-
+        // aware client to skip the guarded proxy) would defeat the policy — even for the
+        // proxy-aware clients we claim to constrain. Match case-INSENSITIVELY (rather than a
+        // fixed set of literal spellings) so ANY casing the attacker slips in is handled.
+        auto lower = [](std::string s) {
+            for (char& c : s)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            return s;
+        };
+        auto drop_name = [](std::vector<std::string>& v, const std::string& n) {
+            v.erase(std::remove(v.begin(), v.end(), n), v.end());
+        };
+        auto drop_from_audit = [&](const std::string& n) {
+            drop_name(env.set, n);
+            drop_name(env.allowed, n);
+            drop_name(env.scrubbed, n);
+        };
+        // First pass: erase EVERY case spelling of a proxy-related var already present in the
+        // resolved env (http/https/all_proxy AND no_proxy), plus its audit-name entries. This
+        // removes an attacker-supplied UPPERCASE HTTPS_PROXY, a mixed-case No_Proxy, an ambient
+        // --allow-env'd bypass list, etc. — nothing survives to override or skip the proxy.
+        for (auto it = env.resolved.begin(); it != env.resolved.end();) {
+            const std::string lk = lower(it->first);
+            if (lk == "http_proxy" || lk == "https_proxy" || lk == "all_proxy" ||
+                lk == "no_proxy") {
+                drop_from_audit(it->first);
+                it = env.resolved.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        // Second pass: inject the guarded-proxy endpoint under both the lowercase and UPPERCASE
+        // canonical spellings so every proxy-aware client reads it. no_proxy is left ABSENT (an
+        // empty bypass list), so no host can be dialed around the proxy.
+        for (const char* k : {"http_proxy", "https_proxy", "all_proxy",
+                              "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"}) {
+            env.resolved[k] = proxy_url;
+            record_set(k);
+        }
+        // In jail mode the child reaches the proxy at 127.0.0.1:<proxy_port> on the netns
+        // loopback ONLY because pasta forwards it (-T). Add it to the forward set so the
+        // isolated-netns wrapping below exposes the proxy port to the child.
+        if (proxy_port > 0) jail_forward_ports.push_back(proxy_port);
     }
 
     // ---- 4. Fontconfig isolation (best-effort) ---------------------------
@@ -746,6 +855,38 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             "upstream URL from the child's environment, but the child is NOT network-jailed "
             "(it retains general host network access, and the resolved upstream IP:port is "
             "observable via /proc/net/tcp).";
+    }
+
+    // Honest disclosure for the guarded proxy. Surface on stderr so a user who never opens
+    // the audit still learns whether the allow/block list is a REAL firewall (strict jail:
+    // proxy is the only egress) or merely constrains proxy-aware clients (shared net or a
+    // NAT jail, where a raw-IP / proxy-ignoring client bypasses the policy).
+    if (netpolicy_active) {
+        const std::string purl = "http://127.0.0.1:" + std::to_string(proxy_port);
+        if (!warning.empty()) warning += "\n";
+        if (strict_jail) {
+            warning +=
+                "Note: network policy is enforced by the guarded proxy (" + purl +
+                ") AND the STRICT netns jail (pasta -o 127.0.0.1) forwards ONLY the proxy "
+                "port, so the proxy is the child's ONLY egress path: the allow/block host "
+                "list is a REAL domain-level egress firewall (direct, non-proxy connections "
+                "are blocked).";
+        } else if (jail_active) {
+            warning +=
+                "Note: guarded proxy active (" + purl +
+                "); the netns jail NATs general outbound traffic, so a client that ignores "
+                "http_proxy or connects to a raw IP can still reach the internet — the "
+                "allow/block list only constrains proxy-aware clients. Use "
+                "[egress].isolate_netns = \"strict\" to make it a real egress firewall.";
+        } else {
+            warning +=
+                "Note: guarded proxy active (" + purl +
+                ") on the SHARED host network; only proxy-aware clients are constrained (a "
+                "client that ignores http_proxy/https_proxy or connects to a raw IP bypasses "
+                "the policy, and the child retains general host network access). Compose "
+                "[egress].isolate_netns = \"strict\" with pasta to forward only the proxy "
+                "port and make the allow/block list a real egress firewall.";
+        }
     }
 
     // ---- 7. Locate the bubblewrap backend --------------------------------
@@ -1122,6 +1263,60 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         }
     }
 
+    // Network policy / guarded proxy transparency (phase 4). COUNTS + the loopback proxy
+    // endpoint only — never the host names, never a secret. The honest firewall-vs-proxy-
+    // aware reality is recorded as an active policy note so behaviour is never overclaimed.
+    if (netpolicy_active) {
+        const NetworkPolicy& np = cfg.ext.network_policy;
+        rec.network_policy_enabled = true;
+        rec.network_policy_default_action = np.default_action;
+        rec.guarded_proxy_endpoint = "http://127.0.0.1:" + std::to_string(proxy_port);
+        rec.network_policy_allow_count = np.allow_hosts.size();
+        rec.network_policy_block_count = np.block_hosts.size();
+        rec.network_policy_metadata_blocked = np.block_private_metadata_endpoints;
+        // Document the precedence honestly: if an external proxy was ALSO configured
+        // ([proxy].enabled or --set-env http_proxy/…), the guarded proxy OVERRODE it. The
+        // external proxy is not used and its value (which can carry credentials) is never
+        // logged — only its presence is noted here.
+        bool external_proxy_configured = false;
+        for (const auto& kv : cfg.set_env) {
+            if (kv.first == "http_proxy" || kv.first == "https_proxy" ||
+                kv.first == "all_proxy" || kv.first == "no_proxy") {
+                external_proxy_configured = true;
+                break;
+            }
+        }
+        if (external_proxy_configured) {
+            rec.active_policy_notes.push_back(
+                "an external proxy was configured ([proxy] or --set-env) but the guarded "
+                "proxy takes PRECEDENCE: http_proxy/https_proxy/all_proxy were overridden to "
+                "the loopback guarded proxy, any no_proxy bypass list was dropped, and the "
+                "external proxy value (possibly carrying credentials) is neither used nor "
+                "logged.");
+        }
+        if (strict_jail) {
+            rec.active_policy_notes.push_back(
+                "network policy enforced by the guarded proxy; the STRICT netns jail (pasta "
+                "-o 127.0.0.1) forwards ONLY the proxy port, so the proxy is the child's "
+                "ONLY egress path and the allow/block host list is a REAL domain-level "
+                "egress firewall — a direct, non-proxy connection from the child is blocked.");
+        } else if (jail_active) {
+            rec.active_policy_notes.push_back(
+                "network policy active behind the guarded proxy; the netns jail NATs general "
+                "outbound traffic, so a client that ignores http_proxy or dials a raw IP "
+                "still reaches the internet — the allow/block list only constrains proxy-"
+                "aware clients. Use [egress].isolate_netns = \"strict\" for a real firewall.");
+        } else {
+            rec.active_policy_notes.push_back(
+                "network policy active behind the guarded proxy on the SHARED host network; "
+                "only proxy-aware clients are constrained (a client that ignores http_proxy "
+                "or dials a raw IP bypasses the policy, and the child retains general host "
+                "network access). Compose [egress].isolate_netns = \"strict\" with pasta to "
+                "forward only the proxy port and make the allow/block list a real egress "
+                "firewall.");
+        }
+    }
+
     // ---- 10. Write the audit "start" block (+ any warnings) --------------
     // JSON format emits a SINGLE object per run (it carries the exit code, so it can
     // only be written AFTER the child is reaped — see step 12). Text format writes the
@@ -1199,6 +1394,10 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // the audit/cleanup work below. On the error/signal return paths above, the
     // function-scope EgressServer destructor performs the same teardown — no orphans.
     egress_srv.stop();
+    // Same lifecycle for the guarded proxy: close the listener + drain workers now (free the
+    // loopback port promptly). stop() is idempotent and the function-scope ProxyServer
+    // destructor covers every error/signal return path above — no orphaned proxy.
+    proxy_srv.stop();
 
     int exit_code;
     if (WIFEXITED(status)) {

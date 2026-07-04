@@ -1,7 +1,9 @@
 # Raincoat — Egress Bridge / Endpoint Indirection
 
 Status: **implemented (MVP).** Host-side HTTP(S) forward proxy per bridge (`src/egress.*`), wired
-into the live sandbox by the runner. See the honest networking model below.
+into the live sandbox by the runner. See the honest networking model below. A separate
+**guarded proxy** (`[network_policy]`, `src/proxy.*`) enforces a domain allow/block policy over the
+child's general egress — see [Network policy / guarded proxy](#network-policy--guarded-proxy-filtering-forward-proxy).
 
 ## Goal
 Let the child process see only a **local or generic endpoint**, while Raincoat privately forwards
@@ -114,10 +116,92 @@ opt-in before logging upstream endpoints.
   child's `127.0.0.1`. The bridge sidesteps this by keeping the host-side listener and letting
   pasta `-T` forward the ns-loopback bridge port to it, so `child_endpoint = http://127.0.0.1:PORT`
   still works unchanged; a newer pasta would simply make host-loopback reachability native.
-- **`guarded` mode / domain allow-block policy** and **DNS policy** (`[network_policy]`, `[dns]`) —
-  parsed/reserved, not enforced.
+- **DNS policy** (`[dns]`) — parsed/reserved, not enforced.
 - **Transparent egress mode** (no explicit endpoint) and an explicit **MITM mode** (disabled by
   default), which would be needed for full HTTPS hostname rewriting without a custom endpoint.
+
+> **Note — `guarded` / `[network_policy]` is now IMPLEMENTED (phase 4).** The domain allow/block
+> policy is enforced by a host-side filtering forward proxy (`src/proxy.*`); see the dedicated
+> **[Network policy / guarded proxy](#network-policy--guarded-proxy-filtering-forward-proxy)**
+> section below. It is a *name-based* allow/block firewall (composed with the strict netns jail),
+> not a CIDR firewall, and — without the jail — only constrains proxy-aware clients.
+
+## Network policy / guarded proxy (filtering forward proxy)
+Status: **implemented (phase 4).** Distinct from the egress *bridge* above: the bridge does URL
+indirection for a *known* upstream; the **guarded proxy** enforces a **domain allow/block policy**
+over the child's *general* HTTP(S) egress. Driven entirely by `[network_policy]` — no
+provider/service names baked in.
+
+### How it works
+When `[network_policy].enabled`, the runner starts a small host-side **filtering forward proxy**
+(`src/proxy.*`, `ProxyServer`) bound on a loopback ephemeral port BEFORE launching the sandbox,
+then injects the proxy endpoint into the child as **both** the lowercase and UPPERCASE spellings of
+`http_proxy` / `https_proxy` / `all_proxy`. Any pre-existing proxy vars (from `[proxy]`,
+`--set-env`, `--allow-env`, in any case) are **erased first**, and `no_proxy` is left **absent** (an
+empty bypass list) so a proxy-aware client cannot be told to skip the guard. Raincoat's guarded
+proxy therefore takes precedence over any external proxy, and an external proxy URL (which can carry
+credentials) is never handed to the child.
+
+The proxy checks each request's target **host** against the policy and:
+- **Plain HTTP** — parses the absolute-form request line (`GET http://host/path`), applies policy,
+  and if allowed forwards the request to the origin and streams the response back. A blocked host
+  gets `HTTP/1.1 403 Forbidden`.
+- **HTTPS via `CONNECT`** — applies policy on the host; if allowed, replies `200 Connection
+  Established` and **blind-tunnels** bytes both ways (**no TLS interception / no MITM**); if blocked,
+  replies `403` and closes. Because there is no MITM, only the CONNECT target host (SNI-equivalent)
+  is policy-checked, not the inner HTTP request.
+
+### Policy engine (`host_allowed`, pure + unit-tested)
+Evaluated in order:
+1. **`block_hosts` wins** — exact match or dot-suffix match (`evil.com` blocks `api.evil.com`). A
+   blocked host is never allowed regardless of `default_action`.
+2. **Metadata blocking** (when `block_private_metadata_endpoints`, default true) — blocks the cloud
+   metadata endpoints `169.254.169.254`, `[fd00:ec2::254]`, `metadata.google.internal`, the bare
+   name `metadata`, every entry in `metadata_endpoints`, ANY link-local `169.254.0.0/16` literal,
+   and the numeric IPv4/IPv6 forms of a metadata address.
+3. **`default_action`** — `"deny"` allows ONLY hosts matching `allow_hosts` (exact/dot-suffix), i.e.
+   allow-list mode; `"allow"` permits anything not blocked above (block-list mode).
+
+An empty/unparseable host **fails closed** (denied). A typo'd `default_action` in a profile is
+**rejected** (not silently defaulted), so `"den"` can never silently degrade an intended `"deny"`
+allow-list.
+
+### SSRF / DNS-rebinding guard (post-resolution recheck)
+After policy passes on the literal request host, the proxy re-checks **every** address
+`getaddrinfo` returns *before dialing* and refuses (`403`) if any resolved address is a `block_hosts`
+IP literal or (when enabled) a metadata / link-local address. This closes the "name that resolves to
+a blocked/metadata IP" bypass on both the HTTP and CONNECT paths.
+
+### The jail composition — real firewall vs proxy-only-clients
+The guarded proxy's strength depends **entirely** on whether the child can go *around* it. Raincoat
+composes it with the pasta netns jail (`[egress].isolate_netns`) and discloses the active mode in
+the audit **and** on stderr every run:
+
+| Mode | What the jail does | What the policy is |
+|------|--------------------|--------------------|
+| `isolate_netns = "strict"` (pasta required) | `pasta … -o 127.0.0.1 -T <proxy-port>` forwards ONLY the proxy port and blocks all other outbound | **A REAL domain-level egress firewall** — the proxy is the child's ONLY egress path; direct/raw-IP/proxy-ignoring connections are blocked. |
+| `auto` / `on` (NAT jail) | pasta NATs general outbound | **Proxy-aware clients only** — a client that ignores `http_proxy` or dials a raw IP still reaches the internet. |
+| shared loopback (no pasta / `isolate_netns = "off"`) | none — child shares the host net namespace | **Proxy-aware clients only** — plus the child retains general host network access. |
+
+So: **only `strict` (with pasta) turns the allow/block list into a genuine firewall.** In the other
+modes it constrains *cooperating* clients but a non-proxy-aware or raw-IP client bypasses it — the
+stderr note and audit say exactly this, and never overclaim. To use a **name** block-list as a hard
+firewall even in strict mode, also list the pinned IP literal(s) and/or prefer `default_action =
+"deny"` with an explicit allow-list, because name-based filtering cannot reverse-map an IP back to a
+blocked name (the NAME-vs-IP asymmetry, documented in `src/proxy.hpp`).
+
+### Netns / conflict rules
+Like the bridge, the guarded proxy needs loopback reachability, so the sandbox must share the host
+netns or join the pasta jail with the proxy port forwarded. `[network_policy].enabled` therefore
+**conflicts with `--net off`** and Raincoat refuses that combination with an actionable error rather
+than silently disabling the policy.
+
+### Audit
+When active, the audit records (text and JSON): `Network policy: enabled (default <action>)`, the
+`Guarded proxy: http://127.0.0.1:<port>` endpoint, `allow hosts` / `block hosts` **counts** (never
+the host names), and whether metadata blocking is on. If an external proxy was also configured, the
+audit notes that the guarded proxy **overrode** it (the external URL is never logged). Host names and
+request bodies are never written.
 
 ## Limitations to document (honestly)
 - The bridge hides the real upstream **hostname/URL** from the child's **environment/config** — the
@@ -140,6 +224,17 @@ opt-in before logging upstream endpoints.
 - It does NOT necessarily hide the fact that the child is using a custom/local endpoint.
 - Full HTTPS hostname rewriting without exposing a custom endpoint may require MITM, control of the
   original certificate, or transparent network-level routing.
+- **The guarded proxy (`[network_policy]`) is a real domain-level egress firewall ONLY with the
+  strict netns jail.** Without `isolate_netns = "strict"` (pasta required) — i.e. on the shared
+  network or under the `auto`/`on` NAT jail — it only constrains **proxy-aware** clients: a client
+  that ignores `http_proxy`/`https_proxy` or dials a **raw IP** bypasses the policy entirely. There
+  is **no transparent interception** of non-proxy-aware clients without the jail; the audit + a
+  stderr note disclose which case is in effect every run.
+- **The guarded proxy does not MITM TLS.** HTTPS is handled via `CONNECT` blind-tunnel, so only the
+  connect-target hostname is policy-checked; the inner request/SNI is not inspected. Name-based
+  block-lists are also subject to the NAME-vs-IP asymmetry (a name blocked purely by name is still
+  reachable by its IP unless the IP is also listed / `default_action = "deny"` is used).
+- **DNS policy (`[dns]`) is not enforced** — reserved for future work.
 - Raincoat must NOT claim to bypass detection by any specific tool or service.
 
 ## Audit redaction (per-bridge)

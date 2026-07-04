@@ -82,13 +82,15 @@ TEST(ReservedHonestyAttack, DottedBoolFormBrowserMustAlsoBeDisclosed) {
          "note — the audit dishonestly implies nothing was configured.";
 }
 
-// Same defect via an array-valued member of a reserved section.
-TEST(ReservedHonestyAttack, DottedArrayFormNetworkPolicyMustAlsoBeDisclosed) {
-  std::string path = write_profile("network_policy.deny = [\"evil.example\"]\n");
+// Same defect via an array-valued member of a reserved section. `network_policy` is now
+// ENFORCED (phase 4 filtering proxy) so it is no longer a reserved note; use `dns`, which
+// is still reserved, to exercise the dotted-array-form disclosure path.
+TEST(ReservedHonestyAttack, DottedArrayFormReservedSectionMustAlsoBeDisclosed) {
+  std::string path = write_profile("dns.servers = [\"1.1.1.1\"]\n");
   std::string err;
   auto opt = load_profile(path, err);
   ASSERT_TRUE(opt.has_value()) << err;
-  EXPECT_TRUE(mentions(opt->ext.reserved_notes, "network_policy"))
+  EXPECT_TRUE(mentions(opt->ext.reserved_notes, "dns"))
       << "a reserved section configured via a dotted array key is silently "
          "swallowed with no reserved note.";
 }

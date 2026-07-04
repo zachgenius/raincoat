@@ -306,9 +306,15 @@ into `Options`/`Config`+`Config.ext` (`ExtendedConfig`, see config.hpp):
 - `[backend]`: →ext.backend (bwrap_path, unshare_*, mount_*, die_with_parent; seccomp reserved).
 - `[init]`: `create_dirs`→ext.init_create_dirs. `[report]`: `latest_log`→ext.report_log,
   `playful_summary`→ext.playful_report. `[proxy]`: if enabled, inject http/https/all/no_proxy → set_env.
+- ENFORCED (no longer reserved): `[egress]`/`[[egress.bridge]]` (phase 2 — the egress module's
+  socket/HTTP helpers + loopback `EgressServer`) and `[network_policy]` (phase 4 — enforced by
+  the built-in filtering forward proxy: the runner binds a loopback proxy, injects
+  http/https/all_proxy at the child, and allow/blocks each request's target host per the policy).
+  This constrains PROXY-AWARE clients only unless composed with `egress.isolate_netns = "strict"`
+  (a raw-socket / raw-IP client in shared-net mode bypasses it); the audit and disclosures state
+  this honestly and never claim a domain-level firewall.
 - RESERVED (parse + `ext.reserved_notes` + audit line "configured, not yet enforced", NOT
-  enforced): `[browser]`, `[dns]`, `[network_policy]`, `[egress]`/`[[egress.bridge]]` (phase 2),
-  network modes bridge/guarded/proxy-as-mode, `[backend].seccomp`.
+  enforced): `[browser]`, `[dns]`, network modes bridge/guarded/proxy-as-mode, `[backend].seccomp`.
 The `toml` module must support `[[array-of-tables]]` and nested `[a.b.c]` tables for this.
 
 ### profile  (deps: toml, config)

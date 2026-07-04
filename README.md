@@ -543,6 +543,45 @@ it **joins pasta's** namespace. **Measured on a real host**, this mode:
 
 ---
 
+## Network policy (guarded proxy)
+
+Where the egress *bridge* redirects one known upstream, the **guarded proxy** enforces a **domain
+allow/block policy** over the sandboxed tool's *general* HTTP(S) egress. Turn it on with a
+`[network_policy]` block; Raincoat starts a small host-side filtering forward proxy on loopback and
+injects `http_proxy`/`https_proxy`/`all_proxy` into the child pointing at it (erasing any inherited
+proxy vars, leaving `no_proxy` empty so nothing can be dialed around it). Full detail and the honest
+threat model are in [`docs/EGRESS.md`](docs/EGRESS.md#network-policy--guarded-proxy-filtering-forward-proxy).
+
+```toml
+[network_policy]
+enabled = true
+default_action = "deny"                      # "deny" = allow-list mode; "allow" = block-list mode
+allow_hosts = ["api.example.com", "example.org"]   # exact or dot-suffix ("example.org" allows sub.example.org)
+block_hosts = []                             # always blocked (wins over allow)
+block_private_metadata_endpoints = true      # block 169.254.169.254 & friends (default true)
+
+[egress]
+isolate_netns = "strict"                     # REQUIRED for a real firewall — see below
+```
+
+The proxy checks each request's target host: plain HTTP is parsed and forwarded (or `403`ed);
+HTTPS is policy-checked at `CONNECT` and blind-tunnelled (no TLS interception). It also blocks cloud
+**metadata endpoints** by default and re-checks every DNS result before dialing (an SSRF /
+DNS-rebinding guard).
+
+> **Honest limitation — the composition is what makes it a firewall.** The allow/block list is a
+> **real domain-level egress firewall only when composed with `[egress].isolate_netns = "strict"`**
+> (which requires [`pasta`](https://passt.top/)): strict forwards *only* the proxy port and blocks
+> all other outbound, so the proxy is the child's **only** way out. **Without** the strict jail — on
+> the shared host network, or under the `auto`/`on` NAT jail — the proxy only constrains
+> **proxy-aware** clients: a tool that ignores `http_proxy` or connects to a **raw IP** bypasses the
+> policy. There is no transparent interception without the jail. Raincoat discloses which case is in
+> effect in the audit log and on stderr every run. `[network_policy]` needs loopback reachability, so
+> it conflicts with `--net off` (Raincoat refuses that combination). A ready-to-edit profile lives at
+> [`examples/guarded.toml`](examples/guarded.toml).
+
+---
+
 ## Roadmap
 
 The MVP implements the fake home, env scrub, generic locale/timezone, best-effort fonts,
@@ -564,12 +603,15 @@ filesystem restriction, `full`/`off` networking, and the audit log. Planned and 
 - **Egress bridge / endpoint indirection** *(implemented in the MVP — see the
   [Egress bridge](#egress-bridge-endpoint-indirection) section and [`docs/EGRESS.md`](docs/EGRESS.md))*.
   The **isolated-netns jail** (default when `pasta` is present) is now implemented: it fixes the
-  `/proc/net/tcp` upstream leak and hides other host-loopback services. Still deferred within
-  egress: a **per-destination egress firewall** (only the configured upstreams reachable — the
-  pasta jail NATs general internet, it does not block it), host-loopback mapping on newer `pasta`
-  (`--map-host-loopback`, so the host is reachable at the child's `127.0.0.1`), a `guarded` mode
-  with a domain allow/block policy, DNS policy, a transparent egress mode, and an explicit MITM
-  mode (off by default).
+  `/proc/net/tcp` upstream leak and hides other host-loopback services. The **`guarded` mode / domain
+  allow-block policy** (`[network_policy]`) is now implemented too — a host-side filtering forward
+  proxy that becomes a real domain-level egress firewall when composed with the strict netns jail
+  (see [Network policy (guarded proxy)](#network-policy-guarded-proxy) and
+  [`docs/EGRESS.md`](docs/EGRESS.md)). Still deferred within egress: a **general CIDR-based egress
+  firewall** (the guarded proxy is name-based, not CIDR), host-loopback mapping on newer `pasta`
+  (`--map-host-loopback`, so the host is reachable at the child's `127.0.0.1`), **transparent
+  interception** of non-proxy-aware clients without the jail, **DNS policy**, a transparent egress
+  mode, and an explicit MITM mode (off by default).
 
 ---
 

@@ -1,0 +1,84 @@
+# Raincoat profile — network policy (guarded proxy) + STRICT egress jail.
+#
+# This profile gives the sandboxed tool network access to ONLY an explicit
+# allow-list of hostnames and NOTHING else. It is the "real firewall" setup:
+# a host-side filtering forward proxy enforces the allow/block policy, and the
+# strict pasta netns jail forwards ONLY the proxy port so the proxy is the
+# child's ONLY way out (direct / raw-IP / proxy-ignoring connections are blocked).
+#
+# GENERIC BY CONSTRUCTION: the hostnames below are placeholders. Replace them
+# with the destinations your tool actually needs. No provider names are baked
+# into Raincoat.
+#
+# HONEST THREAT MODEL (read this):
+#   * With [egress].isolate_netns = "strict" (REQUIRES `pasta`/passt installed),
+#     the allow/block list is a REAL domain-level egress firewall — the child can
+#     reach ONLY the allow-listed hosts through the proxy, and nothing else.
+#     If pasta is ABSENT, "strict" fails CLOSED (the run is refused) rather than
+#     silently downgrading to general internet.
+#   * WITHOUT the strict jail (auto/on NAT jail, or shared loopback), the proxy
+#     only constrains PROXY-AWARE clients: a tool that ignores http_proxy/https_proxy
+#     or dials a raw IP would bypass the policy. There is no transparent interception
+#     without the jail. Raincoat discloses the active mode in the audit + on stderr.
+#   * HTTPS is policy-checked at CONNECT and blind-tunnelled (no TLS interception).
+#   * Name-vs-IP asymmetry: a host blocked purely by NAME is still reachable by its
+#     IP unless you also list the IP or use default_action = "deny" with an allow-list
+#     (this profile uses deny + allow-list, the stronger posture).
+#
+# Run it (from a directory that does NOT contain secrets you don't want mounted):
+#   raincoat --profile /path/to/guarded.toml -- your-tool ...
+
+strict = false
+network = "full"          # guarded proxy needs loopback reachability; it CONFLICTS with --net off
+
+# Your project. "." resolves to the launch directory.
+allow_read = ["."]
+allow_write = ["."]
+allow_env = []
+
+[env]
+TZ = "UTC"
+LANG = "en_US.UTF-8"
+LC_ALL = "en_US.UTF-8"
+
+[fontconfig]
+enabled = true
+
+[audit]
+log_file = ".raincoat/audit.log"
+
+[network_policy]
+enabled = true
+
+# "deny" = allow-list mode: ONLY allow_hosts are reachable (recommended, strongest).
+# "allow" = block-list mode: everything except block_hosts is reachable.
+default_action = "deny"
+
+# Hostnames the child may reach. Exact match OR dot-suffix match: "example.org"
+# also allows "sub.example.org". For a hard firewall, prefer listing exactly the
+# hosts your tool needs (and their pinned IPs if you must block by name too).
+allow_hosts = [
+  "api.example.com",
+  "example.org",
+]
+
+# Hosts that are ALWAYS blocked (wins over allow_hosts). Optional.
+block_hosts = []
+
+# Block cloud metadata endpoints (169.254.169.254, fd00:ec2::254,
+# metadata.google.internal, link-local 169.254.0.0/16, ...). Default true.
+block_private_metadata_endpoints = true
+
+# Extra metadata hosts/IPs to block, beyond the built-in set. Optional.
+metadata_endpoints = []
+
+[egress]
+# STRICT is what turns the allow/block list into a REAL egress firewall: it runs
+# the child in an isolated pasta netns with pasta's outbound bound to loopback
+# (-o 127.0.0.1) and forwards ONLY the guarded-proxy port, so the proxy is the
+# child's only egress. REQUIRES `pasta`; fails CLOSED (run refused) if pasta is
+# absent, rather than silently granting general internet.
+#
+# Drop to "auto" if you accept the weaker "proxy-aware clients only" guarantee
+# (see the threat-model note above). Check availability with `raincoat doctor`.
+isolate_netns = "strict"

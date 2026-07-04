@@ -182,6 +182,18 @@ std::string format_audit_start(const AuditRecord& r) {
         ss << "  Injected env var: " << b.injected_env << "\n";
     }
 
+    // Network policy / guarded proxy (phase 4). COUNTS only — never the host names, never
+    // a secret. The proxy endpoint is a bare loopback host:port (safe). The honest
+    // firewall-vs-proxy-aware reality is recorded separately as an active policy note.
+    if (r.network_policy_enabled) {
+        ss << "Network policy: enabled (default " << r.network_policy_default_action << ")\n";
+        ss << "Guarded proxy: " << r.guarded_proxy_endpoint << "\n";
+        ss << "  allow hosts: " << r.network_policy_allow_count << "\n";
+        ss << "  block hosts: " << r.network_policy_block_count << "\n";
+        ss << "  metadata endpoints blocked: "
+           << (r.network_policy_metadata_blocked ? "yes" : "no") << "\n";
+    }
+
     // Sections that were configured but are NOT yet enforced. Surfacing them keeps the
     // audit honest about what the rich profile does (and does not) actually do.
     if (!r.reserved_notes.empty()) {
@@ -261,6 +273,19 @@ std::string format_audit_json(const AuditRecord& r, int exit_code) {
             o << '}';
         }
         o << ']';
+    }
+
+    // Network policy / guarded proxy (phase 4): counts + endpoint, never host names.
+    if (r.network_policy_enabled) {
+        raw_field("network_policy_enabled", "true", first);
+        str_field("network_policy_default_action", r.network_policy_default_action, first);
+        str_field("guarded_proxy", r.guarded_proxy_endpoint, first);
+        raw_field("network_policy_allow_hosts",
+                  std::to_string(r.network_policy_allow_count), first);
+        raw_field("network_policy_block_hosts",
+                  std::to_string(r.network_policy_block_count), first);
+        raw_field("network_policy_metadata_blocked",
+                  r.network_policy_metadata_blocked ? "true" : "false", first);
     }
 
     if (!r.warnings.empty()) str_field("warnings", r.warnings, first);

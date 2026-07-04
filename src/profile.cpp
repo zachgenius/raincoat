@@ -381,9 +381,38 @@ std::optional<Options> load_profile(const std::string& path, std::string& err) {
         o.ext.reserved_notes.push_back(
             "dns override configured — not yet enforced (phase 2)");
     }
+    // [network_policy] -> ext.network_policy (NetworkPolicy). Enforced this phase (phase 4)
+    // by Raincoat's own filtering forward proxy (see proxy.hpp), so this is REAL parsed
+    // config now — NOT a reserved note. Tolerant of unknown keys; an INVALID
+    // default_action, however, is REJECTED rather than silently defaulted, because a typo
+    // like default_action = "den" must not silently degrade an intended allow-list ("deny")
+    // policy into the fail-OPEN "allow" default.
     if (t.contains("network_policy")) {
-        o.ext.reserved_notes.push_back(
-            "network_policy configured — not yet enforced (phase 2)");
+        NetworkPolicy& np = o.ext.network_policy;
+        if (auto b = t.get_bool("network_policy.enabled"); b.has_value())
+            np.enabled = *b;
+        if (auto s = t.get_string("network_policy.default_action"); s.has_value()) {
+            if (*s == "allow" || *s == "deny") {
+                np.default_action = *s;
+            } else {
+                err = "Error: invalid network_policy.default_action value in profile: \"" +
+                      *s + "\" (expected allow|deny)";
+                return std::nullopt;
+            }
+        } else if (t.contains("network_policy.default_action")) {
+            err = "Error: invalid network_policy.default_action value in profile "
+                  "(expected allow|deny)";
+            return std::nullopt;
+        }
+        if (auto a = t.get_string_array("network_policy.allow_hosts"); a.has_value())
+            np.allow_hosts = *a;
+        if (auto a = t.get_string_array("network_policy.block_hosts"); a.has_value())
+            np.block_hosts = *a;
+        if (auto b = t.get_bool("network_policy.block_private_metadata_endpoints");
+            b.has_value())
+            np.block_private_metadata_endpoints = *b;
+        if (auto a = t.get_string_array("network_policy.metadata_endpoints"); a.has_value())
+            np.metadata_endpoints = *a;
     }
 
     return o;
