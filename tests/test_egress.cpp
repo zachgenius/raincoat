@@ -1235,9 +1235,11 @@ TEST(EgressServerSecurity, RejectsRoutableBind) {
 
 namespace {
 
-// Count entries under /proc/self/fd (a relative measure of open fds).
+// Count entries under /proc/self/fd (a relative measure of open fds). macOS/BSD has no
+// /proc, but /dev/fd lists this process's open descriptors the same way.
 int count_open_fds() {
     DIR* d = ::opendir("/proc/self/fd");
+    if (!d) d = ::opendir("/dev/fd");
     if (!d) return -1;
     int n = 0;
     while (::readdir(d)) ++n;
@@ -1437,6 +1439,10 @@ TEST(EgressAttack2, RejectsDnsNameBind) {
 
 // An alternate 127.0.0.0/8 address is still loopback and must be accepted.
 TEST(EgressAttack2, AcceptsAlternateLoopback) {
+#ifdef __APPLE__
+    GTEST_SKIP() << "macOS binds only 127.0.0.1 as loopback by default; 127.0.0.2 (and the "
+                    "rest of 127/8) needs an explicit `ifconfig lo0 alias`, unlike Linux.";
+#endif
     EgressConfig cfg = make_cfg("http://127.0.0.1:1");
     cfg.bridges[0].child_endpoint = "http://127.0.0.2:0";
     EgressServer server;

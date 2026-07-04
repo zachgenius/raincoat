@@ -22,6 +22,7 @@
 // once the shim dir is prepended.
 
 #include <gtest/gtest.h>
+#include "rc_test_timeout.h"
 
 #include <atomic>
 #include <cerrno>
@@ -58,7 +59,7 @@ std::string make_root(const char* tag) {
 // popen capture (stdout+stderr), wrapped in a hard timeout so a regressed (recursing)
 // shim cannot hang the suite.
 std::string run_capture(const std::string& cmd) {
-    std::string full = "timeout 10 " + cmd + " 2>&1";
+    std::string full = rc_timeout(10) + cmd + " 2>&1";
     std::string out;
     FILE* p = ::popen(full.c_str(), "r");
     if (!p) return out;

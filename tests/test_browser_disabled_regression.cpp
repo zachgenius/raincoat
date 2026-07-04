@@ -9,6 +9,7 @@
 // mechanism is exercised against a fake stub that prints its argv.
 
 #include <gtest/gtest.h>
+#include "rc_test_timeout.h"
 #include <unistd.h>
 
 #include <cstdio>
@@ -48,7 +49,7 @@ BrowserConfig enabled_shims_cfg() {
 // Run `cmd` under a shell (with a hard `timeout` so a regressed shim that recursed
 // cannot hang the suite), returning captured stdout+stderr.
 std::string run_capture(const std::string& cmd) {
-    std::string full = "timeout 10 " + cmd + " 2>&1";
+    std::string full = rc_timeout(10) + cmd + " 2>&1";
     std::string out;
     FILE* p = ::popen(full.c_str(), "r");
     if (!p) return out;

@@ -26,6 +26,7 @@
 // bug, not a hang).
 
 #include <gtest/gtest.h>
+#include "rc_test_timeout.h"
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -56,7 +57,7 @@ std::string make_root() {
 // popen capture (stdout+stderr), wrapped in a hard timeout so a regressed shim that
 // truly recursed cannot hang the suite.
 std::string run_capture(const std::string& cmd) {
-    std::string full = "timeout 10 " + cmd + " 2>&1";
+    std::string full = rc_timeout(10) + cmd + " 2>&1";
     std::string out;
     FILE* p = ::popen(full.c_str(), "r");
     if (!p) return out;
@@ -183,7 +184,7 @@ TEST(BrowserAttack2, DegradedGuardNeverInfiniteLoops) {
 
     // Trailing-slash shim dir, no readlink on PATH, no real msedge anywhere. A regressed
     // (sentinel-less) shim would self-exec forever; `timeout` would then SIGKILL it.
-    const std::string cmd = "timeout -s KILL 5 /usr/bin/env PATH='" + s.shim_dir +
+    const std::string cmd = rc_timeout(5, true) + "/usr/bin/env PATH='" + s.shim_dir +
                             "/:/raincoat-no-such-dir' msedge probe";
     int rc = std::system((cmd + " >/dev/null 2>&1").c_str());
     int code = WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;

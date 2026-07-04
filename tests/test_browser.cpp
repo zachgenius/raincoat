@@ -9,6 +9,7 @@
 // No real browser is ever launched — the stub stands in for it.
 
 #include <gtest/gtest.h>
+#include "rc_test_timeout.h"
 #include <unistd.h>
 
 #include <cstdio>
@@ -49,7 +50,7 @@ bool is_executable(const std::string& path) {
 // Run `cmd` under a shell, returning captured stdout+stderr. Wrapped in `timeout` so a
 // regressed shim that recursed into itself fails the test instead of hanging forever.
 std::string run_capture(const std::string& cmd) {
-    std::string full = "timeout 10 " + cmd + " 2>&1";
+    std::string full = rc_timeout(10) + cmd + " 2>&1";
     std::string out;
     FILE* p = ::popen(full.c_str(), "r");
     if (!p) return out;

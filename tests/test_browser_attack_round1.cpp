@@ -18,6 +18,7 @@
 // mangled; malformed viewports never crash and never emit a flag.
 
 #include <gtest/gtest.h>
+#include "rc_test_timeout.h"
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -54,7 +55,7 @@ std::string read_file(const std::string& path) {
 
 // popen capture (stdout+stderr), wrapped in a hard timeout.
 std::string run_capture(const std::string& cmd) {
-    std::string full = "timeout 10 " + cmd + " 2>&1";
+    std::string full = rc_timeout(10) + cmd + " 2>&1";
     std::string out;
     FILE* p = ::popen(full.c_str(), "r");
     if (!p) return out;
@@ -111,7 +112,7 @@ TEST(BrowserAttack1, RecursionGuardIsSpellingFragile) {
     // refuse to resolve itself and would fall through to "could not find real". The
     // current guard resolves the shim as if it were the real browser and exec-loops.
     // `timeout` SIGKILLs a hung (recursing) shim; a correct shim exits fast on its own.
-    const std::string cmd = "timeout -s KILL 5 env PATH='" + s.shim_dir +
+    const std::string cmd = rc_timeout(5, true) + "env PATH='" + s.shim_dir +
                             "/:/raincoat-no-such-dir' '" + shim + "' probe";
     int rc = std::system((cmd + " >/dev/null 2>&1").c_str());
     int code = WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;

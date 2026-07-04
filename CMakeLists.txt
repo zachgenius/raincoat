@@ -99,5 +99,12 @@ foreach(test_src ${TEST_SOURCES})
   target_include_directories(${test_name} PRIVATE "${CMAKE_SOURCE_DIR}/src")
   target_compile_definitions(${test_name} PRIVATE RC_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   target_link_libraries(${test_name} PRIVATE raincoat_core ${RC_GTEST_LIBS})
+  # On macOS, a GoogleTest dylib in a non-standard prefix (e.g. conda/homebrew) is not
+  # auto-added to the rpath when it sits in an implicit link dir, so bake its directory in
+  # explicitly — otherwise `ctest` fails with a dyld "@rpath/libgtest… not loaded" error.
+  if(APPLE AND TARGET GTest::gtest)
+    set_target_properties(${test_name} PROPERTIES
+      BUILD_RPATH "$<TARGET_FILE_DIR:GTest::gtest>")
+  endif()
   add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
