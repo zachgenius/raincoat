@@ -278,7 +278,8 @@ Verdict: this tool did not get to see you naked.
   *leaving it unset* shows the real system value. The knobs:
   - `cpu_vendor_id` / `cpu_model_name` → `/proc/cpuinfo` (x86; the logical-processor *count* stays
     the host's so thread-pool sizing still works).
-  - `kernel_osrelease` / `kernel_version` → `/proc/version` + `/proc/sys/kernel/{osrelease,version}`.
+  - `kernel_osrelease` / `kernel_version` → `/proc/version` + `/proc/sys/kernel/{osrelease,version}`;
+    `kernel_cmdline` → `/proc/cmdline` (hides the root disk UUID + distro boot image).
   - `machine_id` → `/etc/machine-id` (stable per-install ID); `boot_id` →
     `/proc/sys/kernel/random/boot_id` (per-boot correlation UUID).
   - `mem_total_kb` → `/proc/meminfo`; `uptime_seconds` → `/proc/uptime` + `/proc/loadavg`.

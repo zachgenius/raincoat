@@ -220,6 +220,10 @@ struct BackendConfig {
     // syscall (release/version). Faked if either is set; the unset one stays the host's real.
     std::optional<std::string> kernel_osrelease;       // uname -r
     std::optional<std::string> kernel_version;         // uname -v (build string)
+    // kernel_cmdline -> /proc/cmdline. The boot command line leaks the root/resume disk UUID
+    // (root=UUID=...), the distro (BOOT_IMAGE/initrd path), and hardware boot params — all
+    // stable identifiers. A single static line, so a clean overlay.
+    std::optional<std::string> kernel_cmdline;
     // machine_id -> /etc/machine-id (stable per-install identifier).
     std::optional<std::string> machine_id;
     // boot_id -> /proc/sys/kernel/random/boot_id (per-boot correlation UUID).

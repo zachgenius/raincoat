@@ -265,6 +265,7 @@ std::optional<Options> load_profile(const std::string& path, std::string& err) {
     set_opt_str("backend.cpu_model_name", o.ext.backend.cpu_model_name);
     set_opt_str("backend.kernel_osrelease", o.ext.backend.kernel_osrelease);
     set_opt_str("backend.kernel_version", o.ext.backend.kernel_version);
+    set_opt_str("backend.kernel_cmdline", o.ext.backend.kernel_cmdline);
     set_opt_str("backend.machine_id", o.ext.backend.machine_id);
     set_opt_str("backend.boot_id", o.ext.backend.boot_id);
     set_opt_u64("backend.mem_total_kb", o.ext.backend.mem_total_kb);

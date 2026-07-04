@@ -57,6 +57,8 @@ supervisor exists. To be consistent, the fake values MUST match across both path
 | `/proc/cpuinfo` | CPU model/family/stepping/microcode/MHz/flags (+ ARM `Serial`) | **masked** (`cpu_vendor_id`/`cpu_model_name`, x86) |
 | `/proc/version` | kernel release + **distro build host** + toolchain | **masked** (`kernel_osrelease`/`kernel_version`) |
 | `/proc/sys/kernel/osrelease` · `…/version` · `…/ostype` | `uname` mirror | **masked** (`kernel_osrelease`/`kernel_version`) |
+| `/proc/cmdline` | boot cmdline: **root/resume disk UUID**, distro boot image, hardware params | **masked** (`kernel_cmdline`) |
+| `/proc/stat` | `btime` (boot wall-clock) + per-cpu lines (core count) | **deferred** — a static overlay would freeze the live CPU counters (breaks `top`/`mpstat`), same dynamic-data problem as `mountinfo` |
 | `/proc/sys/kernel/hostname` · `…/domainname` | hostname | UTS namespace (`--unshare-uts --hostname`) |
 | `/etc/machine-id` · `/var/lib/dbus/machine-id` | stable per-install ID | **masked** (`machine_id`) |
 | `/proc/sys/kernel/random/boot_id` | per-boot UUID (correlation) | **masked** (`boot_id`) |

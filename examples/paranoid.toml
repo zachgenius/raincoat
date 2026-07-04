@@ -82,6 +82,7 @@ cpu_vendor_id  = "GenuineIntel"
 cpu_model_name = "Generic x86_64 Processor"
 kernel_osrelease = "6.1.0-generic"
 kernel_version   = "#1 SMP PREEMPT_DYNAMIC Generic"
+kernel_cmdline   = "BOOT_IMAGE=/boot/vmlinuz root=/dev/sda1 ro quiet"
 machine_id     = "0123456789abcdef0123456789abcdef"
 boot_id        = "00000000-0000-4000-8000-000000000000"
 mem_total_kb   = 16777216   # 16 GiB

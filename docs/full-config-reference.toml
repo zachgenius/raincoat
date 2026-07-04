@@ -524,6 +524,9 @@ cpu_model_name = "Generic x86_64 Processor"
 # is set; the unset one stays the host's real value.
 kernel_osrelease = "6.1.0-generic"
 kernel_version = "#1 SMP PREEMPT_DYNAMIC Generic"
+# /proc/cmdline — the boot command line leaks the root/resume disk UUID (root=UUID=...), the
+# distro (BOOT_IMAGE/initrd path) and hardware boot params. A single static line.
+kernel_cmdline = "BOOT_IMAGE=/boot/vmlinuz root=/dev/sda1 ro quiet"
 # /etc/machine-id (stable per-install identifier). A shared constant is non-identifying.
 machine_id = "0123456789abcdef0123456789abcdef"
 # /proc/sys/kernel/random/boot_id (per-boot correlation UUID).

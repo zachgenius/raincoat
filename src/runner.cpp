@@ -1205,6 +1205,7 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     bool cpuinfo_masked = false;
     bool cpuinfo_skipped_arch = false;
     bool kernel_masked = false;
+    bool cmdline_masked = false;
     bool meminfo_masked = false;
     bool uptime_masked = false;
     bool boot_id_masked = false;
@@ -1251,6 +1252,10 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
                 k = write_overlay(".rc-kversion", "/proc/sys/kernel/version",
                                   *bk.kernel_version + "\n");
             kernel_masked = v && r && k;
+        }
+        if (bk.kernel_cmdline) {
+            cmdline_masked =
+                write_overlay(".rc-cmdline", "/proc/cmdline", *bk.kernel_cmdline + "\n");
         }
         if (bk.mem_total_kb) {
             meminfo_masked = write_overlay(".rc-meminfo", "/proc/meminfo",
@@ -1444,6 +1449,11 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             "show a generic kernel (host release + distro build host hidden). Best-effort — "
             "the uname() SYSCALL is NOT faked, so a tool calling it directly still sees the "
             "real kernel; only the /proc file reads are covered.");
+    }
+    if (cmdline_masked) {
+        rec.active_policy_notes.push_back(
+            "/proc/cmdline masked (boot command line hidden — root/resume disk UUID, distro "
+            "boot image, and hardware boot params not exposed).");
     }
     if (etc_machine_id) {
         rec.active_policy_notes.push_back(
