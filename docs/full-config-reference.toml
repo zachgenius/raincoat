@@ -9,11 +9,16 @@
 # should be tolerated, not fatal.
 #
 # Support status (see docs/PROGRESS.md for the live tracker):
-#   APPLIED NOW (phase 1.5): profile_name, strict, network(off|full), keep_temp, workdir,
-#     [identity], [filesystem] (allow_read/allow_write/deny/mode/fake_home/create_standard_dirs),
+#   APPLIED NOW: profile_name, strict, network(off|full), keep_temp, workdir,
+#     [identity], [filesystem] (allow_read/allow_write/deny/mode, remap_cwd, [[filesystem.mount]]),
 #     [environment] (clear/allow/deny/scrub_patterns/[environment.set]), [fontconfig],
-#     [audit] (log_file/redact_*/log_*/format), [backend] (bwrap_path/unshare_*/mount_*/
-#     die_with_parent; seccomp reserved), [init], [report].
+#     [audit] (log_file/redact_*/log_*/format), [init], [report],
+#     [backend]: bwrap_path/unshare_*/mount_*/die_with_parent (seccomp reserved), PLUS the
+#     value-driven machine-fingerprint masks — cpu_vendor_id/cpu_model_name/cpu_count,
+#     kernel_osrelease/kernel_version/kernel_cmdline, machine_id, boot_id, mem_total_kb,
+#     uptime_seconds. On x86_64 the kernel/mem/uptime/cpu_count values are also enforced at the
+#     SYSCALL level (uname/sysinfo/sched_getaffinity) via a seccomp user-notify supervisor.
+#     See docs/FINGERPRINT-SYSCALLS.md and docs/MOUNT-REMAP.md.
 #   PARSED + RESERVED (honest "configured, not yet enforced"): [filesystem.tripwire], [browser],
 #     [dns], network modes "proxy"/"bridge"/"guarded".
 #   PHASE 2 (egress bridge forwarding): [egress] + [[egress.bridge]] actual HTTP forwarding.

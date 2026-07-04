@@ -29,6 +29,33 @@ TZ = "UTC"
 LANG = "en_US.UTF-8"
 LC_ALL = "en_US.UTF-8"
 
+# --- Machine fingerprint: present a generic machine identity ----------------
+# Value-driven — each key sets what the child sees; OMIT (or comment out) a key
+# to show the real system value. This masks CPU, kernel, RAM, uptime, machine-id
+# and boot-id, so an untrusted tool learns a generic machine, not yours. On
+# x86_64 the kernel/mem/cpu_count/uptime values are also enforced at the SYSCALL
+# level (uname/sysinfo/sched_getaffinity), so even a static/Go binary sees them.
+# See docs/FINGERPRINT-SYSCALLS.md.
+[backend]
+cpu_vendor_id    = "GenuineIntel"
+cpu_model_name   = "Generic x86_64 Processor"
+cpu_count        = 8
+kernel_osrelease = "6.1.0-generic"
+kernel_version   = "#1 SMP PREEMPT_DYNAMIC Generic"
+kernel_cmdline   = "BOOT_IMAGE=/boot/vmlinuz root=/dev/sda1 ro quiet"
+machine_id       = "0123456789abcdef0123456789abcdef"
+boot_id          = "00000000-0000-4000-8000-000000000000"
+mem_total_kb     = 16777216   # 16 GiB
+uptime_seconds   = 3600
+
+# --- OPTIONAL: hide your username from the working-dir path -----------------
+# When you grant the tool a path, remap_cwd presents the working directory at a
+# neutral mount point (e.g. /work) instead of /home/you/... so the tool can't
+# read your username via pwd/realpath/$PWD. Opt-in: absolute-path command args
+# that reference the real host path won't resolve. See docs/MOUNT-REMAP.md.
+# [filesystem]
+# remap_cwd = "/work"
+
 [fontconfig]
 enabled = true
 

@@ -58,6 +58,12 @@ deny = [
   "~/.ssh", "~/.aws", "~/.config/gcloud", "~/.kube", "~/.gnupg",
   "~/.docker", "~/.npmrc", "~/.git-credentials", "~/.gitconfig", "~/.config/gh",
 ]
+# When you DO grant the tool a path (via allow_read/allow_write), present it at a
+# neutral mount point so the child can't read your username/layout via pwd/
+# realpath. Opt-in: absolute-path command args referencing the real host path
+# won't resolve. See docs/MOUNT-REMAP.md. (deny-by-default mounts nothing until
+# you add a path, so this stays inert until then.)
+# remap_cwd = "/work"
 
 # --- Tripwire: plant inert decoy "credentials" in the fake home -------------
 # Harmless bait files (clearly labelled "not a real credential") placed inside
