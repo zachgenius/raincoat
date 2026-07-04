@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -43,6 +44,35 @@ std::string join_command(const std::vector<std::string>& cmd) {
         ss << cmd[i];
     }
     return ss.str();
+}
+
+// Spawn one probe under sandbox-exec with the given argv (silencing its output) and return
+// its exit status, or -1 if it could not be run/reaped. Used by the macOS fail-closed
+// pre-flight check to EMPIRICALLY verify the generated profile denies what it claims —
+// substituting for the structural certainty a mount namespace gives on Linux.
+int run_sandbox_probe(const std::vector<std::string>& argv) {
+    std::vector<char*> cargv;
+    cargv.reserve(argv.size() + 1);
+    for (const auto& s : argv) cargv.push_back(const_cast<char*>(s.c_str()));
+    cargv.push_back(nullptr);
+    pid_t pid = ::fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        int devnull = ::open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            ::dup2(devnull, STDOUT_FILENO);
+            ::dup2(devnull, STDERR_FILENO);
+            if (devnull > STDERR_FILENO) ::close(devnull);
+        }
+        ::execvp(cargv[0], cargv.data());
+        _exit(127);
+    }
+    int status = 0;
+    while (::waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) return -1;
+    }
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    return -1;
 }
 
 // True when `path` is exactly `mount` or lives beneath it (identity mapping).
@@ -1168,6 +1198,47 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             plan->profile_path,
             std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
             std::filesystem::perm_options::replace, pec);
+    }
+
+    // ---- 8c. Fail-closed pre-flight probe (Filter backends only) ---------
+    // A Filter backend (Seatbelt) hides paths by DENYING access over the real filesystem,
+    // so a canonicalization/rule mistake fails OPEN — a silent leak that would still audit
+    // as "hidden". Before running the user's command, spawn a throwaway probe under the
+    // IDENTICAL profile that tries the two invariants this run claims: read the real $HOME,
+    // and (when the network is meant to be restricted) connect to a public IP. If either
+    // SUCCEEDS, refuse the run. This restores Linux's fail-closed guarantee with a measured,
+    // per-run check. It also catches an OS/SBPL regression that silently stops enforcing.
+    if (caps.fs_hiding == FsHiding::Filter && !plan->profile_text.empty()) {
+        const bool net_restricted = (cfg.net == NetMode::Off) || mac_kernel_firewall;
+        // $1 = real home (skip if empty); $2 = 1 when the network must be blocked. Exit 10 =
+        // home readable (FS leak); 11 = outbound reachable (net leak); 0 = both denied.
+        const char* script =
+            "if [ -n \"$1\" ] && /bin/ls \"$1\" >/dev/null 2>&1; then exit 10; fi\n"
+            "if [ \"$2\" = 1 ] && /usr/bin/nc -G2 -w2 -z 1.1.1.1 443 >/dev/null 2>&1; then "
+            "exit 11; fi\n"
+            "exit 0\n";
+        std::vector<std::string> probe_argv = {
+            *backend_path, "-f", plan->profile_path, "--",
+            "/bin/sh", "-c", script, "sh", real_home, net_restricted ? "1" : "0"};
+        int pr = run_sandbox_probe(probe_argv);
+        if (pr != 0) {
+            if (pr == 10) {
+                err = "Error: pre-flight sandbox probe FAILED — the profile did not deny "
+                      "access to your real home directory (" + real_home +
+                      "). Refusing to run the command (fail-closed) rather than leak it.";
+            } else if (pr == 11) {
+                err = "Error: pre-flight sandbox probe FAILED — the profile did not block "
+                      "outbound network access as required. Refusing to run (fail-closed).";
+            } else {
+                err = "Error: pre-flight sandbox probe could not confirm the sandbox is "
+                      "effective (sandbox-exec returned " + std::to_string(pr) +
+                      "). Refusing to run (fail-closed). Run `raincoat doctor`.";
+            }
+            std::cerr << err << "\n";
+            cleanup_root();
+            restore_signals();
+            return 1;
+        }
     }
 
     // ---- 9. Audit record -------------------------------------------------
