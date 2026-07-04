@@ -171,12 +171,32 @@ identity remain Tier 3 / hardware-rooted.
 
 ## Implementation roadmap
 
-- [x] Tier 1, Linux: `/proc/cpuinfo`, `/proc/version` + `uname` file mirror, `/etc/machine-id`
-- [x] Tier 2, Linux: `uname(2)` via seccomp user-notify (set `kernel_osrelease`/`kernel_version`)
-- [x] Tier 2, Linux: `sysinfo(2)` (set `mem_total_kb`/`uptime_seconds`) + paired `/proc/meminfo`, `/proc/uptime`, `/proc/loadavg` overlays
-- [x] Tier 1, Linux: `boot_id` overlay (set `boot_id`)
-- [ ] Tier 1, Linux: `/proc/self/mountinfo` — **blocked**: bind-overlay can't follow the per-reader `self` indirection (verified), and there's no syscall to trap. Needs a different mechanism (mount cwd at a generic path; strip host paths from binds).
+**Done (Linux, value-driven — set the value to mask, omit for the real system value):**
+
+- [x] Tier 1: `/proc/cpuinfo` (`cpu_vendor_id`/`cpu_model_name`)
+- [x] Tier 1: `/proc/version` + `/proc/sys/kernel/{osrelease,version}` (`kernel_osrelease`/`kernel_version`)
+- [x] Tier 1: `/proc/cmdline` — root/resume disk UUID + distro boot image (`kernel_cmdline`)
+- [x] Tier 1: `/etc/machine-id` (`machine_id`); `/proc/sys/kernel/random/boot_id` (`boot_id`)
+- [x] Tier 1: `/proc/meminfo` (`mem_total_kb`); `/proc/uptime` + `/proc/loadavg` (`uptime_seconds`)
+- [x] Tier 2: `uname(2)` via seccomp user-notify (`kernel_osrelease`/`kernel_version`)
+- [x] Tier 2: `sysinfo(2)` via seccomp user-notify (`mem_total_kb`/`uptime_seconds`)
+- [x] Path de-identification: `[filesystem].remap_cwd` + `[[filesystem.mount]]` present host paths at neutral sandbox paths (see `MOUNT-REMAP.md`)
+- [x] Not exposed at all: DMI serials / product UUID / MAC (Raincoat never mounts `/sys`)
+
+**Open (candidates):**
+
+- [ ] Tier 1 + Tier 2: **CPU core count** — `/proc/cpuinfo` block count + `sched_getaffinity(2)` (nproc). *In progress.*
 - [ ] `uname` on non-x86 arches (per-arch syscall numbers)
-- [ ] macOS `DYLD_INSERT_LIBRARIES` interposer (`sysctl`, `gethostuuid`, IOKit)
-- [ ] Windows API-hook layer (`MachineGuid`, SMBIOS, WMI)
-- [ ] Tier 3 — explicit non-goal (needs a VM/hypervisor)
+
+**Blocked / deferred (no clean mechanism):**
+
+- [ ] `/proc/self/mountinfo`, `/proc/mounts` — per-reader `self` indirection defeats bind-overlay (verified); no syscall to trap. `remap_cwd` mitigates the *mount-point* path; the mount-*source* field and `uid=`/device remain.
+- [ ] `/proc/stat` — a static overlay would freeze the live CPU counters (`btime` is the only static leak; not worth breaking `top`/`mpstat`).
+- [ ] `statfs`/`statvfs` syscalls — the path/fd argument resolves in the *child's* mount namespace, so the parent-side supervisor can't baseline the real result cleanly.
+- [ ] `getuid`/`getgid`, `sched_setaffinity`, `clock_gettime(CLOCK_BOOTTIME)` — faking these breaks permission/thread/timing logic; the right tool for uid is `--unshare-user` mapping, not a fake.
+
+**Off-platform / non-goal:**
+
+- [ ] macOS `DYLD_INSERT_LIBRARIES` interposer (`sysctl`, `gethostuuid`, IOKit) — separate effort
+- [ ] Windows API-hook layer (`MachineGuid`, SMBIOS, WMI) — separate effort
+- [ ] Tier 3 (`CPUID`/`RDTSC`/`RDRAND`) — needs a VM/hypervisor; explicit non-goal
