@@ -272,6 +272,14 @@ Verdict: this tool did not get to see you naked.
 - **A minimal `/etc`.** The child sees a generic `/etc/hostname` (`sandbox`), a generic
   `/etc/hosts`, and an `/etc/localtime` pinned to the resolved timezone — so your real machine
   name and host file never leak through `/etc`.
+- **Your CPU.** On x86 hosts, `/proc/cpuinfo` is shadowed with a generic block, so the child
+  reads a neutral `Generic x86_64 Processor` instead of your exact CPU model, stepping,
+  microcode, clock, and flags (a strong, trivially-read machine fingerprint). The
+  logical-processor *count* is preserved so tools that size thread pools still work. Toggle with
+  `[backend].fake_cpuinfo`. **Honest caveat:** this is best-effort normalization — the `uname()`
+  kernel/arch string is **not** faked (bwrap can't intercept the syscall), and other `/proc` and
+  `/sys` entries remain the host's. On non-x86 hosts the real `/proc/cpuinfo` is left in place
+  (a wrong-arch fake would mislead tools more than the leak it prevents).
 - **The filesystem.** Only the paths you allow (plus the CWD in non-strict mode) are visible.
   `--allow-read` is read-only; `--allow-write` is read-write. A `[filesystem].mode =
   "deny-by-default"` profile drops even the CWD auto-mount, and optional `[filesystem.tripwire]`

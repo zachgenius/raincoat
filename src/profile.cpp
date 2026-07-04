@@ -244,6 +244,7 @@ std::optional<Options> load_profile(const std::string& path, std::string& err) {
     set_backend_bool("backend.unshare_net_when_off",
                      o.ext.backend.unshare_net_when_off);
     set_backend_bool("backend.mount_proc", o.ext.backend.mount_proc);
+    set_backend_bool("backend.fake_cpuinfo", o.ext.backend.fake_cpuinfo);
     set_backend_bool("backend.mount_dev", o.ext.backend.mount_dev);
     set_backend_bool("backend.mount_tmpfs_tmp", o.ext.backend.mount_tmpfs_tmp);
     set_backend_bool("backend.die_with_parent", o.ext.backend.die_with_parent);

@@ -18,7 +18,8 @@ std::vector<std::string> build_bwrap_argv(const std::string& bwrap_path, const C
                                           const std::string& mask_empty_file = "",
                                           const std::vector<std::string>& mask_files = {},
                                           const std::vector<std::string>& curated_font_dirs = {},
-                                          bool mask_usr_local_fonts = true);
+                                          bool mask_usr_local_fonts = true,
+                                          const std::string& fake_cpuinfo_file = "");
 
 // PURE. Render the bwrap argv as a display-safe string for the audit log. Every
 // `--setenv <NAME> <VALUE>` value is redacted to `<redacted>` (the NAME is shown)

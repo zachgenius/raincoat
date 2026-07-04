@@ -12,9 +12,11 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <sys/stat.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -68,6 +70,62 @@ std::string default_or_empty(const std::map<std::string, std::string>& m,
                              const std::string& key) {
     auto it = m.find(key);
     return it == m.end() ? std::string() : it->second;
+}
+
+// True on x86 hosts (the only arch for which we synthesize a plausible /proc/cpuinfo).
+// On other arches (arm64, riscv, ...) the cpuinfo format differs enough that a wrong
+// generic block would confuse tools more than the leak it prevents, so we leave the
+// real file in place there. `uname -m` is the host machine string.
+bool host_is_x86() {
+    struct utsname u{};
+    if (::uname(&u) != 0) return false;
+    const std::string m = u.machine;
+    return m == "x86_64" || m == "amd64" || m == "i386" || m == "i486" ||
+           m == "i586" || m == "i686";
+}
+
+// Build a generic x86_64 /proc/cpuinfo with `nproc` identical logical processors. It
+// masks the host's real CPU model/family/stepping/microcode/MHz/cache/bogomips (a
+// strong machine fingerprint) while keeping the logical-processor COUNT and a common
+// baseline flag set, so tools that size thread pools from cpuinfo or probe for SSE2
+// still behave. Two different machines with the same core count emit byte-identical
+// output — that is the anti-fingerprint goal. Not meant to be a faithful CPU report.
+std::string generic_cpuinfo(unsigned nproc) {
+    if (nproc == 0) nproc = 1;
+    const char* kFlags =
+        "fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 "
+        "clflush mmx fxsr sse sse2 ht syscall nx lm constant_tsc";
+    std::ostringstream ss;
+    for (unsigned i = 0; i < nproc; ++i) {
+        ss << "processor\t: " << i << "\n"
+           << "vendor_id\t: GenuineIntel\n"
+           << "cpu family\t: 6\n"
+           << "model\t\t: 60\n"
+           << "model name\t: Generic x86_64 Processor\n"
+           << "stepping\t: 3\n"
+           << "microcode\t: 0x1\n"
+           << "cpu MHz\t\t: 2000.000\n"
+           << "cache size\t: 8192 KB\n"
+           << "physical id\t: 0\n"
+           << "siblings\t: " << nproc << "\n"
+           << "core id\t\t: " << i << "\n"
+           << "cpu cores\t: " << nproc << "\n"
+           << "apicid\t\t: " << i << "\n"
+           << "initial apicid\t: " << i << "\n"
+           << "fpu\t\t: yes\n"
+           << "fpu_exception\t: yes\n"
+           << "cpuid level\t: 13\n"
+           << "wp\t\t: yes\n"
+           << "flags\t\t: " << kFlags << "\n"
+           << "bugs\t\t:\n"
+           << "bogomips\t: 4000.00\n"
+           << "clflush size\t: 64\n"
+           << "cache_alignment\t: 64\n"
+           << "address sizes\t: 39 bits physical, 48 bits virtual\n"
+           << "power management:\n"
+           << "\n";
+    }
+    return ss.str();
 }
 
 // Terminating-signal handling for sandbox cleanup. When raincoat is interrupted
@@ -1091,10 +1149,35 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         mask_usr_local_fonts =
             std::filesystem::is_directory("/usr/local/share/fonts", lec) && !lec;
     }
+
+    // Generic /proc/cpuinfo mask. When proc is mounted and the profile keeps
+    // fake_cpuinfo on (default), synthesize a generic cpuinfo on the host and let
+    // build_bwrap_argv bind it over the real one, so the child cannot read the host's
+    // exact CPU as a fingerprint. Only on x86 hosts (see host_is_x86); elsewhere the
+    // file stays empty and cpuinfo is left untouched. Non-fatal: any write failure just
+    // leaves the real cpuinfo exposed (best-effort, like the other masks).
+    std::string fake_cpuinfo_file;
+    bool cpuinfo_masked = false;
+    bool cpuinfo_skipped_arch = false;
+    if (cfg.ext.backend.mount_proc && cfg.ext.backend.fake_cpuinfo) {
+        if (host_is_x86()) {
+            const std::string path = root + "/.rc-cpuinfo";
+            std::ofstream cf(path, std::ios::binary | std::ios::trunc);
+            cf << generic_cpuinfo(std::thread::hardware_concurrency());
+            if (cf) {
+                fake_cpuinfo_file = path;
+                cpuinfo_masked = true;
+            }
+        } else {
+            cpuinfo_skipped_arch = true;
+        }
+    }
+
     std::vector<std::string> argv =
         build_bwrap_argv(*bwrap_path, cfg_copy, mounts, env, fake_home, sandbox_tmp,
                          binds_resolv_conf(cfg.net), font.dir, mask_dir, sandbox_out,
-                         mask_empty_file, mask_files, font.font_dirs, mask_usr_local_fonts);
+                         mask_empty_file, mask_files, font.font_dirs, mask_usr_local_fonts,
+                         fake_cpuinfo_file);
 
     // ---- 8b. Isolated-netns wrapping (pasta) -----------------------------
     // In jail mode the child runs inside pasta's private network namespace: prepend
@@ -1248,6 +1331,17 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         if (etc_localtime) add("localtime");
         rec.active_policy_notes.push_back(
             "Minimal /etc provided (generic, host /etc never exposed): " + files);
+    }
+    if (cpuinfo_masked) {
+        rec.active_policy_notes.push_back(
+            "/proc/cpuinfo masked with a generic block (host CPU model/stepping/"
+            "microcode/MHz/flags hidden; logical-processor count preserved). Best-"
+            "effort fingerprint reduction — the uname() kernel/arch string is NOT "
+            "faked and other /proc and /sys entries remain the host's.");
+    } else if (cpuinfo_skipped_arch) {
+        rec.active_policy_notes.push_back(
+            "/proc/cpuinfo left unmasked: fake_cpuinfo only synthesizes an x86 block, "
+            "and this is a non-x86 host where a wrong-arch fake would mislead tools.");
     }
 
     // Egress bridge transparency. Honest network-model disclosure + one summary per

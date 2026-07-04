@@ -502,6 +502,12 @@ unshare_net_when_off = true
 
 # Mount basic virtual filesystems.
 mount_proc = true
+# Shadow /proc/cpuinfo with a generic block so the child cannot read the host's exact
+# CPU (model/stepping/microcode/MHz/flags) as a fingerprint. The logical-processor
+# COUNT is preserved so tools that size thread pools still work. Only takes effect when
+# mount_proc = true and the host is x86 (a wrong-arch fake would mislead tools, so it is
+# skipped elsewhere). Best-effort: the uname() kernel/arch string is NOT faked.
+fake_cpuinfo = true
 mount_dev = true
 mount_tmpfs_tmp = true
 

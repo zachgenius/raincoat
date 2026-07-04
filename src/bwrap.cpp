@@ -33,7 +33,8 @@ std::vector<std::string> build_bwrap_argv(const std::string& bwrap_path, const C
                                           const std::string& mask_empty_file,
                                           const std::vector<std::string>& mask_files,
                                           const std::vector<std::string>& curated_font_dirs,
-                                          bool mask_usr_local_fonts) {
+                                          bool mask_usr_local_fonts,
+                                          const std::string& fake_cpuinfo_file) {
     std::vector<std::string> a;
     auto p1 = [&](const std::string& x) { a.push_back(x); };
     auto p2 = [&](const std::string& x, const std::string& y) {
@@ -114,7 +115,18 @@ std::vector<std::string> build_bwrap_argv(const std::string& bwrap_path, const C
         for (const auto& d : curated_font_dirs) p3("--ro-bind", d, d);
     }
 
-    if (backend.mount_proc) p2("--proc", "/proc");
+    if (backend.mount_proc) {
+        p2("--proc", "/proc");
+        // Shadow /proc/cpuinfo with a generic block so the child cannot read the host's
+        // exact CPU model/stepping/microcode/MHz/flags — a strong, trivially-read machine
+        // fingerprint that --proc alone (a real host procfs) leaves fully exposed. The
+        // fake file is a raincoat-created generic cpuinfo on the host; the bind MUST come
+        // AFTER --proc so it overlays the freshly-mounted procfs entry. Empty when the
+        // runner did not synthesize one (fake_cpuinfo disabled, or a non-x86 host where a
+        // wrong-arch fake would be worse than the leak), in which case cpuinfo is untouched.
+        if (!fake_cpuinfo_file.empty())
+            p3("--ro-bind", fake_cpuinfo_file, "/proc/cpuinfo");
+    }
     if (backend.mount_dev) p2("--dev", "/dev");
 
     // TLS trust store; DNS resolver (only when requested).

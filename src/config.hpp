@@ -204,6 +204,7 @@ struct BackendConfig {
     bool unshare_cgroup = false;
     bool unshare_net_when_off = true;   // honor NetMode::Off with --unshare-net
     bool mount_proc     = true;
+    bool fake_cpuinfo   = true;         // shadow /proc/cpuinfo with a generic block (x86 hosts)
     bool mount_dev      = true;
     bool mount_tmpfs_tmp = true;
     bool die_with_parent = true;
