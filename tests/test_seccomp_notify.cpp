@@ -17,29 +17,43 @@ using namespace raincoat;
 // BPF program shape (x86_64): traps uname as USER_NOTIF, everything else ALLOW.
 // ---------------------------------------------------------------------------
 
-#if defined(__x86_64__)
-TEST(SeccompNotify, ProgramTrapsUnameAllowsRest) {
-    auto p = build_uname_filter_program();
-    ASSERT_EQ(p.size(), 6u);
-    // Structure: LD arch / JEQ arch / LD nr / JEQ uname / RET USER_NOTIF / RET ALLOW.
-    EXPECT_EQ(p[0].code, (BPF_LD | BPF_W | BPF_ABS));
-    EXPECT_EQ(p[1].code, (BPF_JMP | BPF_JEQ | BPF_K));
-    EXPECT_EQ(p[3].code, (BPF_JMP | BPF_JEQ | BPF_K));
-    EXPECT_EQ(p[4].code, (BPF_RET | BPF_K));
-    EXPECT_EQ(p[4].k, static_cast<__u32>(SECCOMP_RET_USER_NOTIF));
-    EXPECT_EQ(p[5].code, (BPF_RET | BPF_K));
-    EXPECT_EQ(p[5].k, static_cast<__u32>(SECCOMP_RET_ALLOW));
+// Count RET instructions with a given k value.
+static int countRet(const std::vector<sock_filter>& p, __u32 k) {
+    int c = 0;
+    for (const auto& i : p)
+        if (i.code == (BPF_RET | BPF_K) && i.k == k) ++c;
+    return c;
 }
 
-TEST(SeccompNotify, SupportedOnX86) { EXPECT_TRUE(seccomp_uname_supported()); }
+#if defined(__x86_64__)
+TEST(SeccompNotify, ProgramTrapsRequestedSyscalls) {
+    // uname only: one USER_NOTIF match arm.
+    auto u = build_identity_filter_program(true, false);
+    EXPECT_EQ(u[0].code, (BPF_LD | BPF_W | BPF_ABS));  // load arch first
+    EXPECT_EQ(countRet(u, static_cast<__u32>(SECCOMP_RET_USER_NOTIF)), 1);
+    EXPECT_EQ(countRet(u, static_cast<__u32>(SECCOMP_RET_ALLOW)), 1);
+
+    // both: still a single shared USER_NOTIF return, reached by two JEQ arms.
+    auto both = build_identity_filter_program(true, true);
+    EXPECT_EQ(countRet(both, static_cast<__u32>(SECCOMP_RET_USER_NOTIF)), 1);
+    // Two JEQ-on-nr arms => `both` is longer than the uname-only program.
+    EXPECT_GT(both.size(), u.size());
+}
+
+TEST(SeccompNotify, NeitherTrapIsPureAllow) {
+    auto p = build_identity_filter_program(false, false);
+    EXPECT_EQ(countRet(p, static_cast<__u32>(SECCOMP_RET_USER_NOTIF)), 0);
+    EXPECT_GE(countRet(p, static_cast<__u32>(SECCOMP_RET_ALLOW)), 1);
+}
+
+TEST(SeccompNotify, SupportedOnX86) { EXPECT_TRUE(seccomp_identity_supported()); }
 #endif
 
-TEST(SeccompNotify, ProgramEndsInAllow) {
+TEST(SeccompNotify, ProgramEndsInARet) {
     // On any arch the program must terminate in a RET (never fall off the end).
-    auto p = build_uname_filter_program();
+    auto p = build_identity_filter_program(true, true);
     ASSERT_FALSE(p.empty());
     EXPECT_EQ(p.back().code, (BPF_RET | BPF_K));
-    EXPECT_EQ(p.back().k, static_cast<__u32>(SECCOMP_RET_ALLOW));
 }
 
 // ---------------------------------------------------------------------------

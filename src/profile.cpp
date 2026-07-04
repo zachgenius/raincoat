@@ -8,6 +8,8 @@
 // merge combines a profile Options with a CLI Options where CLI wins.
 #include "profile.hpp"
 
+#include <cerrno>
+#include <cstdlib>
 #include <exception>
 #include <fstream>
 #include <set>
@@ -258,6 +260,19 @@ std::optional<Options> load_profile(const std::string& path, std::string& err) {
     if (auto s = t.get_string("backend.machine_id"); s.has_value())
         o.ext.backend.machine_id = *s;
     set_backend_bool("backend.fake_uname", o.ext.backend.fake_uname);
+    set_backend_bool("backend.fake_sysinfo", o.ext.backend.fake_sysinfo);
+    set_backend_bool("backend.fake_meminfo", o.ext.backend.fake_meminfo);
+    set_backend_bool("backend.fake_uptime", o.ext.backend.fake_uptime);
+    set_backend_bool("backend.fake_boot_id", o.ext.backend.fake_boot_id);
+    if (auto s = t.get_string("backend.mem_total_kb"); s.has_value()) {
+        errno = 0;
+        char* end = nullptr;
+        const unsigned long long v = std::strtoull(s->c_str(), &end, 10);
+        if (errno == 0 && end != s->c_str() && *end == '\0')
+            o.ext.backend.mem_total_kb = static_cast<std::uint64_t>(v);
+    }
+    if (auto s = t.get_string("backend.boot_id"); s.has_value())
+        o.ext.backend.boot_id = *s;
     set_backend_bool("backend.mount_dev", o.ext.backend.mount_dev);
     set_backend_bool("backend.mount_tmpfs_tmp", o.ext.backend.mount_tmpfs_tmp);
     set_backend_bool("backend.die_with_parent", o.ext.backend.die_with_parent);

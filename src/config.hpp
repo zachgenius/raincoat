@@ -8,6 +8,7 @@
 // DO NOT put logic with side effects here. Keep it declarative.
 #pragma once
 
+#include <cstdint>
 #include <map>
 #include <optional>
 #include <string>
@@ -230,6 +231,18 @@ struct BackendConfig {
     // and is x86_64-only. See docs/FINGERPRINT-SYSCALLS.md. The presented values reuse
     // kernel_osrelease / kernel_version / the identity hostname.
     bool fake_uname = false;
+    // Syscall-level (Tier 2) mask for sysinfo(2): intercept the syscall and return generic
+    // uptime/RAM/proc-count. OFF by default (heavier seccomp path + faking RAM can affect
+    // memory-sizing tools). x86_64-only. Pairs with the /proc/meminfo + /proc/uptime overlays.
+    bool fake_sysinfo = false;
+    // Tier-1 /proc overlays for memory/uptime/boot identity. meminfo/uptime default OFF
+    // (faking RAM/uptime can surprise tools); boot_id default ON (a pure per-boot correlation
+    // UUID — nothing depends on its value, so masking it never breaks anything).
+    bool fake_meminfo = false;   // /proc/meminfo
+    bool fake_uptime = false;    // /proc/uptime + /proc/loadavg
+    bool fake_boot_id = true;    // /proc/sys/kernel/random/boot_id
+    std::uint64_t mem_total_kb = 16ull * 1024 * 1024;  // 16 GiB; shared by sysinfo + meminfo
+    std::string boot_id = "00000000-0000-4000-8000-000000000000";
     bool mount_dev      = true;
     bool mount_tmpfs_tmp = true;
     bool die_with_parent = true;

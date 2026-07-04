@@ -282,12 +282,19 @@ Verdict: this tool did not get to see you naked.
   `uname()` **syscall** directly (e.g. a static or Go binary) would still see the real kernel. To
   close that too, enable `[backend].fake_uname` (below). (Your host's DMI serials, product UUID,
   and MAC addresses do *not* leak at all, because Raincoat never mounts `/sys` into the sandbox.)
-- **Your kernel, at the syscall level** *(opt-in, x86_64)*. `[backend].fake_uname = true` installs
-  a **seccomp user-notify** supervisor that intercepts the `uname(2)` syscall itself and returns the
-  same generic kernel/hostname the `/proc` masks show — so even a statically-linked or Go binary
-  issuing the raw syscall (which an `LD_PRELOAD` shim would miss) gets the fake. It's off by default
-  because it installs a seccomp filter plus a supervisor thread; see `docs/FINGERPRINT-SYSCALLS.md`
-  for the full catalogue of identification vectors across Linux/macOS/Windows and the roadmap.
+- **Your memory, uptime, and boot ID.** The per-boot correlation UUID at
+  `/proc/sys/kernel/random/boot_id` is presented as a constant by default (`[backend].fake_boot_id`)
+  — nothing depends on its value, so masking it never breaks anything. Opt-in
+  `[backend].fake_meminfo` and `[backend].fake_uptime` additionally mask `/proc/meminfo` (host RAM
+  size) and `/proc/uptime` + `/proc/loadavg` with generic, self-consistent values
+  (`[backend].mem_total_kb`).
+- **Your kernel and memory, at the syscall level** *(opt-in, x86_64)*. `[backend].fake_uname` and
+  `[backend].fake_sysinfo` install a **seccomp user-notify** supervisor that intercepts the
+  `uname(2)` and `sysinfo(2)` syscalls themselves and returns the same generic kernel/RAM/uptime the
+  `/proc` masks show — so even a statically-linked or Go binary issuing the raw syscall (which an
+  `LD_PRELOAD` shim would miss) gets the fake. Off by default because they install a seccomp filter
+  plus a supervisor thread; see `docs/FINGERPRINT-SYSCALLS.md` for the full catalogue of
+  identification vectors across Linux/macOS/Windows, the three-tier model, and the roadmap.
   **Honest caveat — the hard floor:** CPU *instructions* like `CPUID`/`RDTSC` execute in user mode
   and never trap, so they can't be faked without a hypervisor (a VM) — a deliberate non-goal.
 - **Your CPU.** On x86 hosts, `/proc/cpuinfo` is shadowed with a generic block, so the child

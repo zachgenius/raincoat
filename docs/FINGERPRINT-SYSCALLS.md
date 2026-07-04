@@ -41,7 +41,7 @@ supervisor exists. To be consistent, the fake values MUST match across both path
 | Syscall (`x86_64 nr`) | Exposes | How we fake it | Status |
 |---|---|---|---|
 | `uname(2)` (63) | `sysname`, `nodename` (hostname), `release` (kernel), `version` (build string), `machine` (arch), `domainname` | seccomp user-notify: write a fake `struct new_utsname` into the child's buffer | **implemented** (`backend.fake_uname`) |
-| `sysinfo(2)` (99) | `uptime`, load avg, `totalram`/`freeram` (RAM size), swap, process count | seccomp user-notify: write fake `struct sysinfo` | planned |
+| `sysinfo(2)` (99) | `uptime`, load avg, `totalram`/`freeram` (RAM size), swap, process count | seccomp user-notify: write fake `struct sysinfo` | **implemented** (`backend.fake_sysinfo`) |
 | `sched_getaffinity(2)` (204) | logical CPU count (`nproc`) | seccomp user-notify: rewrite the returned cpu-set | planned (risky — breaks pool sizing) |
 | `getcpu(2)` (309) | current CPU/NUMA node → topology inference | user-notify: pin to 0 | low value |
 | `clock_gettime(CLOCK_BOOTTIME)` / `CLOCK_MONOTONIC` | uptime, boot correlation | hard — faking time breaks programs; only offset-able | not planned |
@@ -59,8 +59,8 @@ supervisor exists. To be consistent, the fake values MUST match across both path
 | `/proc/sys/kernel/osrelease` · `…/version` · `…/ostype` | `uname` mirror | **masked** (`fake_kernel`) |
 | `/proc/sys/kernel/hostname` · `…/domainname` | hostname | UTS namespace (`--unshare-uts --hostname`) |
 | `/etc/machine-id` · `/var/lib/dbus/machine-id` | stable per-install ID | **masked** (`fake_machine_id`, constant) |
-| `/proc/sys/kernel/random/boot_id` | per-boot UUID (correlation) | planned (overlay) |
-| `/proc/meminfo` · `/proc/uptime` · `/proc/loadavg` | RAM size, uptime, load | planned (overlay, pairs with `sysinfo`) |
+| `/proc/sys/kernel/random/boot_id` | per-boot UUID (correlation) | **masked** (`fake_boot_id`, default on) |
+| `/proc/meminfo` · `/proc/uptime` · `/proc/loadavg` | RAM size, uptime, load | **masked** (`fake_meminfo` / `fake_uptime`) |
 | `/proc/self/mountinfo` · `/proc/mounts` | **host mount layout + real paths** (strong deanon vector) | partially reduced by bwrap's own mounts; overlay planned |
 | `/sys/class/dmi/id/*` (`product_uuid`, `product_serial`, `board_serial`, `chassis_serial`, `sys_vendor`, `product_name`) | SMBIOS/DMI serials + **product UUID** | **not exposed** — Raincoat never mounts `/sys` |
 | `/sys/class/net/*/address` | interface **MAC** | **not exposed** — no `/sys` mount |
@@ -171,8 +171,9 @@ identity remain Tier 3 / hardware-rooted.
 
 - [x] Tier 1, Linux: `/proc/cpuinfo`, `/proc/version` + `uname` file mirror, `/etc/machine-id`
 - [x] Tier 2, Linux: `uname(2)` via seccomp user-notify (`backend.fake_uname`)
-- [ ] Tier 2, Linux: `sysinfo(2)` (+ paired `/proc/meminfo`, `/proc/uptime` overlays)
-- [ ] Tier 1, Linux: `boot_id`, `mountinfo` overlays
+- [x] Tier 2, Linux: `sysinfo(2)` (`backend.fake_sysinfo`) + paired `/proc/meminfo`, `/proc/uptime`, `/proc/loadavg` overlays
+- [x] Tier 1, Linux: `boot_id` overlay (`backend.fake_boot_id`)
+- [ ] Tier 1, Linux: `/proc/self/mountinfo` overlay (host mount-layout deanon vector)
 - [ ] `uname` on non-x86 arches (per-arch syscall numbers)
 - [ ] macOS `DYLD_INSERT_LIBRARIES` interposer (`sysctl`, `gethostuuid`, IOKit)
 - [ ] Windows API-hook layer (`MachineGuid`, SMBIOS, WMI)

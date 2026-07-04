@@ -144,6 +144,21 @@ std::string generic_proc_version(const std::string& osrelease, const std::string
            " (builder@sandbox) (gcc version 13.0.0 (Generic)) " + version + "\n";
 }
 
+// Generic /proc/meminfo. Masks the host's exact RAM size (a weak fingerprint) while keeping a
+// plausible, self-consistent layout. `total_kb` is shared with the sysinfo(2) fake.
+std::string generic_meminfo(std::uint64_t total_kb) {
+    const std::uint64_t avail = total_kb / 2;
+    std::ostringstream ss;
+    ss << "MemTotal:       " << total_kb << " kB\n"
+       << "MemFree:        " << avail << " kB\n"
+       << "MemAvailable:   " << avail << " kB\n"
+       << "Buffers:               0 kB\n"
+       << "Cached:                0 kB\n"
+       << "SwapTotal:             0 kB\n"
+       << "SwapFree:              0 kB\n";
+    return ss.str();
+}
+
 // Terminating-signal handling for sandbox cleanup. When raincoat is interrupted
 // while the bwrap child is running (Ctrl-C, `kill`, terminal hangup), the default
 // disposition would kill raincoat before cleanup_root() runs, leaking the whole
@@ -1190,6 +1205,9 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     bool cpuinfo_masked = false;
     bool cpuinfo_skipped_arch = false;
     bool kernel_masked = false;
+    bool meminfo_masked = false;
+    bool uptime_masked = false;
+    bool boot_id_masked = false;
     if (cfg.ext.backend.mount_proc) {
         auto write_overlay = [&](const std::string& name, const std::string& target,
                                  const std::string& content) -> bool {
@@ -1220,6 +1238,20 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             bool r = write_overlay(".rc-osrelease", "/proc/sys/kernel/osrelease", rel + "\n");
             bool k = write_overlay(".rc-kversion", "/proc/sys/kernel/version", ver + "\n");
             kernel_masked = v || r || k;
+        }
+        if (cfg.ext.backend.fake_meminfo) {
+            meminfo_masked =
+                write_overlay(".rc-meminfo", "/proc/meminfo",
+                              generic_meminfo(cfg.ext.backend.mem_total_kb));
+        }
+        if (cfg.ext.backend.fake_uptime) {
+            bool up = write_overlay(".rc-uptime", "/proc/uptime", "3600.00 3600.00\n");
+            bool la = write_overlay(".rc-loadavg", "/proc/loadavg", "0.00 0.00 0.00 1/128 1\n");
+            uptime_masked = up || la;
+        }
+        if (cfg.ext.backend.fake_boot_id) {
+            boot_id_masked = write_overlay(".rc-bootid", "/proc/sys/kernel/random/boot_id",
+                                           cfg.ext.backend.boot_id + "\n");
         }
     }
 
@@ -1405,17 +1437,34 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             "/etc/machine-id presented as a constant generic value (host per-install "
             "identifier not exposed).");
     }
-    if (cfg.ext.backend.fake_uname) {
-        if (seccomp_uname_supported()) {
+    if (meminfo_masked) {
+        rec.active_policy_notes.push_back(
+            "/proc/meminfo masked (host RAM size hidden; generic self-consistent totals).");
+    }
+    if (uptime_masked) {
+        rec.active_policy_notes.push_back(
+            "/proc/uptime and /proc/loadavg masked with generic constants (uptime/load "
+            "correlation signal hidden).");
+    }
+    if (boot_id_masked) {
+        rec.active_policy_notes.push_back(
+            "/proc/sys/kernel/random/boot_id presented as a constant (per-boot correlation "
+            "UUID hidden).");
+    }
+    if (cfg.ext.backend.fake_uname || cfg.ext.backend.fake_sysinfo) {
+        std::string which;
+        if (cfg.ext.backend.fake_uname) which += "uname(2)";
+        if (cfg.ext.backend.fake_sysinfo)
+            which += (which.empty() ? "" : " + ") + std::string("sysinfo(2)");
+        if (seccomp_identity_supported()) {
             rec.active_policy_notes.push_back(
-                "uname(2) syscall faked via a seccomp user-notify supervisor: the child "
-                "(and any static/Go binary calling uname directly) sees the same generic "
-                "kernel/hostname as the /proc masks. Best-effort — installs a seccomp "
-                "filter + supervisor thread; on setup failure the trapped call returns "
-                "ENOSYS and uname is left effectively unmasked.");
+                which + " syscall(s) faked via a seccomp user-notify supervisor: even a "
+                "static/Go binary calling them directly sees the same generic identity as "
+                "the /proc masks. Best-effort — installs a seccomp filter + supervisor "
+                "thread; on setup failure the trapped call returns ENOSYS.");
         } else {
             rec.active_policy_notes.push_back(
-                "uname(2) syscall mask requested but unsupported on this arch (x86_64 "
+                which + " syscall mask requested but unsupported on this arch (x86_64 "
                 "only) — left real.");
         }
     }
@@ -1586,17 +1635,22 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     for (auto& s : argv) cargv.push_back(const_cast<char*>(s.c_str()));
     cargv.push_back(nullptr);
 
-    // uname(2) syscall mask (Tier 2). When enabled and supported, install a seccomp
-    // user-notify filter in the child (it survives execve, so bwrap and the target inherit
-    // it) and service the trapped uname() calls from a supervisor thread in this (unfiltered)
-    // parent, returning the same generic identity the /proc masks show. The listener fd is
-    // handed back parent-ward over a socketpair. Best-effort: any setup failure disables the
-    // hook and leaves uname() real. See docs/FINGERPRINT-SYSCALLS.md.
-    bool uname_hook = cfg.ext.backend.fake_uname && seccomp_uname_supported();
+    // Identity-syscall mask (Tier 2: uname(2), sysinfo(2)). When enabled and supported, install
+    // a seccomp user-notify filter in the child (it survives execve, so bwrap and the target
+    // inherit it) and service the trapped calls from a supervisor thread in this (unfiltered)
+    // parent, returning the same generic identity the /proc masks show. The BPF program is built
+    // HERE (parent) so the child path stays allocation-free; the listener fd is handed back over
+    // a socketpair. Best-effort: any setup failure disables the hook and leaves the syscalls
+    // real (the kernel returns ENOSYS to any orphaned trap). See docs/FINGERPRINT-SYSCALLS.md.
+    const bool want_uname = cfg.ext.backend.fake_uname;
+    const bool want_sysinfo = cfg.ext.backend.fake_sysinfo;
+    bool id_hook = (want_uname || want_sysinfo) && seccomp_identity_supported();
+    std::vector<sock_filter> id_prog;
     int sc_sock[2] = {-1, -1};
-    if (uname_hook) {
+    if (id_hook) {
+        id_prog = build_identity_filter_program(want_uname, want_sysinfo);
         if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sc_sock) != 0) {
-            uname_hook = false;
+            id_hook = false;
             sc_sock[0] = sc_sock[1] = -1;
         }
     }
@@ -1604,15 +1658,16 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     pid_t pid = ::fork();
     if (pid < 0) {
         err = "Error: fork failed: " + std::string(std::strerror(errno));
-        if (uname_hook) { ::close(sc_sock[0]); ::close(sc_sock[1]); }
+        if (id_hook) { ::close(sc_sock[0]); ::close(sc_sock[1]); }
         restore_signals();
         cleanup_root();
         return 1;
     }
     if (pid == 0) {
-        if (uname_hook) {
-            ::close(sc_sock[0]);                        // parent end
-            seccomp_child_install_and_send(sc_sock[1]);  // best-effort; filter survives exec
+        if (id_hook) {
+            ::close(sc_sock[0]);  // parent end
+            seccomp_child_install_and_send(sc_sock[1], id_prog.data(),
+                                           static_cast<unsigned int>(id_prog.size()));
             ::close(sc_sock[1]);
         }
         ::execvp(launch_path.c_str(), cargv.data());
@@ -1627,44 +1682,49 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     g_child_pid = pid;
     if (g_pending_signal != 0) ::kill(pid, static_cast<int>(g_pending_signal));
 
-    // Bring up the uname supervisor thread. It runs with SIGINT/SIGTERM/SIGHUP blocked so
+    // Bring up the identity supervisor thread. It runs with SIGINT/SIGTERM/SIGHUP blocked so
     // those keep hitting the main thread's handlers; the main thread waits on the child while
-    // the supervisor answers uname() notifications concurrently (no waitpid/notify deadlock).
-    std::atomic<bool> uname_stop{false};
-    std::thread uname_thread;
-    int uname_listener = -1;
-    if (uname_hook) {
+    // the supervisor answers notifications concurrently (no waitpid/notify deadlock).
+    std::atomic<bool> id_stop{false};
+    std::thread id_thread;
+    int id_listener = -1;
+    if (id_hook) {
         ::close(sc_sock[1]);  // child end
-        uname_listener = seccomp_recv_listener_fd(sc_sock[0]);
+        id_listener = seccomp_recv_listener_fd(sc_sock[0]);
         ::close(sc_sock[0]);
-        if (uname_listener >= 0) {
-            UtsnameSpoof spoof;
-            spoof.nodename = identity_host;
-            spoof.release = cfg.ext.backend.kernel_osrelease;
-            spoof.version = cfg.ext.backend.kernel_version;
+        if (id_listener >= 0) {
+            IdentitySpoof spoof;
+            spoof.trap_uname = want_uname;
+            spoof.trap_sysinfo = want_sysinfo;
+            spoof.uts.nodename = identity_host;
+            spoof.uts.release = cfg.ext.backend.kernel_osrelease;
+            spoof.uts.version = cfg.ext.backend.kernel_version;
+            spoof.sys.total_ram_bytes =
+                static_cast<std::uint64_t>(cfg.ext.backend.mem_total_kb) * 1024;
+            spoof.sys.free_ram_bytes = spoof.sys.total_ram_bytes / 2;
             sigset_t block, old;
             sigemptyset(&block);
             sigaddset(&block, SIGINT);
             sigaddset(&block, SIGTERM);
             sigaddset(&block, SIGHUP);
             pthread_sigmask(SIG_BLOCK, &block, &old);
-            uname_thread = std::thread(seccomp_supervise_uname, uname_listener,
-                                       spoof, std::ref(uname_stop));
+            id_thread = std::thread(seccomp_supervise_identity, id_listener,
+                                    spoof, std::ref(id_stop));
             pthread_sigmask(SIG_SETMASK, &old, nullptr);
         } else {
-            uname_hook = false;  // no listener; kernel makes trapped uname() return ENOSYS
+            id_hook = false;  // no listener; kernel makes trapped syscalls return ENOSYS
         }
     }
     // Tear down the supervisor thread (idempotent): stop it and join before returning on any
     // path, so its std::thread is never destroyed while joinable.
-    auto stop_uname_supervisor = [&]() {
-        if (uname_thread.joinable()) {
-            uname_stop.store(true);
-            uname_thread.join();
+    auto stop_id_supervisor = [&]() {
+        if (id_thread.joinable()) {
+            id_stop.store(true);
+            id_thread.join();
         }
-        if (uname_listener >= 0) {
-            ::close(uname_listener);
-            uname_listener = -1;
+        if (id_listener >= 0) {
+            ::close(id_listener);
+            id_listener = -1;
         }
     };
 
@@ -1672,7 +1732,7 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     while (::waitpid(pid, &status, 0) < 0) {
         if (errno != EINTR) {
             err = "Error: waitpid failed: " + std::string(std::strerror(errno));
-            stop_uname_supervisor();
+            stop_id_supervisor();
             restore_signals();
             cleanup_root();
             return 1;
@@ -1685,7 +1745,7 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     g_child_pid = 0;
     // Child gone: no more uname() callers, so stop and join the supervisor before we
     // proceed to teardown/audit.
-    stop_uname_supervisor();
+    stop_id_supervisor();
     restore_signals();
 
     // Child reaped: tear down the egress bridge listeners + worker threads now (free the

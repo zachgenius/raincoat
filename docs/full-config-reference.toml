@@ -530,6 +530,22 @@ machine_id = "0123456789abcdef0123456789abcdef"
 # and a supervisor thread. Presented values reuse kernel_osrelease / kernel_version / the
 # identity hostname. See docs/FINGERPRINT-SYSCALLS.md.
 fake_uname = false
+# Tier-2 (syscall-level) mask for sysinfo(2), OPT-IN, x86_64 only. Intercepts the syscall and
+# returns generic uptime / RAM / process count. Off by default (heavier seccomp path + faking
+# RAM can affect memory-sizing tools). Pairs with the /proc/meminfo + /proc/uptime overlays.
+fake_sysinfo = false
+# Tier-1 /proc overlays for memory/uptime/boot identity.
+#   fake_meminfo -> /proc/meminfo (RAM size). OFF by default (faking RAM can surprise tools).
+#   fake_uptime  -> /proc/uptime + /proc/loadavg. OFF by default.
+#   fake_boot_id -> /proc/sys/kernel/random/boot_id. ON by default: it is a pure per-boot
+#                   correlation UUID, so masking it never breaks anything.
+fake_meminfo = false
+fake_uptime = false
+fake_boot_id = true
+# Presented total RAM in kB (shared by fake_sysinfo and fake_meminfo). Default 16 GiB.
+mem_total_kb = 16777216
+# Presented /proc/sys/kernel/random/boot_id value.
+boot_id = "00000000-0000-4000-8000-000000000000"
 mount_dev = true
 mount_tmpfs_tmp = true
 
