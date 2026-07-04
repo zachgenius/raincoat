@@ -513,6 +513,16 @@ fake_cpuinfo = true
 # from the host so thread-pool sizing stays correct.)
 cpu_vendor_id = "GenuineIntel"
 cpu_model_name = "Generic x86_64 Processor"
+# Kernel identity mask: shadow /proc/version and /proc/sys/kernel/{osrelease,version} (the
+# file-readable mirror of `uname`) so the child cannot read the host's exact kernel release
+# or distro build host. NOTE: the uname() SYSCALL itself is not intercepted — this covers
+# the /proc file reads only. Values below are what the child sees.
+fake_kernel = true
+kernel_osrelease = "6.1.0-generic"
+kernel_version = "#1 SMP PREEMPT_DYNAMIC Generic"
+# Present a constant generic /etc/machine-id instead of the host's stable per-install id.
+fake_machine_id = true
+machine_id = "0123456789abcdef0123456789abcdef"
 mount_dev = true
 mount_tmpfs_tmp = true
 

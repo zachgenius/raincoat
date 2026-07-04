@@ -210,6 +210,19 @@ struct BackendConfig {
     // The logical-processor COUNT is always taken from the host (kept for functionality).
     std::string cpu_vendor_id  = "GenuineIntel";
     std::string cpu_model_name = "Generic x86_64 Processor";
+    // Kernel identity mask: shadow /proc/version and /proc/sys/kernel/{osrelease,version}
+    // (the file-readable mirror of `uname`) so the child cannot read the host's exact
+    // kernel release + build host/toolchain — a strong fingerprint --proc leaves exposed.
+    // NOTE: the uname() *syscall* itself is NOT faked (bwrap can't intercept it); this
+    // only covers the /proc file reads. Values below are what the child sees.
+    bool fake_kernel = true;
+    std::string kernel_osrelease = "6.1.0-generic";
+    std::string kernel_version   = "#1 SMP PREEMPT_DYNAMIC Generic";
+    // Machine-id mask: present a constant generic /etc/machine-id instead of exposing (or
+    // leaving absent) the host's stable per-install identifier. A shared constant is
+    // non-identifying by design; configure it if a tool needs a specific value.
+    bool fake_machine_id = true;
+    std::string machine_id = "0123456789abcdef0123456789abcdef";
     bool mount_dev      = true;
     bool mount_tmpfs_tmp = true;
     bool die_with_parent = true;

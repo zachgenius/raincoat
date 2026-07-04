@@ -34,7 +34,8 @@ std::vector<std::string> build_bwrap_argv(const std::string& bwrap_path, const C
                                           const std::vector<std::string>& mask_files,
                                           const std::vector<std::string>& curated_font_dirs,
                                           bool mask_usr_local_fonts,
-                                          const std::string& fake_cpuinfo_file) {
+                                          const std::vector<std::pair<std::string, std::string>>&
+                                              proc_overlays) {
     std::vector<std::string> a;
     auto p1 = [&](const std::string& x) { a.push_back(x); };
     auto p2 = [&](const std::string& x, const std::string& y) {
@@ -117,15 +118,15 @@ std::vector<std::string> build_bwrap_argv(const std::string& bwrap_path, const C
 
     if (backend.mount_proc) {
         p2("--proc", "/proc");
-        // Shadow /proc/cpuinfo with a generic block so the child cannot read the host's
-        // exact CPU model/stepping/microcode/MHz/flags — a strong, trivially-read machine
-        // fingerprint that --proc alone (a real host procfs) leaves fully exposed. The
-        // fake file is a raincoat-created generic cpuinfo on the host; the bind MUST come
-        // AFTER --proc so it overlays the freshly-mounted procfs entry. Empty when the
-        // runner did not synthesize one (fake_cpuinfo disabled, or a non-x86 host where a
-        // wrong-arch fake would be worse than the leak), in which case cpuinfo is untouched.
-        if (!fake_cpuinfo_file.empty())
-            p3("--ro-bind", fake_cpuinfo_file, "/proc/cpuinfo");
+        // Overlay generic files onto the freshly-mounted procfs to hide machine
+        // fingerprints the real /proc exposes: /proc/cpuinfo (CPU model/stepping/flags),
+        // /proc/version and /proc/sys/kernel/{osrelease,version} (kernel release + build
+        // host — the file mirror of `uname`). Each entry is {host_file, /proc/... target};
+        // the raincoat-created host file is bound read-only over the target. These MUST
+        // come AFTER --proc so they land on the fresh procfs. Empty entries when the runner
+        // synthesized nothing (mask disabled, or a non-x86 host for cpuinfo), leaving the
+        // real files untouched. (The uname() *syscall* is not intercepted — file reads only.)
+        for (const auto& ov : proc_overlays) p3("--ro-bind", ov.first, ov.second);
     }
     if (backend.mount_dev) p2("--dev", "/dev");
 

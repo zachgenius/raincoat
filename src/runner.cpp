@@ -131,6 +131,15 @@ std::string generic_cpuinfo(unsigned nproc, const std::string& vendor_id,
     return ss.str();
 }
 
+// Generic /proc/version line. Real format is
+// "Linux version <release> (<builduser@host>) (<compiler>) <version>". We synthesize a
+// neutral one so the child cannot read the host's exact kernel release or — as here on
+// Pop!_OS — the distro build host (jenkins@warp.pop-os.org), a strong fingerprint.
+std::string generic_proc_version(const std::string& osrelease, const std::string& version) {
+    return "Linux version " + osrelease +
+           " (builder@sandbox) (gcc version 13.0.0 (Generic)) " + version + "\n";
+}
+
 // Terminating-signal handling for sandbox cleanup. When raincoat is interrupted
 // while the bwrap child is running (Ctrl-C, `kill`, terminal hangup), the default
 // disposition would kill raincoat before cleanup_root() runs, leaking the whole
@@ -781,11 +790,24 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // sandbox temp tree and bound read-only at their canonical /etc paths; they are
     // destroyed with the sandbox root. /etc/localtime is bound from the host zoneinfo
     // for the resolved TZ (falling back to UTC) only when that file exists.
-    bool etc_hostname = false, etc_hosts = false, etc_localtime = false;
+    bool etc_hostname = false, etc_hosts = false, etc_localtime = false, etc_machine_id = false;
     {
         const std::string etc_dir = root + "/etc";
         std::string derr;
         if (make_dirs(etc_dir, derr)) {
+            // Constant generic /etc/machine-id (a stable per-install identifier the host
+            // would otherwise expose, or leave absent). A shared constant is non-
+            // identifying; configurable via backend.machine_id.
+            if (cfg.ext.backend.fake_machine_id) {
+                const std::string mid_path = etc_dir + "/machine-id";
+                std::ofstream mf(mid_path, std::ios::binary | std::ios::trunc);
+                mf << cfg.ext.backend.machine_id << "\n";
+                if (mf) {
+                    mounts.push_back(
+                        Mount{mid_path, "/etc/machine-id", MountMode::ReadOnly});
+                    etc_machine_id = true;
+                }
+            }
             const std::string hostname_path = etc_dir + "/hostname";
             const std::string hosts_path = etc_dir + "/hosts";
             {
@@ -1153,28 +1175,47 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             std::filesystem::is_directory("/usr/local/share/fonts", lec) && !lec;
     }
 
-    // Generic /proc/cpuinfo mask. When proc is mounted and the profile keeps
-    // fake_cpuinfo on (default), synthesize a generic cpuinfo on the host and let
-    // build_bwrap_argv bind it over the real one, so the child cannot read the host's
-    // exact CPU as a fingerprint. Only on x86 hosts (see host_is_x86); elsewhere the
-    // file stays empty and cpuinfo is left untouched. Non-fatal: any write failure just
-    // leaves the real cpuinfo exposed (best-effort, like the other masks).
-    std::string fake_cpuinfo_file;
+    // Generic /proc fingerprint masks. When proc is mounted, synthesize generic host
+    // files and hand build_bwrap_argv a list of {host_file, /proc target} overlays that
+    // it binds over the fresh procfs, so the child cannot read the host's exact CPU
+    // (/proc/cpuinfo) or kernel (/proc/version + /proc/sys/kernel/{osrelease,version})
+    // as fingerprints. cpuinfo is x86-only (see host_is_x86); elsewhere it is left
+    // untouched. Non-fatal: any write failure just leaves that real file exposed
+    // (best-effort, like the other masks).
+    std::vector<std::pair<std::string, std::string>> proc_overlays;
     bool cpuinfo_masked = false;
     bool cpuinfo_skipped_arch = false;
-    if (cfg.ext.backend.mount_proc && cfg.ext.backend.fake_cpuinfo) {
-        if (host_is_x86()) {
-            const std::string path = root + "/.rc-cpuinfo";
-            std::ofstream cf(path, std::ios::binary | std::ios::trunc);
-            cf << generic_cpuinfo(std::thread::hardware_concurrency(),
-                                  cfg.ext.backend.cpu_vendor_id,
-                                  cfg.ext.backend.cpu_model_name);
-            if (cf) {
-                fake_cpuinfo_file = path;
-                cpuinfo_masked = true;
+    bool kernel_masked = false;
+    if (cfg.ext.backend.mount_proc) {
+        auto write_overlay = [&](const std::string& name, const std::string& target,
+                                 const std::string& content) -> bool {
+            const std::string path = root + "/" + name;
+            std::ofstream f(path, std::ios::binary | std::ios::trunc);
+            f << content;
+            if (!f) return false;
+            proc_overlays.emplace_back(path, target);
+            return true;
+        };
+        if (cfg.ext.backend.fake_cpuinfo) {
+            if (host_is_x86()) {
+                cpuinfo_masked = write_overlay(
+                    ".rc-cpuinfo", "/proc/cpuinfo",
+                    generic_cpuinfo(std::thread::hardware_concurrency(),
+                                    cfg.ext.backend.cpu_vendor_id,
+                                    cfg.ext.backend.cpu_model_name));
+            } else {
+                cpuinfo_skipped_arch = true;
             }
-        } else {
-            cpuinfo_skipped_arch = true;
+        }
+        if (cfg.ext.backend.fake_kernel) {
+            const std::string& rel = cfg.ext.backend.kernel_osrelease;
+            const std::string& ver = cfg.ext.backend.kernel_version;
+            // /proc/version plus the file mirror of `uname -r` / `uname -v`.
+            bool v = write_overlay(".rc-version", "/proc/version",
+                                   generic_proc_version(rel, ver));
+            bool r = write_overlay(".rc-osrelease", "/proc/sys/kernel/osrelease", rel + "\n");
+            bool k = write_overlay(".rc-kversion", "/proc/sys/kernel/version", ver + "\n");
+            kernel_masked = v || r || k;
         }
     }
 
@@ -1182,7 +1223,7 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         build_bwrap_argv(*bwrap_path, cfg_copy, mounts, env, fake_home, sandbox_tmp,
                          binds_resolv_conf(cfg.net), font.dir, mask_dir, sandbox_out,
                          mask_empty_file, mask_files, font.font_dirs, mask_usr_local_fonts,
-                         fake_cpuinfo_file);
+                         proc_overlays);
 
     // ---- 8b. Isolated-netns wrapping (pasta) -----------------------------
     // In jail mode the child runs inside pasta's private network namespace: prepend
@@ -1347,6 +1388,18 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         rec.active_policy_notes.push_back(
             "/proc/cpuinfo left unmasked: fake_cpuinfo only synthesizes an x86 block, "
             "and this is a non-x86 host where a wrong-arch fake would mislead tools.");
+    }
+    if (kernel_masked) {
+        rec.active_policy_notes.push_back(
+            "Kernel identity masked: /proc/version and /proc/sys/kernel/{osrelease,version} "
+            "show a generic kernel (host release + distro build host hidden). Best-effort — "
+            "the uname() SYSCALL is NOT faked, so a tool calling it directly still sees the "
+            "real kernel; only the /proc file reads are covered.");
+    }
+    if (etc_machine_id) {
+        rec.active_policy_notes.push_back(
+            "/etc/machine-id presented as a constant generic value (host per-install "
+            "identifier not exposed).");
     }
 
     // Egress bridge transparency. Honest network-model disclosure + one summary per

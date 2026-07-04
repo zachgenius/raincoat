@@ -9,6 +9,7 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "bwrap.hpp"
@@ -215,43 +216,56 @@ TEST(Bwrap, BaseProcAndDev) {
 // /proc/cpuinfo mask (fake_cpuinfo_file)
 // ---------------------------------------------------------------------------
 
-// Rebuild buildTypical with an explicit fake-cpuinfo file passed positionally.
-static Argv buildWithCpuinfo(const std::string& cpuinfo_file, bool mount_proc = true) {
+// Rebuild buildTypical with explicit proc overlays passed positionally.
+using Overlays = std::vector<std::pair<std::string, std::string>>;
+static Argv buildWithOverlays(const Overlays& overlays, bool mount_proc = true) {
     Config cfg = makeConfig(NetMode::Full, "/work", {"/bin/echo", "hi"});
     cfg.ext.backend.mount_proc = mount_proc;
     EnvResolution env = makeEnv({{"HOME", "/fake/home/user"}, {"PATH", "/usr/bin"}});
     return build_bwrap_argv("/usr/bin/bwrap", cfg, {}, env, "/fake/home/user", "/fake/tmp",
-                            true, "", "", "", "", {}, {}, true, cpuinfo_file);
+                            true, "", "", "", "", {}, {}, true, overlays);
 }
 
-TEST(Bwrap, NoCpuinfoBindByDefault) {
-    // Default fake_cpuinfo_file is "" => cpuinfo is never bound (backward compatible).
+static int procIndex(const Argv& a) {
+    for (int i = 0; i + 1 < static_cast<int>(a.size()); ++i)
+        if (a[i] == "--proc" && a[i + 1] == "/proc") return i;
+    return -1;
+}
+
+TEST(Bwrap, NoProcOverlaysByDefault) {
+    // Default proc_overlays is empty => nothing is bound onto /proc (backward compatible).
     Argv a = buildTypical();
-    EXPECT_FALSE(hasTriple(a, "--ro-bind", "/fake/cpuinfo", "/proc/cpuinfo"));
     EXPECT_EQ(indexOf(a, "/proc/cpuinfo"), -1);
+    EXPECT_EQ(indexOf(a, "/proc/version"), -1);
 }
 
-TEST(Bwrap, CpuinfoBoundWhenFilePassed) {
-    Argv a = buildWithCpuinfo("/sbx/.rc-cpuinfo");
+TEST(Bwrap, CpuinfoBoundWhenOverlayPassed) {
+    Argv a = buildWithOverlays({{"/sbx/.rc-cpuinfo", "/proc/cpuinfo"}});
     EXPECT_TRUE(hasTriple(a, "--ro-bind", "/sbx/.rc-cpuinfo", "/proc/cpuinfo"));
 }
 
-TEST(Bwrap, CpuinfoBindOrderedAfterProcMount) {
-    // The overlay is meaningless unless it lands after --proc /proc mounts procfs.
-    Argv a = buildWithCpuinfo("/sbx/.rc-cpuinfo");
-    // --proc /proc is a pair, not a triple; find its index directly.
-    int procIdx = -1;
-    for (int i = 0; i + 1 < static_cast<int>(a.size()); ++i)
-        if (a[i] == "--proc" && a[i + 1] == "/proc") { procIdx = i; break; }
-    int bindIdx = indexOfTriple(a, "--ro-bind", "/sbx/.rc-cpuinfo", "/proc/cpuinfo");
-    ASSERT_GE(procIdx, 0);
-    ASSERT_GE(bindIdx, 0);
-    EXPECT_LT(procIdx, bindIdx);
+TEST(Bwrap, KernelOverlaysBound) {
+    Argv a = buildWithOverlays({{"/sbx/.rc-version", "/proc/version"},
+                                {"/sbx/.rc-osrelease", "/proc/sys/kernel/osrelease"},
+                                {"/sbx/.rc-kversion", "/proc/sys/kernel/version"}});
+    EXPECT_TRUE(hasTriple(a, "--ro-bind", "/sbx/.rc-version", "/proc/version"));
+    EXPECT_TRUE(hasTriple(a, "--ro-bind", "/sbx/.rc-osrelease", "/proc/sys/kernel/osrelease"));
+    EXPECT_TRUE(hasTriple(a, "--ro-bind", "/sbx/.rc-kversion", "/proc/sys/kernel/version"));
 }
 
-TEST(Bwrap, NoCpuinfoBindWhenProcNotMounted) {
-    // With proc unmounted there is no /proc to overlay, so the bind is suppressed.
-    Argv a = buildWithCpuinfo("/sbx/.rc-cpuinfo", /*mount_proc=*/false);
+TEST(Bwrap, ProcOverlaysOrderedAfterProcMount) {
+    // Overlays are meaningless unless they land after --proc /proc mounts procfs.
+    Argv a = buildWithOverlays({{"/sbx/.rc-cpuinfo", "/proc/cpuinfo"},
+                                {"/sbx/.rc-version", "/proc/version"}});
+    int procIdx = procIndex(a);
+    ASSERT_GE(procIdx, 0);
+    EXPECT_LT(procIdx, indexOfTriple(a, "--ro-bind", "/sbx/.rc-cpuinfo", "/proc/cpuinfo"));
+    EXPECT_LT(procIdx, indexOfTriple(a, "--ro-bind", "/sbx/.rc-version", "/proc/version"));
+}
+
+TEST(Bwrap, NoProcOverlaysWhenProcNotMounted) {
+    // With proc unmounted there is no /proc to overlay, so overlays are suppressed.
+    Argv a = buildWithOverlays({{"/sbx/.rc-cpuinfo", "/proc/cpuinfo"}}, /*mount_proc=*/false);
     EXPECT_FALSE(has(a, "--proc"));
     EXPECT_FALSE(hasTriple(a, "--ro-bind", "/sbx/.rc-cpuinfo", "/proc/cpuinfo"));
 }

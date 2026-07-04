@@ -271,7 +271,17 @@ Verdict: this tool did not get to see you naked.
   everything. This is real font-list masking, not per-glyph anti-fingerprinting.
 - **A minimal `/etc`.** The child sees a generic `/etc/hostname` (`sandbox`), a generic
   `/etc/hosts`, and an `/etc/localtime` pinned to the resolved timezone — so your real machine
-  name and host file never leak through `/etc`.
+  name and host file never leak through `/etc`. A constant generic `/etc/machine-id` is presented
+  in place of your host's stable per-install identifier (`[backend].fake_machine_id` /
+  `[backend].machine_id`).
+- **Your kernel.** `/proc/version` and `/proc/sys/kernel/{osrelease,version}` — the file-readable
+  mirror of `uname` — are shadowed with a generic kernel string, so the child can't read your exact
+  kernel release or distro build host (e.g. a `…pop-os.org` builder) as a fingerprint. Toggle with
+  `[backend].fake_kernel`; set `[backend].kernel_osrelease` / `[backend].kernel_version` for
+  specific values. **Honest caveat:** only the `/proc` file reads are covered — the `uname()`
+  *syscall* is **not** intercepted (bwrap can't), so a program that calls it directly still sees the
+  real kernel. (Your host's DMI serials, product UUID, and MAC addresses do *not* leak at all,
+  because Raincoat never mounts `/sys` into the sandbox.)
 - **Your CPU.** On x86 hosts, `/proc/cpuinfo` is shadowed with a generic block, so the child
   reads a neutral `Generic x86_64 Processor` instead of your exact CPU model, stepping,
   microcode, clock, and flags (a strong, trivially-read machine fingerprint). The
