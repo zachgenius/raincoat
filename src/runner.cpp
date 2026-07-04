@@ -19,8 +19,8 @@
 #include <unistd.h>
 
 #include "audit.hpp"
+#include "backend.hpp"
 #include "browser.hpp"
-#include "bwrap.hpp"
 #include "doctor.hpp"
 #include "egress.hpp"
 #include "env_guard.hpp"
@@ -34,18 +34,6 @@
 namespace raincoat {
 
 namespace {
-
-// Verbatim SPEC message for a missing bubblewrap backend (docs/SPEC.md).
-const char* kBwrapMissing =
-    "Error: bubblewrap / bwrap was not found.\n"
-    "\n"
-    "Install it with your package manager, for example:\n"
-    "  Ubuntu/Debian: sudo apt install bubblewrap\n"
-    "  Fedora: sudo dnf install bubblewrap\n"
-    "  Arch: sudo pacman -S bubblewrap\n"
-    "\n"
-    "Then run:\n"
-    "  raincoat doctor\n";
 
 // Join a command argv into a single display string (audit "Command:" line).
 std::string join_command(const std::vector<std::string>& cmd) {
@@ -248,6 +236,13 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         const std::string& cwd, const std::string& assets_dir, std::string& err) {
     err.clear();
 
+    // The linked sandbox backend's capabilities. Every platform-specific step below is
+    // GATED on these, so a backend that cannot deliver a guarantee (e.g. Seatbelt has no
+    // fontconfig isolation, no UTS hostname, no minimal /etc, no netns jail) simply SKIPS
+    // the step instead of emitting a dishonest audit note. The Linux (bwrap) defaults are
+    // all-true, so the Linux path is unchanged. See backend.hpp / docs/MACOS.md.
+    const Capabilities caps = backend_capabilities();
+
     // ---- 0. Install terminating-signal handlers FIRST -------------------
     // These MUST be armed before mkdtemp() creates the sandbox root: a SIGINT/
     // SIGTERM/SIGHUP arriving in the window between root creation and the fork below
@@ -335,7 +330,11 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // the child's sole way out. Without the jail (or in on/auto, which NAT general
     // outbound) the policy only constrains proxy-aware clients — disclosed honestly below.
     const NetnsIsolation isolate_mode = cfg.ext.egress.isolate_netns;
-    const bool jail_requested =
+    // The pasta netns jail is a Linux mechanism. On a backend without it (macOS), the
+    // kernel egress firewall (SBPL (deny network*) + allow only the loopback proxy/bridge
+    // port) provides strict egress instead — see mac_kernel_firewall below — so the whole
+    // pasta decision is gated on caps.supports_netns_jail and never fails closed on macOS.
+    const bool jail_requested = caps.supports_netns_jail &&
         (egress_active || netpolicy_active) && isolate_mode != NetnsIsolation::Off;
     std::optional<std::string> pasta_path;
     if (jail_requested) pasta_path = find_pasta();
@@ -350,8 +349,8 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // downgrade (fail OPEN), refuse the run with an actionable error. This returns before
     // mkdtemp(), so only the signal handlers (armed in step 0) need restoring; no sandbox
     // root exists to clean up yet.
-    if ((egress_active || netpolicy_active) && isolate_mode == NetnsIsolation::Strict &&
-        !pasta_path.has_value()) {
+    if (caps.supports_netns_jail && (egress_active || netpolicy_active) &&
+        isolate_mode == NetnsIsolation::Strict && !pasta_path.has_value()) {
         err =
             "Error: [egress].isolate_netns = \"strict\" blocks the child's general internet "
             "and exposes ONLY the forwarded loopback port(s) (the egress bridge and/or the "
@@ -365,6 +364,16 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         restore_signals();
         return 1;
     }
+
+    // macOS kernel egress firewall: when the backend has no netns jail but CAN enforce a
+    // kernel-level egress firewall (Seatbelt), `isolate_netns = "strict"` with an active
+    // egress bridge and/or guarded proxy is realised by an SBPL rule that denies ALL
+    // outbound and re-allows ONLY the loopback proxy/bridge port(s) — for EVERY client, not
+    // just proxy-aware ones, with no pasta. Non-strict modes keep general network (the
+    // child still reaches the loopback bridge/proxy under allow-default). The loopback
+    // ports are collected in jail_forward_ports below and passed to the backend at launch.
+    const bool mac_kernel_firewall = !caps.supports_netns_jail && caps.net_firewall_kernel &&
+        (egress_active || netpolicy_active) && isolate_mode == NetnsIsolation::Strict;
 
     // ---- 1. Create the sandbox root + fixed sub-tree ---------------------
     const char* tmpdir_env = std::getenv("TMPDIR");
@@ -606,12 +615,18 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     }
 
     // ---- 4. Fontconfig isolation (best-effort) ---------------------------
-    std::string ferr;
-    FontSetup font = setup_fontconfig(root, cfg.fontconfig_enabled,
-                                      assets_dir + "/fontconfig/fonts.conf", ferr);
-    for (const auto& kv : font.env) {
-        env.resolved[kv.first] = kv.second;
-        record_set(kv.first);
+    // Gated on the backend: macOS resolves fonts via Core Text, not fontconfig, and cannot
+    // overlay /usr/share/fonts, so the Seatbelt backend reports supports_fontconfig_isolation
+    // = false and this whole step is skipped (font stays Disabled, no FONTCONFIG_* env).
+    FontSetup font;
+    if (caps.supports_fontconfig_isolation) {
+        std::string ferr;
+        font = setup_fontconfig(root, cfg.fontconfig_enabled,
+                                assets_dir + "/fontconfig/fonts.conf", ferr);
+        for (const auto& kv : font.env) {
+            env.resolved[kv.first] = kv.second;
+            record_set(kv.first);
+        }
     }
 
     // ---- 4a2. Browser isolation (best-effort) ----------------------------
@@ -721,7 +736,7 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // destroyed with the sandbox root. /etc/localtime is bound from the host zoneinfo
     // for the resolved TZ (falling back to UTC) only when that file exists.
     bool etc_hostname = false, etc_hosts = false, etc_localtime = false;
-    {
+    if (caps.supports_minimal_etc) {  // bind-based; the Seatbelt backend cannot overlay /etc
         const std::string etc_dir = root + "/etc";
         std::string derr;
         if (make_dirs(etc_dir, derr)) {
@@ -769,7 +784,7 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // the ENABLED path this is intentionally skipped (FONTCONFIG_FILE is pinned and
     // the curated conf must win, not the host /etc/fonts).
     bool etc_fonts_bound = false;
-    if (!cfg.fontconfig_enabled) {
+    if (caps.supports_fontconfig_isolation && !cfg.fontconfig_enabled) {
         std::error_code fec;
         if (std::filesystem::is_directory("/etc/fonts", fec) && !fec) {
             mounts.push_back(Mount{"/etc/fonts", "/etc/fonts", MountMode::ReadOnly});
@@ -811,7 +826,8 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // unintended network), force the isolation back on and tell the user their backend
     // toggle was overridden. The audit backend-overrides note below reads cfg_copy, so
     // it reflects the forced (honest) value.
-    if (cfg.net == NetMode::Off && !cfg.ext.backend.unshare_net_when_off) {
+    if (caps.net_off == NetOff::UnshareNet && cfg.net == NetMode::Off &&
+        !cfg.ext.backend.unshare_net_when_off) {
         cfg_copy.ext.backend.unshare_net_when_off = true;
         if (!warning.empty()) warning += "\n";
         warning +=
@@ -833,7 +849,7 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // net=off override: force the UTS namespace back on so the generic hostname genuinely
     // takes effect, and disclose the forced toggle. build_bwrap_argv and the backend-
     // overrides audit note both read cfg_copy, so both reflect the forced (honest) value.
-    if (!cfg.ext.backend.unshare_uts) {
+    if (caps.supports_uts_hostname && !cfg.ext.backend.unshare_uts) {
         cfg_copy.ext.backend.unshare_uts = true;
         if (!warning.empty()) warning += "\n";
         warning +=
@@ -939,20 +955,15 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         }
     }
 
-    // ---- 7. Locate the bubblewrap backend --------------------------------
-    // An explicit [backend].bwrap_path (ext.backend.bwrap_path) overrides auto-find,
-    // but only when it names an actual executable — otherwise fall back to the PATH
-    // search so a stale profile path does not hard-fail a runnable host.
-    std::optional<std::string> bwrap_path;
-    if (!cfg.ext.backend.bwrap_path.empty()) {
-        const std::string& bp = cfg.ext.backend.bwrap_path;
-        if (bp.find('/') != std::string::npos && ::access(bp.c_str(), X_OK) == 0) {
-            bwrap_path = bp;  // absolute/relative path to a real executable
-        }
-    }
-    if (!bwrap_path.has_value()) bwrap_path = find_bwrap();
-    if (!bwrap_path.has_value()) {
-        std::cerr << kBwrapMissing;
+    // ---- 7. Locate the sandbox backend -----------------------------------
+    // The backend owns "find my executable / what if it is absent": Linux honors
+    // [backend].bwrap_path else find_bwrap() (missing -> the multi-line bwrap install
+    // message); macOS returns /usr/bin/sandbox-exec (missing -> a Seatbelt message). On
+    // failure the backend fills locate_err; we print it and return 127 exactly as before.
+    std::string locate_err;
+    std::optional<std::string> backend_path = backend_locate(cfg, locate_err);
+    if (!backend_path.has_value()) {
+        std::cerr << locate_err;
         cleanup_root();
         restore_signals();
         return 127;
@@ -1091,52 +1102,72 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         mask_usr_local_fonts =
             std::filesystem::is_directory("/usr/local/share/fonts", lec) && !lec;
     }
-    std::vector<std::string> argv =
-        build_bwrap_argv(*bwrap_path, cfg_copy, mounts, env, fake_home, sandbox_tmp,
-                         binds_resolv_conf(cfg.net), font.dir, mask_dir, sandbox_out,
-                         mask_empty_file, mask_files, font.font_dirs, mask_usr_local_fonts);
+    // Assemble the full launch through the platform backend. On Linux this delegates to
+    // the unchanged build_bwrap_argv and reproduces the pasta wrap verbatim; on macOS it
+    // produces `sandbox-exec -f <profile> -- cmd...` plus the SBPL profile_text. Every
+    // pasta-jail field is inert on a backend without a netns jail (macOS).
+    LaunchInputs li;
+    li.backend_path = *backend_path;
+    li.cfg = &cfg_copy;
+    li.mounts = mounts;
+    li.env = env;
+    li.fake_home = fake_home;
+    li.sandbox_tmp = sandbox_tmp;
+    li.bind_resolv_conf = binds_resolv_conf(cfg.net);
+    li.font_dir = font.dir;
+    li.audit_mask_dir = mask_dir;
+    li.sandbox_out = sandbox_out;
+    li.mask_empty_file = mask_empty_file;
+    li.mask_files = mask_files;
+    li.curated_font_dirs = font.font_dirs;
+    li.mask_usr_local_fonts = mask_usr_local_fonts;
+    li.jail_active = jail_active;
+    li.strict_jail = strict_jail;
+    li.pasta_path = pasta_path;
+    li.jail_forward_ports = jail_forward_ports;
+    // macOS / Seatbelt inputs (unused by the Linux backend). fs_deny with a leading ~ is
+    // expanded against the real home here; the backend realpath-resolves the rest.
+    li.real_home = real_home;
+    for (const std::string& d : cfg.ext.fs_deny) {
+        if (d.size() >= 2 && d[0] == '~' && d[1] == '/' && !real_home.empty())
+            li.fs_deny_resolved.push_back(real_home + d.substr(1));
+        else
+            li.fs_deny_resolved.push_back(d);
+    }
+    li.profile_path = root + "/rc-seatbelt.sb";
+    if (mac_kernel_firewall) li.allow_loopback_ports = jail_forward_ports;
 
-    // ---- 8b. Isolated-netns wrapping (pasta) -----------------------------
-    // In jail mode the child runs inside pasta's private network namespace: prepend
-    //   pasta --config-net -t none -T <bridge-ports> --
-    // to the bwrap argv. bwrap does NOT --unshare-net here (cfg.net is Full on the
-    // egress path), so it JOINS pasta's netns. `-t none` disables inbound forwarding
-    // (host->ns); `-T <ports>` forwards ONLY the bridge port(s) from the ns loopback to
-    // the host bridge, so the child reaches 127.0.0.1:<child_port> (child_endpoint is
-    // unchanged) while no other host-loopback service is exposed. The program that is
-    // exec'd becomes pasta; pasta runs bwrap as its child and propagates its exit code.
-    // MEASURED: the host-side bridge's upstream socket lives in the host netns, so the
-    // child's /proc/net/tcp does NOT reveal it — the shared-loopback leak is fixed.
-    std::string launch_path = *bwrap_path;
-    if (jail_active) {
-        std::vector<std::string> wrapped;
-        wrapped.reserve(argv.size() + 8);
-        wrapped.push_back(*pasta_path);
-        wrapped.push_back("--config-net");
-        wrapped.push_back("-t");
-        wrapped.push_back("none");
-        if (!jail_forward_ports.empty()) {
-            std::string spec;
-            for (std::size_t i = 0; i < jail_forward_ports.size(); ++i) {
-                if (i) spec += ",";
-                spec += std::to_string(jail_forward_ports[i]);
-            }
-            wrapped.push_back("-T");
-            wrapped.push_back(spec);
+    std::optional<LaunchPlan> plan = backend_build_launch(li, err);
+    if (!plan.has_value()) {
+        if (err.empty()) err = "Error: sandbox backend failed to build the launch.";
+        std::cerr << err << "\n";
+        cleanup_root();
+        restore_signals();
+        return 1;
+    }
+    std::vector<std::string>& argv = plan->argv;
+    std::string launch_path = plan->launch_path;
+
+    // macOS: write the generated SBPL profile the backend produced (the runner owns all
+    // side effects). It lives under the sandbox root so cleanup_root() removes it, and is
+    // 0600 + self-denied inside the profile. Fail CLOSED — never launch an unsandboxed
+    // command if the profile cannot be written. Empty on Linux (nothing to write).
+    if (!plan->profile_text.empty()) {
+        std::ofstream pf(plan->profile_path, std::ios::binary | std::ios::trunc);
+        pf << plan->profile_text;
+        pf.close();
+        if (!pf) {
+            err = "Error: failed to write the sandbox profile to " + plan->profile_path;
+            std::cerr << err << "\n";
+            cleanup_root();
+            restore_signals();
+            return 1;
         }
-        // STRICT: bind pasta's outbound to loopback so general internet is BLOCKED while
-        // the `-T` bridge forward(s) still work. MEASURED on this host: with `-o 127.0.0.1`
-        // the child cannot reach real IPs (they time out) but the forwarded bridge port
-        // still reaches the upstream — a true "only the bridge, nothing else" jail. Without
-        // it (auto/on) pasta NATs general outbound, so the child keeps general internet.
-        if (strict_jail) {
-            wrapped.push_back("-o");
-            wrapped.push_back("127.0.0.1");
-        }
-        wrapped.push_back("--");
-        for (auto& tok : argv) wrapped.push_back(std::move(tok));
-        argv = std::move(wrapped);
-        launch_path = *pasta_path;
+        std::error_code pec;
+        std::filesystem::permissions(
+            plan->profile_path,
+            std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+            std::filesystem::perm_options::replace, pec);
     }
 
     // ---- 9. Audit record -------------------------------------------------
@@ -1154,7 +1185,7 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // env.resolved, so this reflects what the child actually received.
     rec.timezone = default_or_empty(env.resolved, "TZ");
     rec.locale = default_or_empty(env.resolved, "LANG");
-    rec.bwrap_command = redact_argv_for_audit(argv, cfg.command.size());
+    rec.bwrap_command = plan->audit_command;  // backend-produced, already display-safe/redacted
 
     // Rich sectioned-config transparency. NAMES/counts only — never a secret VALUE.
     rec.profile_name = cfg.ext.profile_name;
@@ -1424,6 +1455,24 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         return 1;
     }
     if (pid == 0) {
+        if (plan->env_apply == EnvApply::ViaExec) {
+            // macOS/Seatbelt: sandbox-exec passes its environment through untouched and SBPL
+            // has no env directives, so the resolved child env MUST be installed at exec
+            // (execvp would leak raincoat's full parent environ — secrets included — into the
+            // child). launch_path is absolute, so execve (no PATH search) is correct.
+            std::vector<std::string> envs;
+            envs.reserve(plan->child_env.size());
+            for (const auto& kv : plan->child_env) envs.push_back(kv.first + "=" + kv.second);
+            std::vector<char*> envp;
+            envp.reserve(envs.size() + 1);
+            for (auto& e : envs) envp.push_back(const_cast<char*>(e.c_str()));
+            envp.push_back(nullptr);
+            ::execve(launch_path.c_str(), cargv.data(), envp.data());
+            std::perror("raincoat: failed to exec sandbox-exec");
+            _exit(127);
+        }
+        // Linux/bubblewrap (ViaArgv): env is baked into argv (--clearenv/--setenv); exec
+        // carrying the inherited parent environ exactly as before — byte-for-byte unchanged.
         ::execvp(launch_path.c_str(), cargv.data());
         // Only reached if exec failed.
         std::perror(jail_active ? "raincoat: failed to exec pasta"

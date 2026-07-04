@@ -1,0 +1,156 @@
+// Raincoat — seatbelt: pure SBPL assembly (see seatbelt.hpp). No filesystem access.
+#include "seatbelt.hpp"
+
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include "config.hpp"
+
+namespace raincoat {
+
+std::string sbpl_str(const std::string& s, bool& ok) {
+    ok = true;
+    std::string out;
+    out.reserve(s.size() + 2);
+    out.push_back('"');
+    for (char c : s) {
+        if (c == '\n' || c == '\r' || c == '\0') {
+            ok = false;  // unrepresentable — a smuggled newline/NUL could inject a rule
+            return std::string();
+        }
+        if (c == '\\' || c == '"') out.push_back('\\');
+        out.push_back(c);
+    }
+    out.push_back('"');
+    return out;
+}
+
+namespace {
+
+// Emit `(<op> <filters...> (subpath "<path>"))`, or fail-close via ok. A path that is
+// empty is skipped (returns true, emits nothing) so absent optional dirs are no-ops.
+bool emit_subpath(std::ostringstream& os, const char* rule, const std::string& path,
+                  bool& ok) {
+    if (path.empty()) return true;
+    std::string q = sbpl_str(path, ok);
+    if (!ok) return false;
+    os << rule << " (subpath " << q << "))\n";
+    return true;
+}
+
+}  // namespace
+
+std::string build_seatbelt_profile(const LaunchInputs& in, std::string& err) {
+    if (in.cfg == nullptr) {
+        err = "seatbelt: null config";
+        return std::string();
+    }
+    const Config& cfg = *in.cfg;
+    std::ostringstream os;
+    bool ok = true;
+
+    os << "(version 1)\n";
+    // FILTER model: start permissive, then subtract. This is NOT the structural,
+    // fail-closed hiding bwrap gives — a rule that fails to match silently grants access,
+    // which is why the runner runs a fail-closed pre-flight probe. See docs/MACOS.md.
+    os << "(allow default)\n";
+    if (cfg.strict) {
+        os << "; strict: allow-default + EXPANDED denies + no cwd auto-grant. This is NOT\n"
+              "; kernel default-deny (a bare (deny default) cannot even load libSystem on\n"
+              "; macOS); it is honest expanded denial. See docs/MACOS.md.\n";
+    }
+
+    // --- (1) Hide the real home + block username enumeration ---
+    // file-read* also blocks stat(), so the child cannot even confirm a file exists under
+    // the real home (measured). One realpath'd spelling covers the Data-volume firmlink
+    // twin (measured — no doubling needed).
+    if (!emit_subpath(os, "(deny file-read* file-write*", in.real_home, ok)) {
+        err = "seatbelt: unrepresentable real_home path";
+        return std::string();
+    }
+    // Deny READ of /Users so `ls /Users` cannot enumerate the real username; specific
+    // subpaths (workdir, mounts) are RE-ALLOWED below and win by last-match-wins.
+    os << "(deny file-read* (subpath \"/Users\"))\n";
+
+    // --- (2) Re-allow the sandbox-private writable areas ---
+    if (!emit_subpath(os, "(allow file-read* file-write*", in.fake_home, ok) ||
+        !emit_subpath(os, "(allow file-read* file-write*", in.sandbox_tmp, ok) ||
+        !emit_subpath(os, "(allow file-read* file-write*", in.sandbox_out, ok)) {
+        err = "seatbelt: unrepresentable sandbox dir path";
+        return std::string();
+    }
+
+    // --- (3) Re-allow the effective working directory (un-hides a project under $HOME),
+    // unless it is already covered by the fake home (strict mode) or a user mount (the
+    // non-strict cwd auto-mount), to avoid a redundant duplicate rule. ---
+    bool workdir_covered = (cfg.workdir == in.fake_home);
+    for (const Mount& m : in.mounts) {
+        if (m.host_path == cfg.workdir) workdir_covered = true;
+    }
+    if (!workdir_covered &&
+        !emit_subpath(os, "(allow file-read* file-write*", cfg.workdir, ok)) {
+        err = "seatbelt: unrepresentable workdir path";
+        return std::string();
+    }
+
+    // --- (4) Re-allow each user mount (RO -> read; RW -> read+write). (subpath ...) is
+    // correct for both files and dirs, so no filesystem probe is needed here. ---
+    for (const Mount& m : in.mounts) {
+        const char* rule = (m.mode == MountMode::ReadWrite)
+                               ? "(allow file-read* file-write*"
+                               : "(allow file-read*";
+        if (!emit_subpath(os, rule, m.host_path, ok)) {
+            err = "seatbelt: unrepresentable mount path";
+            return std::string();
+        }
+    }
+
+    // --- (5) Re-deny the fs-deny set LAST among file rules so a deny beats any broad
+    // re-allow above (e.g. workdir==$HOME re-allowed, but ~/.ssh denied). Includes the
+    // DARWIN per-user cache/temp dirs the caller folds in. ---
+    for (const std::string& d : in.fs_deny_resolved) {
+        if (!emit_subpath(os, "(deny file-read* file-write*", d, ok)) {
+            err = "seatbelt: unrepresentable fs_deny path";
+            return std::string();
+        }
+    }
+
+    // --- (6) Deny the audit-log dir so the child cannot read/forge/erase the log ---
+    if (!emit_subpath(os, "(deny file-read* file-write*", in.audit_mask_dir, ok)) {
+        err = "seatbelt: unrepresentable audit_mask_dir path";
+        return std::string();
+    }
+
+    // --- (7) Self-deny the generated profile (it names the real home / username) ---
+    if (!in.profile_path.empty()) {
+        std::string q = sbpl_str(in.profile_path, ok);
+        if (!ok) {
+            err = "seatbelt: unrepresentable profile_path";
+            return std::string();
+        }
+        os << "(deny file-read* (literal " << q << "))\n";
+    }
+
+    // --- (8) Network ---
+    // A non-empty allow_loopback_ports means a guarded proxy / egress bridge is active:
+    // deny ALL outbound at the kernel level (for EVERY client, not just proxy-aware ones —
+    // a macOS strength over the Linux pasta jail) and re-allow ONLY the loopback proxy
+    // port(s). "localhost" is required — a raw "127.0.0.1:PORT" fails to compile, and
+    // "localhost" covers both 127.0.0.1 and ::1 (measured). DNS is intentionally NOT
+    // allowed: the proxy resolves host-side, so a non-proxy client is fully contained.
+    if (!in.allow_loopback_ports.empty()) {
+        os << "(deny network*)\n";
+        for (int p : in.allow_loopback_ports) {
+            os << "(allow network-outbound (remote ip \"localhost:" << p << "\"))\n";
+        }
+    } else if (cfg.net == NetMode::Off) {
+        os << "(deny network*)\n";
+    }
+    // NetMode::Full with no proxy: (allow default) already permits network; emit nothing.
+
+    (void)err;
+    return os.str();
+}
+
+}  // namespace raincoat

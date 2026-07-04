@@ -11,11 +11,34 @@ endif()
 
 add_compile_options(-Wall -Wextra)
 
+# Bake linked-library directories into the rpath so test binaries find a non-standard
+# GoogleTest dylib (e.g. a conda/homebrew install) at runtime without DYLD_LIBRARY_PATH.
+set(CMAKE_BUILD_RPATH_USE_LINK_PATH ON)
+
 # ---------------------------------------------------------------------------
 # Core static library: every src/*.cpp except main.cpp
 # ---------------------------------------------------------------------------
 file(GLOB CORE_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/*.cpp")
 list(REMOVE_ITEM CORE_SOURCES "${CMAKE_SOURCE_DIR}/src/main.cpp")
+
+# Sandbox backend: EXACTLY ONE implementation is linked per platform (the runner talks to
+# the backend seam in backend.hpp, never to bwrap/sandbox-exec directly). Strip both from
+# the glob, then add the right pair back. bwrap.cpp + backend_linux.cpp on Linux;
+# seatbelt.cpp + backend_macos.cpp on macOS. (list(REMOVE_ITEM) on an absent path is a no-op.)
+list(REMOVE_ITEM CORE_SOURCES
+  "${CMAKE_SOURCE_DIR}/src/bwrap.cpp"
+  "${CMAKE_SOURCE_DIR}/src/backend_linux.cpp"
+  "${CMAKE_SOURCE_DIR}/src/seatbelt.cpp"
+  "${CMAKE_SOURCE_DIR}/src/backend_macos.cpp")
+if(APPLE)
+  list(APPEND CORE_SOURCES
+    "${CMAKE_SOURCE_DIR}/src/seatbelt.cpp"
+    "${CMAKE_SOURCE_DIR}/src/backend_macos.cpp")
+else()
+  list(APPEND CORE_SOURCES
+    "${CMAKE_SOURCE_DIR}/src/bwrap.cpp"
+    "${CMAKE_SOURCE_DIR}/src/backend_linux.cpp")
+endif()
 
 add_library(raincoat_core STATIC ${CORE_SOURCES})
 target_include_directories(raincoat_core PUBLIC "${CMAKE_SOURCE_DIR}/src")
@@ -54,8 +77,24 @@ else()
 endif()
 
 file(GLOB TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/tests/test_*.cpp")
+
+# Backend-specific suites: the bwrap/font argv tests call build_bwrap_argv (only linked on
+# Linux); the seatbelt SBPL test needs the macOS backend. Prune whichever the linked
+# backend cannot satisfy so `ctest` is green on both platforms.
+set(RC_LINUX_ONLY_TESTS
+  test_bwrap test_bwrap_attack2_regression test_bwrap_font_mask_regression
+  test_font_local_mask_missing_dir_regression test_font_local_share_leak_attack
+  test_backend_golden_argv)
+set(RC_MACOS_ONLY_TESTS test_seatbelt)
+
 foreach(test_src ${TEST_SOURCES})
   get_filename_component(test_name "${test_src}" NAME_WE)
+  if(APPLE AND test_name IN_LIST RC_LINUX_ONLY_TESTS)
+    continue()
+  endif()
+  if(NOT APPLE AND test_name IN_LIST RC_MACOS_ONLY_TESTS)
+    continue()
+  endif()
   add_executable(${test_name} "${test_src}")
   target_include_directories(${test_name} PRIVATE "${CMAKE_SOURCE_DIR}/src")
   target_compile_definitions(${test_name} PRIVATE RC_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
