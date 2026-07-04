@@ -41,6 +41,7 @@ std::vector<std::string> split_path(const std::string& value, char delim) {
     return out;
 }
 
+#ifndef __APPLE__
 std::string rstrip(std::string s) {
     while (!s.empty() && (s.back() == '\n' || s.back() == '\r' ||
                           s.back() == ' ' || s.back() == '\t')) {
@@ -145,6 +146,32 @@ bool probe_userns() {
     }
     return true;  // assume available; the smoke test is the real arbiter
 }
+#endif  // !__APPLE__
+
+#ifdef __APPLE__
+// macOS SBPL smoke test: load a trivial `(version 1)(allow default)` profile via
+// sandbox-exec and run /usr/bin/true inside it. Exit 0 => sandbox-exec can compile and
+// enter a profile on this host. Mirrors run_smoke_test's fork+execl+silence style.
+bool run_sbpl_smoke_test(const std::string& sandbox_exec_path) {
+    pid_t pid = ::fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        int devnull = ::open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            ::dup2(devnull, STDOUT_FILENO);
+            ::dup2(devnull, STDERR_FILENO);
+            if (devnull > STDERR_FILENO) ::close(devnull);
+        }
+        ::execl(sandbox_exec_path.c_str(), sandbox_exec_path.c_str(),
+                "-p", "(version 1)(allow default)",
+                "/usr/bin/true", static_cast<char*>(nullptr));
+        _exit(127);
+    }
+    int status = 0;
+    if (::waitpid(pid, &status, 0) < 0) return false;
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+#endif  // __APPLE__
 
 // Search PATH (absolute dirs only) then a set of conventional fallback dirs for
 // an executable named `tool`.
@@ -175,6 +202,52 @@ std::optional<std::string> find_on_path(const std::string& tool) {
 std::optional<std::string> find_bwrap() { return find_on_path("bwrap"); }
 std::optional<std::string> find_pasta() { return find_on_path("pasta"); }
 std::optional<std::string> find_slirp4netns() { return find_on_path("slirp4netns"); }
+
+#ifdef __APPLE__
+
+// The macOS backend is Seatbelt (sandbox-exec). run_doctor() reuses the DoctorReport
+// fields with macOS meanings: bwrap_found == sandbox-exec present, bwrap_version is a
+// fixed label (sandbox-exec has no --version), userns_ok is N/A (reported true), and
+// smoke_ok is a real SBPL smoke test. pasta/slirp4netns are irrelevant (the egress
+// firewall is kernel-level), so they stay unset.
+DoctorReport run_doctor() {
+    DoctorReport r;
+    const char* kSandboxExec = "/usr/bin/sandbox-exec";
+
+    r.bwrap_found = (::access(kSandboxExec, X_OK) == 0);
+    r.bwrap_path = kSandboxExec;
+    r.bwrap_version = "seatbelt (sandbox-exec)";
+    r.userns_ok = true;  // user namespaces are a Linux concept; N/A on macOS
+
+    if (!r.bwrap_found) {
+        r.notes.push_back(
+            "/usr/bin/sandbox-exec was not found or is not executable (it ships with "
+            "macOS; check your macOS version / system integrity)");
+    } else {
+        r.smoke_ok = run_sbpl_smoke_test(kSandboxExec);
+        if (!r.smoke_ok) {
+            r.notes.push_back(
+                "sandbox-exec SBPL smoke test "
+                "(`sandbox-exec -p '(version 1)(allow default)' /usr/bin/true`) failed");
+        }
+    }
+
+    // ALWAYS emit the honest deprecation warning — even on PASS. Seatbelt still works
+    // today but Apple has deprecated it with no supported replacement for wrapping
+    // arbitrary CLIs (App Sandbox requires an app bundle + entitlements + code signing).
+    r.notes.push_back(
+        "[WARN] Seatbelt / sandbox-exec is Apple-DEPRECATED. It works today but has no "
+        "supported replacement for wrapping arbitrary CLIs (App Sandbox needs a bundle + "
+        "entitlements + code signing); Raincoat's macOS backend is best-effort. See "
+        "docs/MACOS.md.");
+    r.notes.push_back(
+        "The egress firewall on macOS is kernel-level (Seatbelt (deny network*) + allow "
+        "only the loopback proxy port); no pasta/slirp4netns helper is needed.");
+
+    return r;
+}
+
+#else  // !__APPLE__
 
 DoctorReport run_doctor() {
     DoctorReport r;
@@ -224,6 +297,64 @@ DoctorReport run_doctor() {
 
     return r;
 }
+
+#endif  // !__APPLE__
+
+#ifdef __APPLE__
+
+std::string format_doctor(const DoctorReport& r) {
+    std::ostringstream os;
+    os << "Raincoat doctor (macOS / Seatbelt)\n";
+    os << "==================================\n";
+
+    auto line = [&](bool ok, const std::string& label, const std::string& detail) {
+        os << (ok ? "  [ OK ] " : "  [FAIL] ") << label;
+        if (!detail.empty()) os << ": " << detail;
+        os << "\n";
+    };
+
+    // sandbox-exec presence + the real SBPL smoke test.
+    line(r.bwrap_found, "sandbox-exec found",
+         r.bwrap_found ? r.bwrap_path : std::string("not found"));
+    line(r.smoke_ok,
+         "sandbox-exec SBPL smoke test (`sandbox-exec -p '(version 1)(allow default)' true`)",
+         r.smoke_ok ? std::string("passed") : std::string("failed"));
+
+    // The deprecation WARN is ALWAYS rendered, even on PASS — the macOS backend is a
+    // best-effort, Apple-deprecated path. No apt/dnf/pacman hints here (that is Linux).
+    os << "  [WARN] Seatbelt / sandbox-exec is Apple-DEPRECATED — it works today but has "
+          "no supported replacement for wrapping arbitrary CLIs (App Sandbox needs a "
+          "bundle + entitlements + signing). Raincoat's macOS backend is best-effort. See "
+          "docs/MACOS.md.\n";
+    os << "  [INFO] egress firewall is kernel-level (Seatbelt (deny network*)); no "
+          "pasta/slirp4netns helper is needed.\n";
+
+    if (!r.notes.empty()) {
+        os << "\nNotes:\n";
+        for (const auto& n : r.notes) os << "  - " << n << "\n";
+    }
+
+    os << "\n";
+    if (r.usable()) {
+        os << "Result: PASS — host is usable. sandbox-exec is present and the SBPL smoke "
+              "test passed. (Best-effort backend — see the deprecation warning above.)\n";
+    } else {
+        os << "Result: FAIL — host is NOT usable for Raincoat.\n";
+        if (!r.bwrap_found) {
+            os << "\n";
+            os << "/usr/bin/sandbox-exec was not found or is not executable.\n";
+            os << "It ships with macOS; check your macOS version / system integrity.\n";
+        } else if (!r.smoke_ok) {
+            os << "\n";
+            os << "sandbox-exec is present but the SBPL smoke test failed; check your "
+                  "macOS version and that /usr/bin/sandbox-exec can load a profile.\n";
+        }
+    }
+
+    return os.str();
+}
+
+#else  // !__APPLE__
 
 std::string format_doctor(const DoctorReport& r) {
     std::ostringstream os;
@@ -299,5 +430,7 @@ std::string format_doctor(const DoctorReport& r) {
 
     return os.str();
 }
+
+#endif  // !__APPLE__
 
 }  // namespace raincoat

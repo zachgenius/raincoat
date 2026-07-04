@@ -211,11 +211,21 @@ TEST(Doctor, FormatMissingShowsInstallHints) {
     DoctorReport r = make_missing_report();
     std::string out = format_doctor(r);
     ASSERT_FALSE(out.empty());
+#ifdef __APPLE__
+    // macOS: NO apt/dnf/pacman hints — the missing case points at sandbox-exec / the
+    // macOS version, and the deprecation WARN is always surfaced.
+    EXPECT_TRUE(icontains(out, "sandbox-exec")) << out;
+    EXPECT_TRUE(icontains(out, "deprecated")) << out;
+    EXPECT_FALSE(icontains(out, "apt")) << out;
+    EXPECT_FALSE(icontains(out, "dnf")) << out;
+    EXPECT_FALSE(icontains(out, "pacman")) << out;
+#else
     // Must mention the package and all three package managers.
     EXPECT_TRUE(icontains(out, "bubblewrap")) << out;
     EXPECT_TRUE(icontains(out, "apt")) << "expected Ubuntu/Debian hint (apt)\n" << out;
     EXPECT_TRUE(icontains(out, "dnf")) << "expected Fedora hint (dnf)\n" << out;
     EXPECT_TRUE(icontains(out, "pacman")) << "expected Arch hint (pacman)\n" << out;
+#endif
 }
 
 TEST(Doctor, FormatMissingNamesTheMissingBackend) {
@@ -249,21 +259,33 @@ TEST(Doctor, FormatSmokeFailHintsUserNamespaces) {
 
     std::string out = format_doctor(r);
     ASSERT_FALSE(out.empty());
+#ifdef __APPLE__
+    // macOS has no user-namespace concept; the smoke-fail guidance points at the macOS
+    // version / sandbox-exec instead, and never mentions user namespaces or apt.
+    EXPECT_TRUE(icontains(out, "sandbox-exec") || icontains(out, "macos")) << out;
+    EXPECT_FALSE(icontains(out, "unprivileged user namespaces")) << out;
+    EXPECT_FALSE(icontains(out, "apt install")) << out;
+#else
     EXPECT_TRUE(icontains(out, "unprivileged user namespaces"))
         << "smoke-fail case should hint at unprivileged user namespaces\n" << out;
     // It must NOT tell the user to install bubblewrap; bwrap is present.
     EXPECT_FALSE(icontains(out, "apt install")) << out;
     EXPECT_FALSE(icontains(out, "pacman -S")) << out;
+#endif
 }
 
 // Missing bwrap: format_doctor() must surface apt / dnf / pacman install hints.
 TEST(Doctor, FormatMissingSurfacesAllPackageManagers) {
+#ifdef __APPLE__
+    GTEST_SKIP() << "Linux-only: apt/dnf/pacman install hints (macOS ships sandbox-exec)";
+#else
     DoctorReport r = make_missing_report();
     std::string out = format_doctor(r);
     ASSERT_FALSE(out.empty());
     EXPECT_TRUE(icontains(out, "apt")) << "expected apt hint\n" << out;
     EXPECT_TRUE(icontains(out, "dnf")) << "expected dnf hint\n" << out;
     EXPECT_TRUE(icontains(out, "pacman")) << "expected pacman hint\n" << out;
+#endif
 }
 
 TEST(Doctor, FormatHealthyReportsPass) {
@@ -315,6 +337,10 @@ TEST(Doctor, EgressJailIsOptionalForUsability) {
 // pasta is preferred: when both are present egress_jail_available() is true and
 // the formatted line names pasta.
 TEST(Doctor, FormatEgressAvailablePastaPreferred) {
+#ifdef __APPLE__
+    GTEST_SKIP() << "Linux-only: pasta/slirp4netns egress-jail line "
+                    "(macOS egress firewall is kernel-level)";
+#else
     DoctorReport r = make_healthy_report();
     r.pasta_found = true;
     r.pasta_path = "/usr/bin/pasta";
@@ -326,10 +352,14 @@ TEST(Doctor, FormatEgressAvailablePastaPreferred) {
     std::string out = format_doctor(r);
     EXPECT_TRUE(icontains(out, "egress network jail")) << out;
     EXPECT_TRUE(icontains(out, "available (pasta)")) << out;
+#endif
 }
 
 // slirp4netns alone still counts as available.
 TEST(Doctor, FormatEgressAvailableSlirpOnly) {
+#ifdef __APPLE__
+    GTEST_SKIP() << "Linux-only: pasta/slirp4netns egress-jail line";
+#else
     DoctorReport r = make_healthy_report();
     r.slirp4netns_found = true;
     r.slirp4netns_path = "/usr/sbin/slirp4netns";
@@ -337,11 +367,16 @@ TEST(Doctor, FormatEgressAvailableSlirpOnly) {
     EXPECT_TRUE(r.egress_jail_available());
     std::string out = format_doctor(r);
     EXPECT_TRUE(icontains(out, "available (slirp4netns)")) << out;
+#endif
 }
 
 // Neither present: line must say unavailable and point at EGRESS.md, but the
 // doctor must NOT render it as a failure or become unusable.
 TEST(Doctor, FormatEgressUnavailableIsNotAFailure) {
+#ifdef __APPLE__
+    GTEST_SKIP() << "Linux-only: shared-loopback fallback line "
+                    "(macOS egress firewall is kernel-level)";
+#else
     DoctorReport r = make_healthy_report();  // no pasta/slirp
     ASSERT_FALSE(r.egress_jail_available());
 
@@ -352,6 +387,7 @@ TEST(Doctor, FormatEgressUnavailableIsNotAFailure) {
     EXPECT_TRUE(icontains(out, "EGRESS.md")) << out;
     // A healthy host must still pass overall.
     EXPECT_TRUE(icontains(out, "pass") || icontains(out, "usable")) << out;
+#endif
 }
 
 // find_pasta() / find_slirp4netns() must return an executable absolute path when
@@ -387,3 +423,53 @@ TEST(Doctor, RunDoctorAgreesWithEgressFinders) {
     if (r.pasta_found) { EXPECT_FALSE(r.pasta_path.empty()); }
     if (r.slirp4netns_found) { EXPECT_FALSE(r.slirp4netns_path.empty()); }
 }
+
+// --------------------------------------------------------------------------
+// macOS / Seatbelt doctor — the sandbox-exec backend shape (Darwin only)
+// --------------------------------------------------------------------------
+
+#ifdef __APPLE__
+
+// format_doctor() renders the macOS/Seatbelt shape: sandbox-exec line, an ALWAYS-present
+// deprecation WARN, a kernel-level egress note, and NO Linux package-manager hints.
+TEST(Doctor, MacFormatShowsSeatbeltShape) {
+    DoctorReport r = make_healthy_report();  // usable() == true
+    std::string out = format_doctor(r);
+    ASSERT_FALSE(out.empty());
+    EXPECT_TRUE(icontains(out, "seatbelt") || icontains(out, "sandbox-exec")) << out;
+    EXPECT_TRUE(icontains(out, "deprecated")) << out;   // always emitted, even on PASS
+    EXPECT_TRUE(icontains(out, "kernel")) << out;       // egress firewall note
+    EXPECT_FALSE(icontains(out, "apt")) << out;
+    EXPECT_FALSE(icontains(out, "dnf")) << out;
+    EXPECT_FALSE(icontains(out, "pacman")) << out;
+    EXPECT_TRUE(icontains(out, "pass") || icontains(out, "usable")) << out;
+}
+
+// run_doctor() on a real macOS host: sandbox-exec is present, the SBPL smoke test passes,
+// userns_ok is reported true (N/A), and the deprecation + kernel-egress notes are present.
+TEST(Doctor, MacRunDoctorUsableWithWarnNotes) {
+    DoctorReport r = run_doctor();
+    if (!r.bwrap_found) GTEST_SKIP() << "sandbox-exec absent (unexpected on macOS)";
+
+    EXPECT_EQ(r.bwrap_path, "/usr/bin/sandbox-exec");
+    EXPECT_TRUE(r.userns_ok);   // user namespaces are N/A on macOS => reported true
+    EXPECT_TRUE(r.smoke_ok) << "SBPL smoke test should pass on a functional macOS host";
+    EXPECT_TRUE(r.usable());
+
+    bool has_warn = false, has_kernel = false;
+    for (const auto& n : r.notes) {
+        if (icontains(n, "deprecated")) has_warn = true;
+        if (icontains(n, "kernel")) has_kernel = true;
+    }
+    EXPECT_TRUE(has_warn) << "the deprecation WARN must always be present, even on PASS";
+    EXPECT_TRUE(has_kernel) << "the kernel-level egress firewall note should be present";
+}
+
+// find_bwrap() searches PATH for a literal `bwrap` and must not spuriously match
+// sandbox-exec on macOS (bwrap is genuinely absent here).
+TEST(Doctor, MacFindBwrapAbsent) {
+    if (host_has_bwrap()) GTEST_SKIP() << "bwrap unexpectedly present on this macOS host";
+    EXPECT_FALSE(find_bwrap().has_value());
+}
+
+#endif  // __APPLE__

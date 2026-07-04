@@ -69,10 +69,14 @@ bool is_sensitive_env(const std::string& name) {
         has_suffix(name, "_KEY")) {
         return true;
     }
-    // Prefix rules (must be at the very start).
+    // Prefix rules (must be at the very start). DYLD_ is macOS-specific dynamic-linker
+    // injection (DYLD_INSERT_LIBRARIES / DYLD_LIBRARY_PATH / ...): under the macOS
+    // allow-default Seatbelt profile the child runs on the real FS, so a leaked DYLD_*
+    // var could preload host libraries into it. Harmless to scrub on Linux (no DYLD_*
+    // vars exist there), so it is applied unconditionally.
     if (has_prefix(name, "AWS_") || has_prefix(name, "GITHUB_") ||
         has_prefix(name, "GOOGLE_") || has_prefix(name, "OPENAI_") ||
-        has_prefix(name, "ANTHROPIC_")) {
+        has_prefix(name, "ANTHROPIC_") || has_prefix(name, "DYLD_")) {
         return true;
     }
     // Exact-name rules.

@@ -129,6 +129,17 @@ TEST(EnvGuard, SensitivePrefixAnthropic) {
     EXPECT_TRUE(is_sensitive_env("ANTHROPIC_BASE_URL"));
 }
 
+// DYLD_ is the macOS dynamic-linker injection family; scrubbed unconditionally (the
+// prefix never occurs on Linux, so this stays green there too).
+TEST(EnvGuard, SensitivePrefixDyld) {
+    EXPECT_TRUE(is_sensitive_env("DYLD_"));
+    EXPECT_TRUE(is_sensitive_env("DYLD_INSERT_LIBRARIES"));
+    EXPECT_TRUE(is_sensitive_env("DYLD_LIBRARY_PATH"));
+    EXPECT_TRUE(is_sensitive_env("DYLD_FRAMEWORK_PATH"));
+    // Must be at the very start — an embedded DYLD_ is not a match on its own.
+    EXPECT_FALSE(is_sensitive_env("MY_DYLD_PATH"));
+}
+
 // A prefix must appear at the START of the name.
 TEST(EnvGuard, PrefixMustBeAtStart) {
     EXPECT_FALSE(is_sensitive_env("MY_AWS_REGION"));    // AWS_ not at start; no matching suffix
