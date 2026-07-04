@@ -28,22 +28,27 @@ static int countRet(const std::vector<sock_filter>& p, __u32 k) {
 #if defined(__x86_64__)
 TEST(SeccompNotify, ProgramTrapsRequestedSyscalls) {
     // uname only: one USER_NOTIF match arm.
-    auto u = build_identity_filter_program(true, false);
+    auto u = build_identity_filter_program(true, false, false);
     EXPECT_EQ(u[0].code, (BPF_LD | BPF_W | BPF_ABS));  // load arch first
     EXPECT_EQ(countRet(u, static_cast<__u32>(SECCOMP_RET_USER_NOTIF)), 1);
     EXPECT_EQ(countRet(u, static_cast<__u32>(SECCOMP_RET_ALLOW)), 1);
 
-    // both: still a single shared USER_NOTIF return, reached by two JEQ arms.
-    auto both = build_identity_filter_program(true, true);
-    EXPECT_EQ(countRet(both, static_cast<__u32>(SECCOMP_RET_USER_NOTIF)), 1);
-    // Two JEQ-on-nr arms => `both` is longer than the uname-only program.
-    EXPECT_GT(both.size(), u.size());
+    // all three: still a single shared USER_NOTIF return, reached by three JEQ arms.
+    auto all = build_identity_filter_program(true, true, true);
+    EXPECT_EQ(countRet(all, static_cast<__u32>(SECCOMP_RET_USER_NOTIF)), 1);
+    // More JEQ-on-nr arms => `all` is longer than the uname-only program.
+    EXPECT_GT(all.size(), u.size());
 }
 
 TEST(SeccompNotify, NeitherTrapIsPureAllow) {
-    auto p = build_identity_filter_program(false, false);
+    auto p = build_identity_filter_program(false, false, false);
     EXPECT_EQ(countRet(p, static_cast<__u32>(SECCOMP_RET_USER_NOTIF)), 0);
     EXPECT_GE(countRet(p, static_cast<__u32>(SECCOMP_RET_ALLOW)), 1);
+}
+
+TEST(SeccompNotify, AffinityOnlyStillTraps) {
+    auto p = build_identity_filter_program(false, false, true);
+    EXPECT_EQ(countRet(p, static_cast<__u32>(SECCOMP_RET_USER_NOTIF)), 1);
 }
 
 TEST(SeccompNotify, SupportedOnX86) { EXPECT_TRUE(seccomp_identity_supported()); }
@@ -51,7 +56,7 @@ TEST(SeccompNotify, SupportedOnX86) { EXPECT_TRUE(seccomp_identity_supported());
 
 TEST(SeccompNotify, ProgramEndsInARet) {
     // On any arch the program must terminate in a RET (never fall off the end).
-    auto p = build_identity_filter_program(true, true);
+    auto p = build_identity_filter_program(true, true, true);
     ASSERT_FALSE(p.empty());
     EXPECT_EQ(p.back().code, (BPF_RET | BPF_K));
 }

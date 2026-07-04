@@ -80,6 +80,7 @@ fake_sensitive_files = [
 [backend]
 cpu_vendor_id  = "GenuineIntel"
 cpu_model_name = "Generic x86_64 Processor"
+cpu_count      = 8
 kernel_osrelease = "6.1.0-generic"
 kernel_version   = "#1 SMP PREEMPT_DYNAMIC Generic"
 kernel_cmdline   = "BOOT_IMAGE=/boot/vmlinuz root=/dev/sda1 ro quiet"

@@ -42,7 +42,7 @@ supervisor exists. To be consistent, the fake values MUST match across both path
 |---|---|---|---|
 | `uname(2)` (63) | `sysname`, `nodename` (hostname), `release` (kernel), `version` (build string), `machine` (arch), `domainname` | seccomp user-notify: write a fake `struct new_utsname` into the child's buffer | **implemented** (set `kernel_osrelease`/`kernel_version`) |
 | `sysinfo(2)` (99) | `uptime`, load avg, `totalram`/`freeram` (RAM size), swap, process count | seccomp user-notify: write fake `struct sysinfo` | **implemented** (set `mem_total_kb`/`uptime_seconds`) |
-| `sched_getaffinity(2)` (204) | logical CPU count (`nproc`) | seccomp user-notify: rewrite the returned cpu-set | planned (risky — breaks pool sizing) |
+| `sched_getaffinity(2)` (204) | logical CPU count (`nproc`) | seccomp user-notify: write a cpu-set with `cpu_count` bits | **implemented** (`cpu_count`) |
 | `getcpu(2)` (309) | current CPU/NUMA node → topology inference | user-notify: pin to 0 | low value |
 | `clock_gettime(CLOCK_BOOTTIME)` / `CLOCK_MONOTONIC` | uptime, boot correlation | hard — faking time breaks programs; only offset-able | not planned |
 | `ioctl(SIOCGIFHWADDR/SIOCGIFCONF)` | interface **MAC** + names | user-notify is awkward (ioctl arg structs); the **isolated-netns jail** (pasta) is the real fix — child sees only a synthetic iface | covered by egress strict jail; else note |
@@ -180,12 +180,12 @@ identity remain Tier 3 / hardware-rooted.
 - [x] Tier 1: `/proc/meminfo` (`mem_total_kb`); `/proc/uptime` + `/proc/loadavg` (`uptime_seconds`)
 - [x] Tier 2: `uname(2)` via seccomp user-notify (`kernel_osrelease`/`kernel_version`)
 - [x] Tier 2: `sysinfo(2)` via seccomp user-notify (`mem_total_kb`/`uptime_seconds`)
+- [x] Tier 1 + Tier 2: **CPU core count** — `/proc/cpuinfo` block count + `sched_getaffinity(2)` (`cpu_count`)
 - [x] Path de-identification: `[filesystem].remap_cwd` + `[[filesystem.mount]]` present host paths at neutral sandbox paths (see `MOUNT-REMAP.md`)
 - [x] Not exposed at all: DMI serials / product UUID / MAC (Raincoat never mounts `/sys`)
 
 **Open (candidates):**
 
-- [ ] Tier 1 + Tier 2: **CPU core count** — `/proc/cpuinfo` block count + `sched_getaffinity(2)` (nproc). *In progress.*
 - [ ] `uname` on non-x86 arches (per-arch syscall numbers)
 
 **Blocked / deferred (no clean mechanism):**

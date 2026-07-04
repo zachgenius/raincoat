@@ -226,6 +226,9 @@ struct BackendConfig {
     // falls back to a generic default. Logical-processor COUNT is always the host's.
     std::optional<std::string> cpu_vendor_id;          // e.g. "GenuineIntel"
     std::optional<std::string> cpu_model_name;         // e.g. "Generic x86_64 Processor"
+    // cpu_count -> logical CPU count as seen via /proc/cpuinfo (block count) AND the
+    // sched_getaffinity(2) syscall that `nproc`/OpenMP/Go read. Unset => the host's real count.
+    std::optional<std::uint64_t> cpu_count;
     // kernel_* -> /proc/version + /proc/sys/kernel/{osrelease,version} AND the uname(2)
     // syscall (release/version). Faked if either is set; the unset one stays the host's real.
     std::optional<std::string> kernel_osrelease;       // uname -r

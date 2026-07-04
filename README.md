@@ -276,8 +276,8 @@ Verdict: this tool did not get to see you naked.
   machine-id, and boot-id values in place of your host's. These are configured under `[backend]`
   and are **value-driven, not on/off toggles**: *setting* a key makes the child see that value;
   *leaving it unset* shows the real system value. The knobs:
-  - `cpu_vendor_id` / `cpu_model_name` → `/proc/cpuinfo` (x86; the logical-processor *count* stays
-    the host's so thread-pool sizing still works).
+  - `cpu_vendor_id` / `cpu_model_name` → `/proc/cpuinfo` (x86); `cpu_count` → the logical-CPU
+    count in `/proc/cpuinfo` *and* `sched_getaffinity(2)` (what `nproc` reads).
   - `kernel_osrelease` / `kernel_version` → `/proc/version` + `/proc/sys/kernel/{osrelease,version}`;
     `kernel_cmdline` → `/proc/cmdline` (hides the root disk UUID + distro boot image).
   - `machine_id` → `/etc/machine-id` (stable per-install ID); `boot_id` →
@@ -287,11 +287,11 @@ Verdict: this tool did not get to see you naked.
   See `examples/paranoid.toml` for a "mask everything" profile, and `docs/full-config-reference.toml`
   for the annotated list. (Your host's DMI serials, product UUID, and MAC addresses do *not* leak at
   all — Raincoat never mounts `/sys` into the sandbox.)
-- **…and at the syscall level, not just the files** *(x86_64)*. Setting `kernel_*` or
-  `mem_total_kb` / `uptime_seconds` also engages a **seccomp user-notify** supervisor that
-  intercepts the `uname(2)` and `sysinfo(2)` syscalls themselves — so even a statically-linked or
-  Go binary issuing the raw syscall (which the `/proc` file overlays and an `LD_PRELOAD` shim both
-  miss) gets the fake. The supervisor baselines each call from the host's *real* struct and
+- **…and at the syscall level, not just the files** *(x86_64)*. Setting `kernel_*`,
+  `mem_total_kb` / `uptime_seconds`, or `cpu_count` also engages a **seccomp user-notify**
+  supervisor that intercepts the `uname(2)`, `sysinfo(2)`, and `sched_getaffinity(2)` syscalls
+  themselves — so even a statically-linked or Go binary issuing the raw syscall (which the `/proc`
+  file overlays and an `LD_PRELOAD` shim both miss) gets the fake. The supervisor baselines each call from the host's *real* struct and
   overrides only the fields you set, so unset fields stay truthful. It installs a seccomp filter
   plus a supervisor thread; see `docs/FINGERPRINT-SYSCALLS.md` for the full catalogue across
   Linux/macOS/Windows and the three-tier model. **Honest caveat — the hard floor:** CPU

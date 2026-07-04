@@ -22,9 +22,10 @@
 
 namespace raincoat {
 
-std::vector<sock_filter> build_identity_filter_program(bool trap_uname, bool trap_sysinfo) {
+std::vector<sock_filter> build_identity_filter_program(bool trap_uname, bool trap_sysinfo,
+                                                       bool trap_affinity) {
     std::vector<sock_filter> p;
-    if (!trap_uname && !trap_sysinfo) {  // nothing to trap -> bare ALLOW
+    if (!trap_uname && !trap_sysinfo && !trap_affinity) {  // nothing to trap -> bare ALLOW
         p.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
         return p;
     }
@@ -44,6 +45,7 @@ std::vector<sock_filter> build_identity_filter_program(bool trap_uname, bool tra
     };
     if (trap_uname) add_match(__NR_uname);
     if (trap_sysinfo) add_match(__NR_sysinfo);
+    if (trap_affinity) add_match(__NR_sched_getaffinity);
 
     // Fall-through (no match) -> ALLOW; then the USER_NOTIF return.
     p.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
@@ -175,10 +177,12 @@ int seccomp_recv_listener_fd(int sock_fd) {
 }
 
 #if defined(__x86_64__)
-// Write `len` bytes from `src` into the trapped caller's memory at `addr`. The caller is
-// blocked in the syscall until we SEND, so its buffer is stable; we only guard PID reuse.
-static bool write_child_mem(int listener_fd, const struct seccomp_notif& req, const void* src,
-                            std::size_t len) {
+// Write `len` bytes from `src` into the trapped caller's memory at child address `addr`. The
+// caller is blocked in the syscall until we SEND, so its buffer is stable; we only guard PID
+// reuse. `addr` is the syscall's output-pointer argument (args[0] for uname/sysinfo, args[2]
+// for sched_getaffinity).
+static bool write_child_mem(int listener_fd, const struct seccomp_notif& req, off_t addr,
+                            const void* src, std::size_t len) {
     char path[64];
     std::snprintf(path, sizeof(path), "/proc/%u/mem", static_cast<unsigned>(req.pid));
     const int mfd = ::open(path, O_WRONLY);
@@ -186,7 +190,6 @@ static bool write_child_mem(int listener_fd, const struct seccomp_notif& req, co
     bool ok = false;
     __u64 id = req.id;
     if (::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_ID_VALID, &id) == 0) {
-        const off_t addr = static_cast<off_t>(req.data.args[0]);
         const ssize_t w = ::pwrite(mfd, src, len, addr);
         ok = (w == static_cast<ssize_t>(len));
     }
@@ -243,7 +246,8 @@ void seccomp_supervise_identity(int listener_fd, const IdentitySpoof& spoof,
             if (spoof.uts_release) u.release = *spoof.uts_release;
             if (spoof.uts_version) u.version = *spoof.uts_version;
             const std::array<char, kUtsBufLen> buf = pack_new_utsname(u);
-            ok = write_child_mem(listener_fd, req, buf.data(), buf.size());
+            ok = write_child_mem(listener_fd, req, static_cast<off_t>(req.data.args[0]),
+                                 buf.data(), buf.size());
         } else if (req.data.nr == __NR_sysinfo) {
             // Baseline from the host's REAL sysinfo, then override memory / uptime when set.
             struct sysinfo si;
@@ -261,9 +265,32 @@ void seccomp_supervise_identity(int listener_fd, const IdentitySpoof& spoof,
                     si.freehigh = 0;
                     si.mem_unit = 1;  // totalram/freeram are now in bytes
                 }
-                ok = write_child_mem(listener_fd, req, &si, sizeof(si));
+                ok = write_child_mem(listener_fd, req, static_cast<off_t>(req.data.args[0]),
+                                     &si, sizeof(si));
             } else {
                 ok = false;
+            }
+        } else if (req.data.nr == __NR_sched_getaffinity && spoof.cpu_count) {
+            // sched_getaffinity(pid, cpusetsize, mask): report `cpu_count` online CPUs by
+            // writing a mask with that many low bits set. Return value = bytes written (the
+            // kernel's affinity-mask size); glibc zeroes the caller's buffer past that, so
+            // CPU_COUNT sees exactly cpu_count. Mirror the kernel's EINVAL when the caller's
+            // buffer is smaller than that mask (nproc then retries with a bigger buffer).
+            std::uint64_t n = *spoof.cpu_count;
+            if (n == 0) n = 1;
+            if (n > 4096) n = 4096;
+            const std::size_t nbytes = ((static_cast<std::size_t>(n) + 63) / 64) * 8;  // ulong-aligned
+            const std::size_t cpusetsize = static_cast<std::size_t>(req.data.args[1]);
+            if (cpusetsize < nbytes) {
+                resp.error = -EINVAL;
+                ok = true;  // deliberate error result, not a write failure
+            } else {
+                std::vector<unsigned char> mask(nbytes, 0);
+                for (std::uint64_t i = 0; i < n; ++i)
+                    mask[i / 8] |= static_cast<unsigned char>(1u << (i % 8));
+                ok = write_child_mem(listener_fd, req, static_cast<off_t>(req.data.args[2]),
+                                     mask.data(), mask.size());
+                if (ok) resp.val = static_cast<__s64>(nbytes);  // bytes copied
             }
         }
         // else: a syscall we did not mean to trap — answer success (val=0) harmlessly.

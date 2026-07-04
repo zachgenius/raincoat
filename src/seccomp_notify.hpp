@@ -44,17 +44,20 @@ struct UtsnameSpoof {
 struct IdentitySpoof {
     bool trap_uname = false;
     bool trap_sysinfo = false;
+    bool trap_affinity = false;
     std::string uts_nodename = "sandbox";
     std::optional<std::string> uts_release;         // -> uname release  (unset => real)
     std::optional<std::string> uts_version;         // -> uname version  (unset => real)
     std::optional<std::uint64_t> sys_uptime_seconds;   // -> sysinfo uptime (unset => real)
     std::optional<std::uint64_t> sys_total_ram_bytes;  // -> sysinfo totalram (unset => real)
+    std::optional<std::uint64_t> cpu_count;            // -> sched_getaffinity mask bit count
 };
 
 // PURE + testable. Classic-BPF program: USER_NOTIF for the requested syscalls on x86_64,
 // ALLOW for everything else (including non-x86_64 personalities). With neither flag set it is
 // a bare ALLOW.
-std::vector<sock_filter> build_identity_filter_program(bool trap_uname, bool trap_sysinfo);
+std::vector<sock_filter> build_identity_filter_program(bool trap_uname, bool trap_sysinfo,
+                                                       bool trap_affinity);
 
 // PURE + testable. Pack the spoof into the 390-byte `struct new_utsname` wire layout (six
 // 65-byte NUL-padded fields), truncating any over-long field to fit.
