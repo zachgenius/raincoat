@@ -410,6 +410,127 @@ TEST(Profile, LoadEmptyProfileSucceedsWithDefaults) {
     EXPECT_TRUE(opt->allow_read.empty());
 }
 
+// ===========================================================================
+// Value-driven fingerprint masks: [backend].* optionals (presence == the switch).
+// ===========================================================================
+
+TEST(Profile, LoadBackendFingerprintValuesSet) {
+    std::string path = write_temp_file(
+        "[backend]\n"
+        "cpu_vendor_id = \"AuthenticAMD\"\n"
+        "cpu_model_name = \"Acme CPU\"\n"
+        "cpu_count = 8\n"
+        "kernel_osrelease = \"6.1.0-generic\"\n"
+        "kernel_version = \"#1 SMP GENERIC\"\n"
+        "kernel_cmdline = \"BOOT_IMAGE=/vmlinuz root=/dev/sda1\"\n"
+        "machine_id = \"cafebabecafebabecafebabecafebabe\"\n"
+        "boot_id = \"00000000-0000-4000-8000-000000000000\"\n"
+        "mem_total_kb = 2097152\n"
+        "uptime_seconds = 3600\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    const auto& b = opt->ext.backend;
+    EXPECT_EQ(b.cpu_vendor_id.value_or(""), "AuthenticAMD");
+    EXPECT_EQ(b.cpu_model_name.value_or(""), "Acme CPU");
+    ASSERT_TRUE(b.cpu_count.has_value());
+    EXPECT_EQ(*b.cpu_count, 8u);
+    EXPECT_EQ(b.kernel_osrelease.value_or(""), "6.1.0-generic");
+    EXPECT_EQ(b.kernel_version.value_or(""), "#1 SMP GENERIC");
+    EXPECT_EQ(b.kernel_cmdline.value_or(""), "BOOT_IMAGE=/vmlinuz root=/dev/sda1");
+    EXPECT_EQ(b.machine_id.value_or(""), "cafebabecafebabecafebabecafebabe");
+    EXPECT_EQ(b.boot_id.value_or(""), "00000000-0000-4000-8000-000000000000");
+    ASSERT_TRUE(b.mem_total_kb.has_value());
+    EXPECT_EQ(*b.mem_total_kb, 2097152u);
+    ASSERT_TRUE(b.uptime_seconds.has_value());
+    EXPECT_EQ(*b.uptime_seconds, 3600u);
+}
+
+TEST(Profile, LoadBackendFingerprintValuesDefaultToUnset) {
+    // No [backend] section => every fingerprint knob stays nullopt (real system value shown).
+    std::string path = write_temp_file("strict = true\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    const auto& b = opt->ext.backend;
+    EXPECT_FALSE(b.cpu_vendor_id.has_value());
+    EXPECT_FALSE(b.cpu_model_name.has_value());
+    EXPECT_FALSE(b.cpu_count.has_value());
+    EXPECT_FALSE(b.kernel_osrelease.has_value());
+    EXPECT_FALSE(b.kernel_version.has_value());
+    EXPECT_FALSE(b.kernel_cmdline.has_value());
+    EXPECT_FALSE(b.machine_id.has_value());
+    EXPECT_FALSE(b.boot_id.has_value());
+    EXPECT_FALSE(b.mem_total_kb.has_value());
+    EXPECT_FALSE(b.uptime_seconds.has_value());
+}
+
+TEST(Profile, LoadBackendIntegerKnobsRejectNonNumeric) {
+    // A non-numeric mem_total_kb is ignored (stays unset) rather than mis-parsed.
+    std::string path = write_temp_file("[backend]\nmem_total_kb = \"lots\"\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    EXPECT_FALSE(opt->ext.backend.mem_total_kb.has_value());
+}
+
+// ===========================================================================
+// Mount remap: [filesystem].remap_cwd + [[filesystem.mount]].
+// ===========================================================================
+
+TEST(Profile, LoadRemapCwd) {
+    std::string path = write_temp_file("[filesystem]\nremap_cwd = \"/work\"\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    ASSERT_TRUE(opt->ext.remap_cwd.has_value());
+    EXPECT_EQ(*opt->ext.remap_cwd, "/work");
+}
+
+TEST(Profile, LoadExplicitRemapMounts) {
+    std::string path = write_temp_file(
+        "[[filesystem.mount]]\n"
+        "host = \"/home/u/data\"\n"
+        "sandbox = \"/data\"\n"
+        "mode = \"ro\"\n"
+        "[[filesystem.mount]]\n"
+        "host = \"/home/u/out\"\n"
+        "sandbox = \"/out\"\n"
+        "mode = \"rw\"\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    const auto& rm = opt->ext.remap_mounts;
+    ASSERT_EQ(rm.size(), 2u);
+    EXPECT_EQ(rm[0].host, "/home/u/data");
+    EXPECT_EQ(rm[0].sandbox, "/data");
+    EXPECT_EQ(rm[0].mode, raincoat::MountMode::ReadOnly);
+    EXPECT_EQ(rm[1].host, "/home/u/out");
+    EXPECT_EQ(rm[1].sandbox, "/out");
+    EXPECT_EQ(rm[1].mode, raincoat::MountMode::ReadWrite);
+}
+
+TEST(Profile, LoadRemapMountDefaultsToReadOnly) {
+    // Omitted mode defaults to read-only (the safe choice).
+    std::string path = write_temp_file(
+        "[[filesystem.mount]]\nhost = \"/home/u/data\"\nsandbox = \"/data\"\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    ASSERT_EQ(opt->ext.remap_mounts.size(), 1u);
+    EXPECT_EQ(opt->ext.remap_mounts[0].mode, raincoat::MountMode::ReadOnly);
+}
+
+TEST(Profile, LoadRemapMountSkipsIncompleteEntry) {
+    // An entry missing host or sandbox is dropped (not half-applied).
+    std::string path = write_temp_file(
+        "[[filesystem.mount]]\nsandbox = \"/data\"\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    EXPECT_TRUE(opt->ext.remap_mounts.empty());
+}
+
 TEST(Profile, LoadCommentsAndBlankLinesIgnored) {
     std::string path = write_temp_file(
         "# leading comment\n"

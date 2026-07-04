@@ -1,10 +1,19 @@
-// Raincoat — tests for the PURE, host-independent parts of the seccomp uname notifier:
-// the BPF program shape and the new_utsname wire packing. The syscall machinery itself
-// (filter install, supervisor loop) is exercised end-to-end by the runner, not here.
+// Raincoat — tests for the seccomp identity notifier: the PURE parts (BPF program shape,
+// new_utsname wire packing) plus a live integration test that installs the filter and checks
+// the supervisor actually fakes uname(2)/sysinfo(2)/sched_getaffinity(2) at runtime.
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstring>
 #include <string>
+#include <thread>
+
+#include <sched.h>
+#include <sys/socket.h>
+#include <sys/sysinfo.h>
+#include <sys/utsname.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <linux/filter.h>
 #include <linux/seccomp.h>
@@ -112,3 +121,87 @@ TEST(SeccompNotify, TruncatesOverlongFieldAndKeepsNul) {
     // The overflow must not have bled into the next field.
     EXPECT_EQ(field(b, 3), "SENTINEL");
 }
+
+// ---------------------------------------------------------------------------
+// Live integration: install the filter in a child and verify the supervisor fakes
+// uname(2)/sysinfo(2)/sched_getaffinity(2) at the SYSCALL level. Self-contained (no bwrap).
+// Skips gracefully when unprivileged seccomp user-notify is unavailable on the host.
+// ---------------------------------------------------------------------------
+#if defined(__x86_64__)
+
+// Child exit codes report which stage failed (parent turns these into assertions).
+enum : int { CX_OK = 0, CX_INSTALL = 10, CX_UNAME = 11, CX_SYSINFO = 12, CX_AFFINITY = 13 };
+
+static constexpr unsigned long kFakeUptime = 4321;
+static constexpr unsigned long long kFakeRamBytes = 2ULL * 1024 * 1024 * 1024;  // 2 GiB
+static constexpr int kFakeCpus = 3;
+
+TEST(SeccompNotifyLive, FakesUnameSysinfoAffinity) {
+    int sock[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sock), 0);
+
+    pid_t pid = ::fork();
+    ASSERT_GE(pid, 0);
+    if (pid == 0) {
+        // ---- child ----
+        ::close(sock[0]);
+        auto prog = build_identity_filter_program(true, true, true);
+        if (seccomp_child_install_and_send(sock[1], prog.data(),
+                                           static_cast<unsigned int>(prog.size())) != 0)
+            _exit(CX_INSTALL);
+        // Filter is now active; these calls trap to the parent supervisor.
+        struct utsname u;
+        if (::uname(&u) != 0 || std::strcmp(u.nodename, "testhost") != 0 ||
+            std::strcmp(u.release, "TESTREL") != 0 || std::strcmp(u.version, "TESTVER") != 0)
+            _exit(CX_UNAME);
+        struct sysinfo si;
+        if (::sysinfo(&si) != 0 || static_cast<unsigned long>(si.uptime) != kFakeUptime ||
+            static_cast<unsigned long long>(si.totalram) != kFakeRamBytes)
+            _exit(CX_SYSINFO);
+        cpu_set_t cs;
+        CPU_ZERO(&cs);
+        if (::sched_getaffinity(0, sizeof(cs), &cs) != 0 || CPU_COUNT(&cs) != kFakeCpus)
+            _exit(CX_AFFINITY);
+        _exit(CX_OK);
+    }
+
+    // ---- parent (supervisor) ----
+    ::close(sock[1]);
+    int lfd = seccomp_recv_listener_fd(sock[0]);
+    ::close(sock[0]);
+    if (lfd < 0) {
+        // Child could not install the filter (kernel/policy lacks unprivileged user-notify).
+        int st = 0;
+        ::waitpid(pid, &st, 0);
+        GTEST_SKIP() << "seccomp user-notify unavailable on this host";
+    }
+
+    IdentitySpoof spoof;
+    spoof.trap_uname = spoof.trap_sysinfo = spoof.trap_affinity = true;
+    spoof.uts_nodename = "testhost";
+    spoof.uts_release = "TESTREL";
+    spoof.uts_version = "TESTVER";
+    spoof.sys_uptime_seconds = kFakeUptime;
+    spoof.sys_total_ram_bytes = kFakeRamBytes;
+    spoof.cpu_count = kFakeCpus;
+
+    std::atomic<bool> stop{false};
+    std::thread sup(seccomp_supervise_identity, lfd, spoof, std::ref(stop));
+
+    int status = 0;
+    ASSERT_EQ(::waitpid(pid, &status, 0), pid);
+    stop.store(true);
+    sup.join();
+    ::close(lfd);
+
+    ASSERT_TRUE(WIFEXITED(status));
+    const int code = WEXITSTATUS(status);
+    EXPECT_EQ(code, CX_OK) << "child failed at stage "
+                           << (code == CX_INSTALL  ? "install"
+                               : code == CX_UNAME    ? "uname"
+                               : code == CX_SYSINFO  ? "sysinfo"
+                               : code == CX_AFFINITY ? "affinity"
+                                                     : "unknown");
+}
+
+#endif  // __x86_64__
