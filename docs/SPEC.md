@@ -229,6 +229,26 @@ Roadmap: network allowlist mode; interactive ask mode; browser profile isolation
 (Playwright/Puppeteer/Selenium); better font/emoji fingerprint resistance; honeytoken/tripwire
 files; macOS best-effort; JSON audit logs; per-command policy templates; agent-specific profiles.
 
+## Per-platform capability / guarantee matrix
+Raincoat's guarantees are delivered by a per-platform backend behind the seam in `src/backend.hpp`
+(EXACTLY ONE linked per build; compile-time selection, no runtime dispatch). **Linux (bubblewrap) is
+the reference backend** — it CONSTRUCTS a mount/UTS/net namespace, so hiding is structural and
+fail-closed. **macOS (Seatbelt via `/usr/bin/sandbox-exec`) is best-effort** — it FILTERS the real
+filesystem with a kernel deny policy, so hiding is deny-based and fail-open, and the runner adds a
+per-run fail-closed pre-flight probe to compensate. The runner GATES every platform step on the
+backend's `Capabilities` so a guarantee a backend cannot deliver is SKIPPED, never dishonestly audited.
+Measured on macOS 26.5.1 (Apple Silicon). Full honest write-up: `docs/MACOS.md`.
+
+| Guarantee | Linux (bwrap) — reference | macOS (Seatbelt) — best-effort |
+|---|---|---|
+| Filesystem hiding | **Structural / fail-closed**: unlisted paths absent; a missing bind aborts | **Filter / fail-open**: real `$HOME` + `/Users` DENIED over the real fs (present-but-denied); every path realpath'd (a raw `/tmp` rule fails open); a per-run **pre-flight probe** refuses the run if the real `$HOME` is still readable |
+| Network off | `--unshare-net` (fresh empty netns) | `(deny network*)` kernel policy |
+| Egress firewall (proxy/bridge only) | Needs the pasta **strict** netns jail; without it, proxy-aware clients only | **Kernel firewall for ALL clients, no helper**: `(deny network*)` + `(allow network-outbound (remote ip "localhost:<port>"))`; needs no pasta, does not fail closed — STRONGER than Linux |
+| Identity / hostname | Generic `USER`/`LOGNAME`/`HOSTNAME` **+** fresh UTS ns fakes `gethostname()` | Generic `USER`/`LOGNAME` env only; **`gethostname()`/`uname()` leak the real name** (only `$HOSTNAME` env faked); username can still leak via `getpwuid()` |
+| Fonts | Curated Noto/DejaVu set (tmpfs mask + re-bind) | **None** — Core Text, not fontconfig; cannot overlay `/usr/share/fonts` |
+| Minimal `/etc` | Generic `/etc/hostname`/`hosts`/`localtime` binds | **None** — cannot bind a fake `/etc` |
+| Env injection | Baked into argv (`--clearenv` + `--setenv`) | Installed at `execve` (SBPL has no env directives) |
+
 ## Build/test environment facts (this host)
 - g++ 13.3 (use -std=c++17). cmake 3.28. GoogleTest static libs at
   /usr/lib/x86_64-linux-gnu/libgtest.a and libgtest_main.a; headers /usr/include/gtest.

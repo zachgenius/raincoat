@@ -204,6 +204,76 @@ Leaf helpers. No raincoat-specific types.
   command tokens are appended verbatim. This is the ONLY correct place to redact — a flattened
   string cannot be re-parsed unambiguously.
 
+### backend  (deps: config) — the platform seam; EXACTLY ONE TU linked per build
+The runner never talks to bwrap or sandbox-exec directly — it talks to three free functions + three
+POD structs. Selection is at **compile time** (see CMakeLists: `backend_linux.cpp` on Linux delegates
+to the pure `bwrap::build_bwrap_argv`; `backend_macos.cpp` on macOS delegates to the pure
+`build_seatbelt_profile`), so there is **no runtime dispatch and no `virtual`** — same
+free-functions / error-code style as every other module.
+- `enum class FsHiding { Structural, Filter, None };` — `Structural` = the sandbox is CONSTRUCTED
+  (bwrap; an unlisted path does not exist, a missing bind aborts → fail-closed). `Filter` = the child
+  runs on the REAL fs and a kernel policy DENIES unlisted paths (Seatbelt; a rule that fails to match
+  silently grants → fail-open, which is why the macOS backend pairs it with a per-run pre-flight probe).
+- `enum class NetOff { UnshareNet, PolicyDeny, None };` — how `NetMode::Off` is realised
+  (bwrap `--unshare-net` vs Seatbelt `(deny network*)`).
+- `enum class EnvApply { ViaArgv, ViaExec };` — `ViaArgv` bakes env into argv (bwrap
+  `--clearenv`/`--setenv`; `LaunchPlan.child_env` unused). `ViaExec` installs `child_env` at
+  `execve`/`posix_spawn` time (SBPL has no env directives). Per-backend: applying the resolved env on
+  the Linux path would feed pasta/bwrap the wrong environment.
+- `struct Capabilities` — pure data; the honesty descriptor the runner GATES every platform-specific
+  step on. Fields: `fs_hiding`, `net_off`, `env_apply`, `bool net_firewall_kernel` (kernel egress
+  firewall for ALL clients with no netns jail — true on macOS, false on Linux), and the feature gates
+  `supports_fontconfig_isolation / supports_uts_hostname / supports_minimal_etc / supports_curated_fonts
+  / supports_netns_jail`, plus `std::string label` (audit + doctor). **Defaults reproduce the Linux
+  (bubblewrap) contract exactly**; the macOS backend overrides only the ones it cannot deliver, so a
+  backend that lacks a guarantee SKIPS the step instead of emitting a dishonest audit note.
+- `struct LaunchInputs` — everything a backend needs, all pre-resolved by the runner (incl.
+  realpath'd macOS paths): `backend_path`, `const Config* cfg` (= the effective `cfg_copy`), `mounts`,
+  `EnvResolution env`, `fake_home`, `sandbox_tmp`/`_out`, font/mask/audit dirs, the pasta-jail context
+  (`jail_active`, `strict_jail`, `pasta_path`, `jail_forward_ports` — inert on backends with
+  `supports_netns_jail=false`), and the Seatbelt-only fields `real_home`, `fs_deny_resolved`,
+  `profile_path`, `allow_loopback_ports`.
+- `struct LaunchPlan` — what the runner forks/execs + audits: `launch_path`, `argv` (post jail-wrap),
+  `child_env` (applied at exec iff `env_apply == ViaExec`), `env_apply`, display-safe `audit_command`,
+  and (macOS) `profile_text` + `profile_path` (the SBPL text and where the runner must write it — the
+  side effect is the runner's, not the backend's).
+- `Capabilities backend_capabilities();` — static descriptor of the linked backend. Pure.
+- `std::optional<std::string> backend_locate(const Config& cfg, std::string& err);` — Linux: honor an
+  executable `cfg.ext.backend.bwrap_path` (`/` + X_OK), else `find_bwrap()`; on failure nullopt + the
+  multi-line "missing bwrap" message. macOS: the fixed `/usr/bin/sandbox-exec`, or nullopt + err.
+- `std::optional<LaunchPlan> backend_build_launch(const LaunchInputs& in, std::string& err);` — builds
+  the final launch from fully-resolved inputs; **never touches the filesystem** (the runner writes any
+  `profile_text`). Linux currently never fails here; the Seatbelt backend fails CLOSED on an
+  unrepresentable profile (nullopt + err).
+
+### seatbelt  (deps: config, backend) — PURE SBPL assembly, no side effects
+The macOS peer of `bwrap.cpp`. `build_seatbelt_profile` turns FULLY realpath-resolved `LaunchInputs`
+into the text of a `.sb` profile via deterministic string assembly + SBPL escaping — unit-testable with
+hand-built inputs exactly like `build_bwrap_argv`. The CALLER (`backend_macos.cpp`) realpaths every path
+first: SBPL `(subpath …)` matches the kernel-canonical path, so a raw `/tmp/...` rule silently fails
+open (measured — see docs/MACOS.md).
+- `std::string build_seatbelt_profile(const LaunchInputs& in, std::string& err);`
+  **Filter model** — starts `(allow default)`, then:
+  - deny the real home (`(deny file-read* file-write* (subpath <real_home>))`; `file-read*` blocks
+    `stat()` too) and deny `(subpath "/Users")` so `ls /Users` cannot enumerate the username;
+  - re-allow the sandbox-private writable dirs (fake home, sandbox tmp, sandbox out), the effective
+    workdir (unless already covered by the fake home or a user mount), and each user mount (RO → read,
+    RW → read+write) — `(subpath …)` is correct for files and dirs alike;
+  - re-deny the `fs_deny_resolved` set LAST among file rules (so a deny beats a broad re-allow, e.g.
+    workdir `== $HOME` re-allowed but `~/.ssh` denied), then deny the audit dir, then self-deny the
+    generated profile (`(literal <profile_path>)` — it names the real home/username);
+  - **network**: a non-empty `allow_loopback_ports` (guarded proxy / egress bridge active) emits
+    `(deny network*)` + one `(allow network-outbound (remote ip "localhost:<port>"))` per port — a
+    kernel egress firewall for EVERY client (DNS intentionally NOT allowed); else `NetMode::Off` emits
+    `(deny network*)`; `Full` emits nothing (allow-default already permits it).
+  - **strict** = allow-default + EXPANDED denies + no cwd auto-grant (NOT kernel default-deny — a bare
+    `(deny default)` can't even load libSystem on macOS; the profile emits an honest comment).
+  Ordering is **last-match-wins**, so a deny that must beat a re-allow is emitted after it. Returns
+  `""` + err when a path is unrepresentable (contains a newline or NUL) — **fail CLOSED** rather than
+  emit a profile a smuggled byte could subvert.
+- `std::string sbpl_str(const std::string& s, bool& ok);` — PURE, exposed for testing: wrap a path as
+  an SBPL string literal, escaping `\` and `"`; `ok=false` on an unrepresentable newline/NUL.
+
 ### audit  (deps: config) — `AuditRecord` lives in audit.hpp
 - `struct AuditRecord { std::string command_line; bool strict; NetMode net; std::string fake_home;`
   `  std::string workdir; std::vector<Mount> mounts; EnvResolution env; FontStatus font;`

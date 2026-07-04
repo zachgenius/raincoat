@@ -348,3 +348,61 @@ via PATH — an absolute-path launch or a flag override bypasses them. NOT deep 
 - [x] No regression: 47 suites green, -Wall -Wextra clean
 
 **PHASE 5 (browser isolation, best-effort): COMPLETE ✅**
+
+---
+
+## Phase 6 — macOS (Seatbelt, best-effort)  (see docs/MACOS.md)
+
+A reduced-guarantee macOS port behind the platform seam (`src/backend.hpp`). One backend TU is
+linked per platform (compile-time, no virtuals): `bwrap.cpp`+`backend_linux.cpp` on Linux,
+`seatbelt.cpp`+`backend_macos.cpp` on macOS. The runner talks only to the three free functions +
+three POD structs and GATES every platform step on the backend's `Capabilities`, so a guarantee
+Seatbelt cannot deliver is SKIPPED, never dishonestly audited. **The core inversion:** bwrap
+CONSTRUCTS a namespace (fail-closed, structural); Seatbelt FILTERS the real filesystem (fail-open,
+deny-based). So structural `[x]` guarantees become best-effort `[~]`, and a per-run fail-closed
+pre-flight probe restores a measured fail-closed check. Measured on macOS 26.5.1 (Apple Silicon).
+
+### 6.1 Backend seam  (backend.hpp / backend_macos.cpp / backend_linux.cpp)
+- [x] `Capabilities` / `LaunchInputs` / `LaunchPlan` PODs; `backend_capabilities` / `backend_locate` / `backend_build_launch` free functions; compile-time platform selection, no runtime dispatch — *backend.hpp / CMakeLists*
+- [x] Linux backend delegates to the unchanged `build_bwrap_argv` + reproduces the pasta wrap; no MVP regression — *backend_linux.cpp / test_backend_golden_argv*
+- [x] macOS `Capabilities`: `fs_hiding=Filter`, `net_off=PolicyDeny`, `env_apply=ViaExec`, `net_firewall_kernel=true`; `supports_{fontconfig,uts_hostname,minimal_etc,curated_fonts,netns_jail}=false` — *backend_macos.cpp*
+- [x] `backend_locate` returns `/usr/bin/sandbox-exec` (actionable error if absent/not X_OK) — *backend_macos.cpp*
+
+### 6.2 SBPL generator  (seatbelt.cpp — pure, no filesystem access)
+- [x] `build_seatbelt_profile` is pure string assembly over fully-realpath'd `LaunchInputs` (peer of `build_bwrap_argv`) — *seatbelt.cpp / test_seatbelt*
+- [x] Filter model: `(allow default)` then SUBTRACT real home + `/Users`, RE-ALLOW sandbox dirs/workdir/mounts, RE-DENY fs-deny + audit dir + self-profile LAST (last-match-wins) — *seatbelt.cpp / test_seatbelt*
+- [x] `sbpl_str` escapes `\`/`"`; a smuggled newline/NUL is unrepresentable → fail CLOSED (`""` + err) — *seatbelt.cpp / test_seatbelt*
+- [x] Every path realpath'd caller-side (`backend_macos.cpp`) — a raw `/tmp` rule silently fails open; canonical `/private/tmp` works (MEASURED); one spelling covers the Data-volume firmlink twin (no doubling) — *backend_macos.cpp*
+- [x] Darwin per-user cache dir (`_CS_DARWIN_USER_CACHE_DIR`) folded into the deny set (not under `$HOME`) — *backend_macos.cpp*
+
+### 6.3 What WORKS (verified)
+- [x] Env scrub / generic identity: `USER`/`LOGNAME`/`HOME`/`TZ`/`LANG` faked, applied at `execve` (SBPL has no env directives) — *runner / backend_macos* (verified)
+- [x] Fake `$HOME` hides real home: `~/.ssh`, `~/.gitconfig` → *Operation not permitted*; `file-read*` blocks `stat()` too — *seatbelt* (MEASURED)
+- [x] Username-enumeration deny: `(deny file-read* (subpath "/Users"))` → `ls /Users` EPERM (deny-home ALONE leaked it) — *seatbelt* (MEASURED)
+- [x] `--net off` → `(deny network*)` blocks outbound to a public IP — *seatbelt* (MEASURED)
+- [x] **Kernel egress firewall** (`isolate_netns = "strict"` + egress/proxy): `(deny network*)` + `(allow network-outbound (remote ip "localhost:<port>"))` — constrains ALL clients (not just proxy-aware), NO pasta, port-precise, `localhost` covers `::1`; needs no pasta and does NOT fail closed on macOS — a STRENGTH over Linux — *seatbelt / runner* (MEASURED)
+- [x] **Fail-closed pre-flight probe** (every run): spawns a probe under the IDENTICAL profile that tries to read real `$HOME` (+ connect to a public IP when net-restricted); REFUSES the run if either succeeds — restores fail-closed for a Filter backend — *runner* (verified: a permissive profile aborts the run)
+
+### 6.4 Best-effort on macOS (deny-based, honest `[~]`)
+- [~] best-effort (macOS): real-`$HOME` hiding is DENY-based (present-but-denied), not structural absence — mitigated (not fixed) by the pre-flight probe — *seatbelt / runner*
+- [~] best-effort (macOS): audit-dir tamper protection is a deny rule over the real audit dir, not a tmpfs mask — *seatbelt*
+
+### 6.5 N/A on macOS (honest `[-]` — gated off, never dishonestly audited)
+- [-] N/A on macOS: structural (fail-closed) filesystem invisibility — Seatbelt is a Filter, so it is deny-based/fail-open (`fs_hiding=Filter`)
+- [-] N/A on macOS: UTS hostname masking — no UTS ns; `gethostname()`/`uname()` leak the real name, only `$HOSTNAME` env is faked (`supports_uts_hostname=false`)
+- [-] N/A on macOS: minimal `/etc` view — cannot bind a fake `/etc` (`supports_minimal_etc=false`)
+- [-] N/A on macOS: curated-font / fontconfig masking — Core Text, not fontconfig; cannot overlay `/usr/share/fonts` (`supports_curated_fonts`/`supports_fontconfig_isolation=false`)
+- [-] N/A on macOS: pasta netns jail + `/proc/net/tcp` leak-fix — no `/proc`, no netns; kernel firewall replaces it (`supports_netns_jail=false`)
+- [-] N/A on macOS: true `(deny default)` strict — a bare deny-default can't even load libSystem (MEASURED, exit 71); macOS `strict` = allow-default + expanded denies + no cwd auto-grant
+
+### 6.6 Disclosed residual bypasses (present, not hidden — see docs/MACOS.md)
+- [x] `getpwuid()->pw_name`/`pw_dir` can still leak the real username/home via opendirectoryd (not a filesystem read) — *docs/MACOS.md*
+- [x] Hardlinks on the shared APFS volume can reference a denied inode by a different path — *docs/MACOS.md*
+- [x] Exposure depends on the host's TCC state (Full Disk Access on the parent terminal changes reachable surface) — *docs/MACOS.md*
+
+### 6.7 Verification gate (Phase 6)
+- [x] `tests/test_seatbelt.cpp` SBPL golden/assembly suite (compiled only on macOS; Linux `bwrap` suites pruned on macOS) — *CMakeLists*
+- [x] Real runs verified on macOS 26.5.1: real `~/.ssh`/`~/.gitconfig` denied, `ls /Users` EPERM, fake identity via env, `--net off` blocks outbound, kernel egress firewall constrains raw clients, pre-flight probe aborts a permissive profile
+- [x] docs/MACOS.md (honest design + threat model) + this Phase 6 tracker; README "Platform status" updated to best-effort macOS
+
+**PHASE 6 (macOS Seatbelt, best-effort): COMPLETE ✅**

@@ -315,9 +315,39 @@ or service.
 
 ## Platform status
 
-**Linux-first.** Raincoat depends on bubblewrap and Linux user namespaces, which is the entire
-MVP target. **macOS and Windows are non-goals for the MVP.** A best-effort macOS mode is on the
-roadmap but not implemented.
+**Linux is the reference backend.** On Linux, Raincoat wraps bubblewrap + user namespaces, which
+CONSTRUCTS a fresh namespace: hidden paths simply don't exist, and a failed mount aborts the run —
+structural, fail-closed guarantees. This is the platform every guarantee in this README is measured
+against.
+
+**macOS is a best-effort Seatbelt backend** (in progress on the `macos-seatbelt-backend` branch).
+Instead of bubblewrap it runs your command under Apple's Seatbelt via
+`/usr/bin/sandbox-exec -f <profile.sb> -- <cmd>`, behind the same platform seam as the Linux backend
+(selected at compile time; the runner skips any guarantee the backend can't deliver rather than fake
+the audit note). **Windows remains a non-goal.**
+
+### macOS (best-effort)
+
+The macOS mode reduces casual, opportunistic leakage — but it is a genuinely weaker port, for three
+honest reasons. Read [`docs/MACOS.md`](docs/MACOS.md) before trusting it:
+
+1. **It filters, it doesn't construct — so a fail-closed pre-flight probe stands in.** Seatbelt runs
+   the child on your **real** filesystem and layers a kernel *deny* policy on top: a hidden file is
+   still on disk, and a deny rule that fails to match **fails open** (silently grants access), the
+   opposite of bubblewrap's fail-closed structure. To compensate, every macOS run first spawns a
+   throwaway probe under the identical profile and **refuses to run** if that probe can still read
+   your real `$HOME` (or reach the network when it shouldn't).
+2. **`sandbox-exec` is Apple-deprecated.** It works today and is the only way to confine an arbitrary
+   CLI, but Apple ships no supported replacement for that use case (the App Sandbox needs a signed
+   bundle + entitlements). Raincoat uses the deprecated-but-functional path and says so.
+3. **No font / `/etc` / hostname masking.** macOS uses Core Text (not fontconfig) and has no UTS
+   namespace, so the curated font set, the minimal `/etc` view, and `gethostname()`/`uname()` masking
+   are all unavailable — only the `$HOSTNAME` *env* value is faked. (One place macOS is actually
+   *stronger*: the guarded-proxy egress firewall is kernel-enforced for **all** clients with no pasta
+   helper — see [`docs/MACOS.md`](docs/MACOS.md).)
+
+Same raincoat, thinner fabric: it keeps the everyday drizzle off on macOS too, but the seams are wider
+and honestly disclosed.
 
 ---
 
@@ -712,11 +742,14 @@ roadmap have since shipped.
   ([Browser isolation](#browser-isolation-browser)).
 - **Per-job profile templates** — the [`examples/`](examples/) directory (strict, paranoid,
   ai-agent, node-build, python-tool, egress, api-agent, guarded, browser).
+- **macOS best-effort mode** (in progress on `macos-seatbelt-backend`) — a reduced-guarantee Seatbelt
+  backend behind the platform seam: `sandbox-exec` deny-based filtering + a fail-closed per-run
+  pre-flight probe, a kernel egress firewall, and honest `[-]` gaps (no font/`/etc`/hostname masking).
+  Full honest write-up in [`docs/MACOS.md`](docs/MACOS.md).
 
 **Still ahead / genuine non-goals:**
 
-- **macOS best-effort mode** — a reduced-guarantee port; the current design is Linux-only (needs
-  bubblewrap + user namespaces). Non-goal for now.
+- **Windows** — a non-goal; there is no bubblewrap/Seatbelt equivalent Raincoat targets.
 - **Interactive "ask" mode** — prompt before granting access at run time (reserved as `ask` in the
   `NetMode` enum). Not implemented.
 - **General CIDR / allowlist egress firewall** — the guarded proxy is name-based, not CIDR, and the
