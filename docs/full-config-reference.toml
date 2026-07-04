@@ -282,6 +282,18 @@ timeout_seconds = 120
 # Important for agent/LLM-style APIs.
 streaming = true
 
+# Network-namespace isolation for the bridge:
+#   "auto" (default) : run the child inside an isolated pasta network namespace WHEN
+#                      pasta is installed, otherwise fall back to shared-loopback.
+#   "on"             : prefer the isolated pasta netns (fall back to shared if pasta absent).
+#   "off"            : always share the host loopback (the child's /proc/net/tcp can then
+#                      observe the upstream socket).
+# The isolated netns keeps the child_endpoint at 127.0.0.1:<port>, hides the host-side
+# bridge->upstream socket from the child's /proc/net/tcp, and exposes ONLY the bridge
+# port(s) on the ns loopback. It is a NAT (general outbound internet still works), NOT a
+# per-destination firewall.
+isolate_netns = "auto"
+
 # Multiple bridges can be configured.
 #
 # The child process sees only the child endpoint.

@@ -172,8 +172,10 @@ CLI grammar: the subcommand must be the first token (e.g. `raincoat init --profi
 ## Phase 2 — Egress bridge / endpoint indirection  (see docs/EGRESS.md)  ✅ MVP LANDED
 
 Generic, profile-driven. No provider/model/env/service names hard-coded. Host-side HTTP(S)
-forward proxy per bridge (`src/egress.*`), wired into the live runner. Deferred items below
-stay honest `[-]` (a true network jail, guarded/DNS policy, transparent/MITM modes).
+forward proxy per bridge (`src/egress.*`), wired into the live runner. The isolated-netns
+egress jail (pasta) has since landed as a *partial* network jail — it fixes the `/proc-net`
+upstream leak and hides other host-loopback services (§2.6). Items that remain stay honest
+`[-]` (a per-destination egress firewall, guarded/DNS policy, transparent/MITM modes).
 
 ### 2.1 Profile schema & parsing
 - [x] `[egress] mode = off|bridge`; `[[egress.bridge]]` array-of-tables — *profile/egress*
@@ -201,12 +203,22 @@ stay honest `[-]` (a true network jail, guarded/DNS policy, transparent/MITM mod
 - [x] Log "Egress bridge enabled: <name>", child endpoint, "Upstream endpoint: hidden", injected env var — *audit / runner* (verified)
 - [x] Never log upstream endpoint or sensitive bodies by default; per-bridge + child-readable fail-closed redaction — *runner / test_egress_audit_ro_leak_attack*
 
-### 2.6 Longer-term (deferred, design so they slot in)
-- [-] True network jail (egress-only netns via veth/slirp) · [-] `guarded` mode + domain allow/block · [-] DNS policy · [-] transparent egress · [-] explicit MITM (off by default)
+### 2.6 Isolated-netns egress jail (pasta) — LANDED (partial network jail)
+- [x] Run the child inside pasta's private netns when egress active + pasta present + `isolate_netns != off`: `pasta --config-net -t none -T <bridge-ports> -- bwrap …` (bwrap JOINS, does not `--unshare-net`) — *runner / test_egress_jail_netns* (verified e2e)
+- [x] child_endpoint unchanged at `127.0.0.1:<port>` (pasta `-T` forwards ns loopback → host bridge); child reaches the upstream — *runner* (verified: child got `UPSTREAM_OK`)
+- [x] **`/proc/net/tcp` upstream leak FIXED** — host-side bridge→upstream socket stays in the host netns, invisible to the child — *runner* (MEASURED: upstream IP:port absent from child `/proc/net/tcp`)
+- [x] Tighter than shared mode: `-t none` exposes only the forwarded bridge port(s); other host-loopback services NOT reachable — *runner*
+- [x] `[egress].isolate_netns = auto|on|off` knob; `auto` uses the jail when pasta present, else shared fallback — *config/profile*
+- [x] pasta reaped/torn down on every exit path (normal/error/signal), exit code propagated; graceful fallback + warning when pasta requested but absent — *runner / test_egress_jail_pasta_failure_regression*
+- [x] `doctor` reports egress-jail availability (pasta/slirp4netns) as `[ OK ]`/`[INFO]`, never `[FAIL]` — *doctor / test_doctor* (verified)
+- [-] **Per-destination egress firewall** — pasta NATs general outbound traffic, so the child retains general internet by IP; the jail is NOT an allow-list firewall (honest non-goal this phase)
+- [-] Host-loopback mapping on newer pasta (`--map-host-loopback`, so the host is at the child's `127.0.0.1`) — this pasta build lacks it
+- [-] `guarded` mode + domain allow/block · [-] DNS policy · [-] transparent egress · [-] explicit MITM (off by default)
 
 ### 2.7 Limitations documented (honest)
 - [x] Hides upstream URL from child env, not the fact a custom endpoint is used — *EGRESS.md / README*
-- [x] Shared host netns ⇒ NOT a network jail; upstream IP:port visible via `/proc/net/tcp`; general net access retained — *EGRESS.md / README* (disclosed in the audit every run)
+- [x] Shared-loopback fallback (no pasta / `isolate_netns=off`) ⇒ NOT a network jail; upstream IP:port visible via `/proc/net/tcp`; general net access retained — *EGRESS.md / README* (disclosed in the audit every run)
+- [x] Isolated-netns jail (pasta) FIXES the `/proc-net` upstream leak + hides other host-loopback services, but still NATs general internet (not a per-destination firewall) — *EGRESS.md / README* (MEASURED; disclosed in the audit + a stderr note every run)
 - [x] HTTPS hostname rewrite may need MITM/cert control/transparent routing — *EGRESS.md*
 - [x] No claims of bypassing any specific tool/service detection — *EGRESS.md / README*
 

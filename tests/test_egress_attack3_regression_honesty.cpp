@@ -350,7 +350,7 @@ TEST(EgressAttack3Regression, ActiveBridgeAuditIsTamperProof) {
     std::string profile_path = (fs::path(profile_dir) / "egress.toml").string();
     {
         std::ofstream p(profile_path);
-        p << "[egress]\nmode = \"bridge\"\n\n"
+        p << "[egress]\nmode = \"bridge\"\nisolate_netns = \"off\"\n\n"
           << "[[egress.bridge]]\n"
           << "name = \"api\"\n"
           << "env = \"MY_BASE_URL\"\n"

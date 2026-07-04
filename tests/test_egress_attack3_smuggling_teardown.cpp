@@ -420,7 +420,7 @@ TEST(EgressAttack3E2E, PortInUseAbortsRunNotSilentlyUnbridged) {
     std::string profile_path = (fs::path(profile_dir) / "egress.toml").string();
     {
         std::ofstream p(profile_path);
-        p << "[egress]\nmode = \"bridge\"\n\n"
+        p << "[egress]\nmode = \"bridge\"\nisolate_netns = \"off\"\n\n"
           << "[[egress.bridge]]\nname = \"api\"\nenv = \"BASE_URL\"\n"
           << "child_endpoint = \"" << child_ep << "\"\n"
           << "upstream_endpoint = \"http://127.0.0.1:1\"\n";
@@ -462,7 +462,7 @@ TEST(EgressAttack3E2E, ActiveBridgeAuditDisclosesSharedNetNamespace) {
     std::string profile_path = (fs::path(profile_dir) / "egress.toml").string();
     {
         std::ofstream p(profile_path);
-        p << "[egress]\nmode = \"bridge\"\n\n"
+        p << "[egress]\nmode = \"bridge\"\nisolate_netns = \"off\"\n\n"
           << "[[egress.bridge]]\nname = \"api\"\nenv = \"BASE_URL\"\n"
           << "child_endpoint = \"" << child_ep << "\"\n"
           << "upstream_endpoint = \"http://127.0.0.1:1\"\n";
@@ -521,7 +521,7 @@ TEST(EgressAttack3E2E, PerBridgeHideUpstreamHonoredInAudit) {
     std::string profile_path = (fs::path(profile_dir) / "egress.toml").string();
     {
         std::ofstream p(profile_path);
-        p << "[egress]\nmode = \"bridge\"\n"
+        p << "[egress]\nmode = \"bridge\"\nisolate_netns = \"off\"\n"
           << "redact_upstreams_in_audit = false\n\n"  // global redaction OFF
           << "[[egress.bridge]]\nname = \"hidden-api\"\nenv = \"HID_URL\"\n"
           << "child_endpoint = \"" << child_ep1 << "\"\n"

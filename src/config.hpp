@@ -42,6 +42,13 @@ enum class FontStatus { Disabled, Enabled, BestEffort, Unavailable };
 // emits a single structured JSON object per run (same information, never secrets).
 enum class AuditFormat { Text, Json };
 
+// Egress network-namespace isolation policy ([egress].isolate_netns).
+//   Auto -> use the isolated pasta netns jail WHEN pasta is available on the host,
+//           otherwise fall back to the shared-loopback model (with a warning). Default.
+//   On   -> prefer the jail; if pasta is absent, fall back to shared-loopback (warn).
+//   Off  -> always use the shared-loopback model, even when pasta is present.
+enum class NetnsIsolation { Auto, On, Off };
+
 // ---------------------------------------------------------------------------
 // Enum <-> string helpers (inline, no link deps)
 // ---------------------------------------------------------------------------
@@ -85,6 +92,28 @@ inline const char* to_string(AuditFormat f) {
 inline std::optional<AuditFormat> audit_format_from_string(const std::string& s) {
     if (s == "text") return AuditFormat::Text;
     if (s == "json") return AuditFormat::Json;
+    return std::nullopt;
+}
+
+inline const char* to_string(NetnsIsolation i) {
+    switch (i) {
+        case NetnsIsolation::Auto: return "auto";
+        case NetnsIsolation::On:   return "on";
+        case NetnsIsolation::Off:  return "off";
+    }
+    return "auto";
+}
+
+// Parse the [egress].isolate_netns knob. Accepts the canonical "auto"/"on"/"off"
+// plus common synonyms so a profile can spell the intent naturally. Unknown values
+// return nullopt (the caller keeps the default rather than aborting the profile).
+inline std::optional<NetnsIsolation> netns_isolation_from_string(const std::string& s) {
+    if (s == "auto") return NetnsIsolation::Auto;
+    if (s == "on" || s == "true" || s == "yes" || s == "jail" || s == "isolate" ||
+        s == "isolated")
+        return NetnsIsolation::On;
+    if (s == "off" || s == "false" || s == "no" || s == "shared" || s == "share")
+        return NetnsIsolation::Off;
     return std::nullopt;
 }
 
@@ -195,6 +224,12 @@ struct EgressConfig {
     bool log_response_bodies = false;
     int  timeout_seconds = 120;
     bool streaming = true;
+    // Network-namespace isolation policy. Auto (default) runs the child inside an
+    // isolated pasta netns (a private tap + NAT) when pasta is present, so the
+    // host-side bridge's upstream socket lives in the host netns and is invisible to
+    // the child's /proc/net/tcp (the shared-loopback /proc-net leak is fixed). When
+    // pasta is absent (or Off), the child shares the host loopback (the MVP model).
+    NetnsIsolation isolate_netns = NetnsIsolation::Auto;
     std::vector<EgressBridge> bridges;
 };
 

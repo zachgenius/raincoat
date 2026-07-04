@@ -299,3 +299,91 @@ TEST(Doctor, FormatRealRunDoctorIsNonEmpty) {
     std::string out = format_doctor(r);
     EXPECT_FALSE(out.empty()) << "format_doctor() should always produce output";
 }
+
+// --------------------------------------------------------------------------
+// egress network jail — optional pasta / slirp4netns detection
+// --------------------------------------------------------------------------
+
+// The egress jail helpers are OPTIONAL: their absence must never make the host
+// unusable or fail the doctor.
+TEST(Doctor, EgressJailIsOptionalForUsability) {
+    DoctorReport r = make_healthy_report();  // no pasta/slirp set
+    EXPECT_FALSE(r.egress_jail_available());
+    EXPECT_TRUE(r.usable()) << "missing egress helpers must not gate usable()";
+}
+
+// pasta is preferred: when both are present egress_jail_available() is true and
+// the formatted line names pasta.
+TEST(Doctor, FormatEgressAvailablePastaPreferred) {
+    DoctorReport r = make_healthy_report();
+    r.pasta_found = true;
+    r.pasta_path = "/usr/bin/pasta";
+    r.pasta_version = "pasta 0.0";  // value is irrelevant to the assertions
+    r.slirp4netns_found = true;
+    r.slirp4netns_path = "/usr/bin/slirp4netns";
+
+    EXPECT_TRUE(r.egress_jail_available());
+    std::string out = format_doctor(r);
+    EXPECT_TRUE(icontains(out, "egress network jail")) << out;
+    EXPECT_TRUE(icontains(out, "available (pasta)")) << out;
+}
+
+// slirp4netns alone still counts as available.
+TEST(Doctor, FormatEgressAvailableSlirpOnly) {
+    DoctorReport r = make_healthy_report();
+    r.slirp4netns_found = true;
+    r.slirp4netns_path = "/usr/sbin/slirp4netns";
+
+    EXPECT_TRUE(r.egress_jail_available());
+    std::string out = format_doctor(r);
+    EXPECT_TRUE(icontains(out, "available (slirp4netns)")) << out;
+}
+
+// Neither present: line must say unavailable and point at EGRESS.md, but the
+// doctor must NOT render it as a failure or become unusable.
+TEST(Doctor, FormatEgressUnavailableIsNotAFailure) {
+    DoctorReport r = make_healthy_report();  // no pasta/slirp
+    ASSERT_FALSE(r.egress_jail_available());
+
+    std::string out = format_doctor(r);
+    EXPECT_TRUE(icontains(out, "egress network jail")) << out;
+    EXPECT_TRUE(icontains(out, "unavailable")) << out;
+    EXPECT_TRUE(icontains(out, "host network namespace")) << out;
+    EXPECT_TRUE(icontains(out, "EGRESS.md")) << out;
+    // A healthy host must still pass overall.
+    EXPECT_TRUE(icontains(out, "pass") || icontains(out, "usable")) << out;
+}
+
+// find_pasta() / find_slirp4netns() must return an executable absolute path when
+// the tool exists, and never crash when it does not. Never depends on a version.
+TEST(Doctor, FindPastaReturnsExecutablePathWhenPresent) {
+    auto p = find_pasta();
+    if (!p.has_value()) GTEST_SKIP() << "pasta not installed on this host";
+    EXPECT_TRUE(file_present(*p)) << *p;
+    EXPECT_TRUE(file_executable(*p)) << *p;
+    ASSERT_FALSE(p->empty());
+    EXPECT_EQ((*p)[0], '/') << "path should be absolute: " << *p;
+    EXPECT_TRUE(ends_with(*p, "pasta")) << *p;
+}
+
+TEST(Doctor, FindSlirpReturnsExecutablePathWhenPresent) {
+    auto p = find_slirp4netns();
+    if (!p.has_value()) GTEST_SKIP() << "slirp4netns not installed on this host";
+    EXPECT_TRUE(file_present(*p)) << *p;
+    EXPECT_TRUE(file_executable(*p)) << *p;
+    ASSERT_FALSE(p->empty());
+    EXPECT_EQ((*p)[0], '/') << "path should be absolute: " << *p;
+    EXPECT_TRUE(ends_with(*p, "slirp4netns")) << *p;
+}
+
+// run_doctor() must agree with the finders and, when a helper is present,
+// capture some (unspecified) version text without asserting its contents.
+TEST(Doctor, RunDoctorAgreesWithEgressFinders) {
+    if (!host_has_bwrap()) GTEST_SKIP() << "bwrap not installed on this host";
+    DoctorReport r = run_doctor();
+
+    EXPECT_EQ(find_pasta().has_value(), r.pasta_found);
+    EXPECT_EQ(find_slirp4netns().has_value(), r.slirp4netns_found);
+    if (r.pasta_found) { EXPECT_FALSE(r.pasta_path.empty()); }
+    if (r.slirp4netns_found) { EXPECT_FALSE(r.slirp4netns_path.empty()); }
+}

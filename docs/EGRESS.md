@@ -67,10 +67,36 @@ opt-in before logging upstream endpoints.
   URL is kept host-side and the profile is masked if reachable inside the sandbox.
 - **Audit redaction** — upstreams recorded as `hidden` by default (see below).
 
+**Isolated network namespace (IMPLEMENTED — pasta jail):**
+- When an egress bridge is active AND `pasta` is available AND the profile does not opt out
+  (`[egress].isolate_netns != "off"`, default `auto`), the child runs inside pasta's private
+  network namespace: `pasta --config-net -t none -T <bridge-ports> -- bwrap …`. bwrap does NOT
+  `--unshare-net` in this mode — it JOINS pasta's netns. MEASURED on a real host:
+  - the child reaches each bridge at its unchanged `127.0.0.1:<child_port>` (pasta forwards that
+    ns-loopback port to the host-side bridge via `-T`);
+  - **the `/proc/net/tcp` upstream leak is FIXED** — the host-side bridge's upstream socket lives
+    in the HOST netns, so it is invisible from inside the child's namespace;
+  - `-t none` makes the jail TIGHTER than shared mode: only the forwarded bridge port(s) are
+    reachable on the ns loopback — other host-loopback services are NOT;
+  - the child is **NOT** fully network-jailed: pasta NATs general outbound traffic, so the child
+    retains general outbound internet by IP. This is a **NAT, not a per-destination firewall** —
+    the audit says so explicitly and never overclaims.
+- When `pasta` is absent (or `isolate_netns = "off"`) raincoat falls back to the shared-loopback
+  model below, with the honest shared-net warning.
+- `raincoat doctor` reports whether the jail is available: `[ OK ] egress network jail:
+  available (pasta) <path>` when pasta (or slirp4netns) is present, or `[INFO] … unavailable —
+  egress bridge shares the host network namespace` otherwise. It is informational, never a
+  `[FAIL]` — a missing helper only means the shared-loopback fallback is used.
+
 **Still future (deferred; the schema/code is shaped so these slot in):**
-- A true **network jail** — an egress-only netns (bridge reachable, everything else blocked) via a
-  veth pair + host forwarding or a userspace net (slirp/passt/pasta). Today egress shares the host
-  net namespace (see Limitations).
+- A per-destination **egress firewall** (only the configured upstreams reachable, general internet
+  blocked). The pasta jail fixes the `/proc-net` leak and blocks other host-loopback services but
+  does not filter arbitrary outbound internet.
+- **Host-loopback mapping on newer pasta** (`--map-host-loopback`). The pasta build measured here
+  is older and lacks it, so the host is reached via NAT (the ns default gateway) rather than the
+  child's `127.0.0.1`. The bridge sidesteps this by keeping the host-side listener and letting
+  pasta `-T` forward the ns-loopback bridge port to it, so `child_endpoint = http://127.0.0.1:PORT`
+  still works unchanged; a newer pasta would simply make host-loopback reachability native.
 - **`guarded` mode / domain allow-block policy** and **DNS policy** (`[network_policy]`, `[dns]`) —
   parsed/reserved, not enforced.
 - **Transparent egress mode** (no explicit endpoint) and an explicit **MITM mode** (disabled by
@@ -80,15 +106,17 @@ opt-in before logging upstream endpoints.
 - The bridge hides the real upstream **hostname/URL** from the child's **environment/config** — the
   child is only handed `child_endpoint` via the injected env var, and a `--profile` reachable inside
   the sandbox is masked (shadowed with an empty file) so the upstream cannot be read out of it.
-- **The upstream is NOT network-jailed and its resolved IP:port is observable to the child.** Because
-  an active egress bridge SHARES the host network namespace (no `--unshare-net`, see below), the child
-  can read raincoat's live connection to the upstream out of `/proc/net/tcp` (e.g. a `127.0.0.1:19191`
-  upstream appears there as `0100007F:4AF7`). The bridge hides the upstream *URL* from the child's
-  env/config; it does NOT hide the upstream *IP:port* from a child that inspects shared `/proc/net`.
-  A true jail (net-namespace isolation + a veth/slirp path) is out of MVP scope. The audit line
-  discloses this shared-net model explicitly so it is never a silent leak.
-- The child also retains **general network access** under the shared namespace — the bridge is
-  URL-indirection, not a network firewall.
+- **In shared-loopback mode, the upstream's resolved IP:port is observable to the child.** When the
+  bridge runs WITHOUT the pasta jail (`isolate_netns = "off"`, or pasta not installed) the sandbox
+  SHARES the host network namespace (no `--unshare-net`), so the child can read raincoat's live
+  connection to the upstream out of `/proc/net/tcp` (e.g. a `127.0.0.1:19191` upstream appears there
+  as `0100007F:4AF7`). The bridge hides the upstream *URL* from the child's env/config; in this mode
+  it does NOT hide the upstream *IP:port* from a child that inspects shared `/proc/net`. The audit
+  line discloses this shared-net model explicitly so it is never a silent leak.
+  **The isolated-netns (pasta) mode FIXES this specific leak** — see the isolated-netns section
+  above — because the bridge's upstream socket then lives in the host netns, invisible to the child.
+- The child retains **general outbound network access** in BOTH modes (shared loopback, or NAT'd via
+  pasta) — the bridge is URL-indirection, not a per-destination network firewall.
 - It does NOT necessarily hide the fact that the child is using a custom/local endpoint.
 - Full HTTPS hostname rewriting without exposing a custom endpoint may require MITM, control of the
   original certificate, or transparent network-level routing.
@@ -112,13 +140,19 @@ same loopback the host bridge listens on:
   host's, so a host-side loopback bridge is unreachable. Making egress-only networking work under an
   otherwise-isolated netns needs one of: a veth pair + host-side forwarding, a userspace network
   (slirp/passt/pasta), an abstract/UNIX socket shim, or transparent routing — all deferred.
-- **MVP decision (implemented):** when `[egress] mode = "bridge"` is active, the runner does NOT
-  unshare the net namespace, so the child shares the host loopback and reaches the bridge. This is
-  the documented tradeoff: the child can reach the local bridge AND retains general host network
-  access, and the upstream IP:port is visible via shared `/proc/net/tcp` (see Limitations). This
-  REPLACES the earlier phase-1.5 "bridge fails closed to off" placeholder for the case where
-  bridges are actually configured. The code is structured so a future "egress-only" netns (bridge
-  reachable, everything else blocked) can slot in without changing the profile schema.
+- **Implemented — isolated netns (default when pasta present):** when `[egress] mode = "bridge"` is
+  active and pasta is available and `isolate_netns != "off"`, the runner wraps bwrap with
+  `pasta --config-net -t none -T <bridge-ports>`. bwrap does NOT `--unshare-net` (it joins pasta's
+  netns). The child reaches `127.0.0.1:<port>` because pasta's `-T` forwards that ns-loopback port
+  to the host-side bridge; the upstream socket stays in the host netns (fixing the `/proc/net/tcp`
+  leak); `-t none` exposes only the bridge port(s); pasta NATs general internet (not a firewall).
+  pasta runs as raincoat's direct child and propagates the child's exit code; it is reaped/torn
+  down on every exit path (normal, error, signal) with no orphans.
+- **Implemented — shared loopback (fallback):** when pasta is absent or `isolate_netns = "off"`, the
+  runner does NOT unshare the net namespace, so the child shares the host loopback and reaches the
+  bridge. Tradeoff: the child retains general host network access and the upstream IP:port is
+  visible via shared `/proc/net/tcp` (see Limitations). The audit + a stderr warning disclose the
+  active model in both cases so behavior is never a silent surprise.
 
 ## Suggested module shape (for the implementation phase)
 - New `egress` module: parse `[egress]` + `[[egress.bridge]]` from the profile (via the `toml`

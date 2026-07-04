@@ -297,6 +297,12 @@ std::optional<Options> load_profile(const std::string& path, std::string& err) {
         if (auto b = t.get_bool("egress.log_response_bodies"); b.has_value())
             eg.log_response_bodies = *b;
         if (auto b = t.get_bool("egress.streaming"); b.has_value()) eg.streaming = *b;
+        // [egress].isolate_netns: auto (default) | on | off — whether to run the child
+        // inside an isolated pasta netns jail (fixes the /proc-net upstream leak) or
+        // share the host loopback. Unknown/odd values are tolerated (keep the default).
+        if (auto s = t.get_string("egress.isolate_netns"); s.has_value()) {
+            if (auto iso = netns_isolation_from_string(*s)) eg.isolate_netns = *iso;
+        }
         // timeout_seconds is an integer; the toml module stores numeric scalars as
         // their raw source text, so parse it defensively and ignore a non-numeric
         // value (keeps the default rather than aborting the whole profile load).

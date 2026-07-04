@@ -49,8 +49,8 @@ std::string rstrip(std::string s) {
     return s;
 }
 
-// Run `bwrap_path --version` and capture its stdout text.
-std::string capture_bwrap_version(const std::string& bwrap_path) {
+// Run `tool_path --version` and capture its stdout/stderr text (first line-ish).
+std::string capture_version(const std::string& tool_path) {
     int pipefd[2];
     if (::pipe(pipefd) != 0) return "";
 
@@ -66,7 +66,7 @@ std::string capture_bwrap_version(const std::string& bwrap_path) {
         ::dup2(pipefd[1], STDERR_FILENO);
         ::close(pipefd[0]);
         ::close(pipefd[1]);
-        ::execl(bwrap_path.c_str(), bwrap_path.c_str(), "--version",
+        ::execl(tool_path.c_str(), tool_path.c_str(), "--version",
                 static_cast<char*>(nullptr));
         _exit(127);
     }
@@ -146,9 +146,9 @@ bool probe_userns() {
     return true;  // assume available; the smoke test is the real arbiter
 }
 
-}  // namespace
-
-std::optional<std::string> find_bwrap() {
+// Search PATH (absolute dirs only) then a set of conventional fallback dirs for
+// an executable named `tool`.
+std::optional<std::string> find_on_path(const std::string& tool) {
     const char* path_env = std::getenv("PATH");
     std::string path = path_env ? path_env : "/usr/bin:/bin:/usr/local/bin";
 
@@ -157,17 +157,24 @@ std::optional<std::string> find_bwrap() {
         if (dir[0] != '/') continue;  // require an absolute location
         std::string candidate = dir;
         if (candidate.back() != '/') candidate.push_back('/');
-        candidate += "bwrap";
+        candidate += tool;
         if (is_executable_file(candidate)) return candidate;
     }
 
     // Fall back to the conventional locations.
-    for (const char* candidate : {"/usr/bin/bwrap", "/bin/bwrap",
-                                  "/usr/local/bin/bwrap"}) {
-        if (is_executable_file(candidate)) return std::string(candidate);
+    for (const char* dir : {"/usr/bin/", "/bin/", "/usr/local/bin/",
+                            "/usr/sbin/", "/sbin/"}) {
+        std::string candidate = std::string(dir) + tool;
+        if (is_executable_file(candidate)) return candidate;
     }
     return std::nullopt;
 }
+
+}  // namespace
+
+std::optional<std::string> find_bwrap() { return find_on_path("bwrap"); }
+std::optional<std::string> find_pasta() { return find_on_path("pasta"); }
+std::optional<std::string> find_slirp4netns() { return find_on_path("slirp4netns"); }
 
 DoctorReport run_doctor() {
     DoctorReport r;
@@ -182,7 +189,7 @@ DoctorReport run_doctor() {
     r.bwrap_found = true;
     r.bwrap_path = *path;
 
-    r.bwrap_version = capture_bwrap_version(*path);
+    r.bwrap_version = capture_version(*path);
     if (r.bwrap_version.empty()) {
         r.notes.push_back("could not read `bwrap --version`");
     }
@@ -195,6 +202,24 @@ DoctorReport run_doctor() {
     r.smoke_ok = run_smoke_test(*path);
     if (!r.smoke_ok) {
         r.notes.push_back("bwrap smoke test (`bwrap ... true`) failed");
+    }
+
+    // Optional egress-network-jail helpers. Their absence is not a failure; it
+    // only means the egress bridge falls back to the shared host loopback.
+    if (auto pasta = find_pasta()) {
+        r.pasta_found = true;
+        r.pasta_path = *pasta;
+        r.pasta_version = capture_version(*pasta);
+    }
+    if (auto slirp = find_slirp4netns()) {
+        r.slirp4netns_found = true;
+        r.slirp4netns_path = *slirp;
+        r.slirp4netns_version = capture_version(*slirp);
+    }
+    if (!r.egress_jail_available()) {
+        r.notes.push_back(
+            "no egress network-jail helper (pasta / slirp4netns) found; the "
+            "egress bridge shares the host network namespace (see EGRESS.md)");
     }
 
     return r;
@@ -228,6 +253,25 @@ std::string format_doctor(const DoctorReport& r) {
     // smoke test
     line(r.smoke_ok, "bwrap smoke test (`bwrap ... true`)",
          r.smoke_ok ? std::string("passed") : std::string("failed"));
+
+    // egress network jail — optional. Absence is informational, not a failure,
+    // so it is never rendered as [FAIL].
+    {
+        std::string detail;
+        if (r.pasta_found) {
+            detail = "available (pasta)";
+            if (!r.pasta_path.empty()) detail += " " + r.pasta_path;
+        } else if (r.slirp4netns_found) {
+            detail = "available (slirp4netns)";
+            if (!r.slirp4netns_path.empty()) detail += " " + r.slirp4netns_path;
+        } else {
+            detail =
+                "unavailable — egress bridge shares the host network namespace "
+                "(see EGRESS.md)";
+        }
+        os << (r.egress_jail_available() ? "  [ OK ] " : "  [INFO] ")
+           << "egress network jail" << ": " << detail << "\n";
+    }
 
     if (!r.notes.empty()) {
         os << "\nNotes:\n";

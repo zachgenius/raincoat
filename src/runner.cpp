@@ -271,6 +271,29 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     const bool egress_active = cfg.ext.egress.enabled;
     EgressServer egress_srv;
 
+    // ---- Egress isolation mode decision (isolated netns vs shared loopback) ----
+    // When egress is active AND the profile did not opt out ([egress].isolate_netns
+    // != off) AND pasta is available on the host, run the child inside pasta's
+    // ISOLATED network namespace: `pasta --config-net -t none -T <bridge-ports> --
+    // bwrap ...`. bwrap then JOINS pasta's netns (it must NOT --unshare-net, which the
+    // egress path already guarantees since cfg.net is Full). MEASURED on this host:
+    //   * the child reaches each bridge at 127.0.0.1:<child_port> (child_endpoint is
+    //     unchanged — pasta -T forwards ns loopback:port to the host bridge);
+    //   * the host-side bridge's upstream socket stays in the HOST netns, so the
+    //     child's /proc/net/tcp NEVER reveals the real upstream IP:port (the shared-
+    //     loopback /proc-net leak is FIXED);
+    //   * `-t none` means ONLY the forwarded bridge ports are reachable on the ns
+    //     loopback — other host-loopback services are NOT (tighter than shared mode);
+    //   * pasta still NATs general outbound traffic, so the child retains general
+    //     outbound internet by IP — this is a NAT, NOT a per-destination firewall.
+    // When pasta is absent (or isolate_netns=off) fall back to the shared-loopback
+    // model with the existing honest warning.
+    const NetnsIsolation isolate_mode = cfg.ext.egress.isolate_netns;
+    const bool jail_requested = egress_active && isolate_mode != NetnsIsolation::Off;
+    std::optional<std::string> pasta_path;
+    if (jail_requested) pasta_path = find_pasta();
+    const bool jail_active = jail_requested && pasta_path.has_value();
+
     // ---- 1. Create the sandbox root + fixed sub-tree ---------------------
     const char* tmpdir_env = std::getenv("TMPDIR");
     std::string base = (tmpdir_env && *tmpdir_env) ? tmpdir_env : "/tmp";
@@ -407,6 +430,10 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // already in use), abort the run rather than silently proceed WITHOUT the bridge —
     // the child would otherwise get no endpoint and the run would misbehave.
     std::map<std::string, std::string> child_visible;
+    // In jail mode these are the actual bound bridge ports that pasta must forward from
+    // the child's netns loopback to the host bridge (`-T <ports>`). Collected here where
+    // the real (possibly ":0"-resolved) port is known.
+    std::vector<int> jail_forward_ports;
     if (egress_active) {
         std::string serr;
         if (!egress_srv.start(cfg.ext.egress, serr)) {
@@ -426,6 +453,7 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             if (port > 0 && parse_url(br.child_endpoint, u, uerr)) {
                 endpoint = u.scheme + "://" + u.host + ":" + std::to_string(port) + u.path;
             }
+            if (port > 0) jail_forward_ports.push_back(port);
             if (!br.env.empty()) {
                 env.resolved[br.env] = endpoint;
                 record_set(br.env);
@@ -637,16 +665,40 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             "\" (fail-closed to off unless overridden with --net).";
     }
 
-    // Honest disclosure when egress-bridge mode is active: the child is NOT network-jailed
-    // (the sandbox shares the host network namespace so it can reach the loopback bridge).
-    // Surface it on stderr too so a user who never opens the audit still learns the model.
-    if (egress_active) {
+    // Honest disclosure when egress-bridge mode is active. The message MUST reflect the
+    // MEASURED reality of the mode actually selected: an isolated pasta netns jail, or the
+    // shared-loopback fallback. Surface it on stderr so a user who never opens the audit
+    // still learns the model.
+    if (egress_active && jail_active) {
+        if (!warning.empty()) warning += "\n";
+        warning +=
+            "Note: egress bridge mode is active in ISOLATED-NETNS mode (pasta " +
+            *pasta_path +
+            "). The child runs in a private network namespace and reaches the "
+            "configured upstream(s) via the injected loopback bridge. The host-side "
+            "bridge's upstream socket stays in the host network namespace, so the "
+            "child's /proc/net/tcp does NOT reveal the real upstream IP:port. The "
+            "child is NOT fully network-jailed: pasta NATs general outbound traffic, "
+            "so it retains general outbound internet by IP (a NAT, not a per-"
+            "destination firewall). Other host-loopback services are NOT reachable.";
+    } else if (egress_active) {
+        if (jail_requested && !pasta_path.has_value()) {
+            // The profile asked for (or defaulted to) the isolated jail but pasta is not
+            // installed. Fall back to shared-loopback and say so honestly.
+            if (!warning.empty()) warning += "\n";
+            warning +=
+                "Warning: egress isolate_netns was requested but `pasta` was not found "
+                "on this host; falling back to the shared-loopback model. Install pasta "
+                "(passt) to run the child in an isolated network namespace and hide the "
+                "upstream socket from the child's /proc/net/tcp.";
+        }
         if (!warning.empty()) warning += "\n";
         warning +=
             "Note: egress bridge mode is active; the sandbox SHARES the host network "
             "namespace so the child can reach the loopback bridge. The bridge hides the "
             "upstream URL from the child's environment, but the child is NOT network-jailed "
-            "(it retains general host network access).";
+            "(it retains general host network access, and the resolved upstream IP:port is "
+            "observable via /proc/net/tcp).";
     }
 
     // ---- 7. Locate the bubblewrap backend --------------------------------
@@ -806,6 +858,40 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
                          binds_resolv_conf(cfg.net), font.dir, mask_dir, sandbox_out,
                          mask_empty_file, mask_files, font.font_dirs, mask_usr_local_fonts);
 
+    // ---- 8b. Isolated-netns wrapping (pasta) -----------------------------
+    // In jail mode the child runs inside pasta's private network namespace: prepend
+    //   pasta --config-net -t none -T <bridge-ports> --
+    // to the bwrap argv. bwrap does NOT --unshare-net here (cfg.net is Full on the
+    // egress path), so it JOINS pasta's netns. `-t none` disables inbound forwarding
+    // (host->ns); `-T <ports>` forwards ONLY the bridge port(s) from the ns loopback to
+    // the host bridge, so the child reaches 127.0.0.1:<child_port> (child_endpoint is
+    // unchanged) while no other host-loopback service is exposed. The program that is
+    // exec'd becomes pasta; pasta runs bwrap as its child and propagates its exit code.
+    // MEASURED: the host-side bridge's upstream socket lives in the host netns, so the
+    // child's /proc/net/tcp does NOT reveal it — the shared-loopback leak is fixed.
+    std::string launch_path = *bwrap_path;
+    if (jail_active) {
+        std::vector<std::string> wrapped;
+        wrapped.reserve(argv.size() + 6);
+        wrapped.push_back(*pasta_path);
+        wrapped.push_back("--config-net");
+        wrapped.push_back("-t");
+        wrapped.push_back("none");
+        if (!jail_forward_ports.empty()) {
+            std::string spec;
+            for (std::size_t i = 0; i < jail_forward_ports.size(); ++i) {
+                if (i) spec += ",";
+                spec += std::to_string(jail_forward_ports[i]);
+            }
+            wrapped.push_back("-T");
+            wrapped.push_back(spec);
+        }
+        wrapped.push_back("--");
+        for (auto& tok : argv) wrapped.push_back(std::move(tok));
+        argv = std::move(wrapped);
+        launch_path = *pasta_path;
+    }
+
     // ---- 9. Audit record -------------------------------------------------
     AuditRecord rec;
     rec.command_line = join_command(cfg.command);
@@ -907,14 +993,31 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // bridge (name, child-visible endpoint, injected env var name). The real upstream is
     // recorded ONLY when redaction was explicitly disabled; by default it is hidden. The
     // upstream_endpoint is NEVER placed in the child env (only child_endpoint is).
-    if (egress_active) {
+    if (egress_active && jail_active) {
         rec.active_policy_notes.push_back(
-            "egress bridge active: the sandbox SHARES the host network namespace so the "
-            "child can reach the loopback bridge; the child is NOT network-jailed (general "
-            "host network remains reachable). The bridge only hides upstream URLs from the "
-            "child's environment/config; because the net namespace is shared, the resolved "
-            "upstream IP:port is still observable to the child via /proc/net/tcp. A true "
-            "network jail (net-namespace isolation + veth/slirp) is out of MVP scope.");
+            "egress bridge active in ISOLATED-NETNS mode (pasta " + *pasta_path +
+            "): the child runs in a PRIVATE network namespace (pasta --config-net -t "
+            "none -T <bridge-ports>) and bwrap joins it (no --unshare-net). The child "
+            "reaches each configured upstream via the injected loopback bridge at its "
+            "child_endpoint (127.0.0.1:<port>, forwarded to the host-side bridge). "
+            "MEASURED on this host: the host-side bridge's upstream socket lives in the "
+            "HOST network namespace, so the child's /proc/net/tcp does NOT reveal the "
+            "real upstream IP:port — the shared-loopback /proc-net leak is FIXED. Only "
+            "the forwarded bridge port(s) are reachable on the ns loopback; other host-"
+            "loopback services are NOT. The child is NOT fully network-jailed: pasta "
+            "NATs general outbound traffic, so it retains general outbound internet by "
+            "IP (a NAT, not a per-destination firewall).");
+    } else if (egress_active) {
+        rec.active_policy_notes.push_back(
+            "egress bridge active (shared-loopback mode): the sandbox SHARES the host "
+            "network namespace so the child can reach the loopback bridge; the child is "
+            "NOT network-jailed (general host network remains reachable). The bridge only "
+            "hides upstream URLs from the child's environment/config; because the net "
+            "namespace is shared, the resolved upstream IP:port is still observable to the "
+            "child via /proc/net/tcp. Install pasta and keep [egress].isolate_netns != off "
+            "to run in an isolated netns that fixes this /proc-net leak.");
+    }
+    if (egress_active) {
         if (!mask_files.empty()) {
             rec.active_policy_notes.push_back(
                 "egress profile-leak guard: the --profile file is reachable by the child "
@@ -990,9 +1093,10 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         return 1;
     }
     if (pid == 0) {
-        ::execvp(bwrap_path->c_str(), cargv.data());
+        ::execvp(launch_path.c_str(), cargv.data());
         // Only reached if exec failed.
-        std::perror("raincoat: failed to exec bwrap");
+        std::perror(jail_active ? "raincoat: failed to exec pasta"
+                                : "raincoat: failed to exec bwrap");
         _exit(127);
     }
 
