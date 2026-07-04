@@ -255,6 +255,25 @@ struct EgressConfig {
     std::vector<EgressBridge> bridges;
 };
 
+// The [browser] section: best-effort browser fingerprint/profile isolation (phase 4). The fake
+// HOME already keeps the real Chrome/Firefox profiles out of reach; this adds a dedicated temp
+// profile dir and (optionally) PATH launch shims that start Chromium/Chrome with generic,
+// low-information flags (--user-data-dir=<isolated>, --lang, --window-size, --disable-gpu/
+// extensions/sync). Honest limitation: shims only affect browsers launched by name via PATH; a
+// script that calls the browser by absolute path or overrides the flags is not constrained.
+struct BrowserConfig {
+    bool enabled = false;
+    bool isolate_profile = true;
+    std::string profile_dir;         // isolated temp profile dir (inside the sandbox)
+    std::string timezone;            // generic browser tz (default UTC)
+    std::string locale;              // e.g. "en-US"
+    std::string viewport;            // e.g. "1280x720"
+    bool disable_gpu = true;
+    bool disable_extensions = true;
+    bool disable_sync = true;
+    bool use_launch_shims = false;   // place PATH wrappers before the real browser
+};
+
 // The [network_policy] section: a host-based egress allow/block policy enforced by Raincoat's
 // own filtering forward proxy (phase 4). When `enabled`, the runner starts a local HTTP(S)
 // proxy that checks each request's target host against these rules and injects http_proxy/
@@ -309,6 +328,7 @@ struct ExtendedConfig {
     AuditFormat audit_format = AuditFormat::Text;  // [audit].format ("text"|"json")
     EgressConfig egress;                       // [egress] + [[egress.bridge]] (phase 2)
     NetworkPolicy network_policy;              // [network_policy] guarded proxy (phase 4)
+    BrowserConfig browser;                     // [browser] best-effort isolation (phase 4)
     // A RESERVED restrictive network mode ("proxy"/"bridge"/"guarded") was requested but
     // is not yet enforced. Carries the requested mode name so resolve_config can fail
     // CLOSED (fall back to NetMode::Off, never Full) and the runner can warn on stderr.

@@ -309,3 +309,42 @@ are constrained (honest, disclosed every run). No provider/service names hard-co
 - [x] README (Network policy section + roadmap) + docs/EGRESS.md (§ Network policy / guarded proxy) + `examples/guarded.toml`
 
 **PHASE 4 (network policy / guarded proxy): COMPLETE ✅ — 41 suites green, -Wall -Wextra clean**
+
+---
+
+## Phase 5 — Browser isolation  (best-effort; see README "Browser isolation")
+
+Generic, profile-driven browser fingerprint/profile isolation for headless-browser jobs
+(Playwright / Puppeteer / Selenium). The fake HOME already keeps the host's real Chrome/Firefox
+profiles out of the child's reach; this ADDS an isolated throwaway profile dir + optional generic
+PATH launch shims. Best-effort by construction: the shims only affect a browser launched BY NAME
+via PATH — an absolute-path launch or a flag override bypasses them. NOT deep anti-fingerprinting
+(canvas/WebGL/audio/font-metrics/JA3 untouched); that stays an honest `[-]` below.
+
+### 5.1 Profile schema & parsing  (config, profile)
+- [x] `[browser]` → `BrowserConfig` (`enabled`, `isolate_profile`, `profile_dir`, `timezone`, `locale`, `viewport`, `disable_gpu/extensions/sync`, `use_launch_shims`) — *config.hpp / profile / test_profile*
+- [x] Disabled (`enabled=false`) recorded as an honest reserved/"configured but not enabled" note — *profile*
+
+### 5.2 Isolation mechanism  (browser)
+- [x] Throwaway profile dir created inside the sandbox root (or explicit `profile_dir`), destroyed with it; skipped when `isolate_profile=false` — *browser / test_browser*
+- [x] Generic launch shims for Chromium/Chrome/Edge names + firefox: exec the REAL browser (resolved from PATH minus the shim dir, with absolute fallbacks) with isolation flags PREPENDED before `"$@"` — *browser / test_browser*
+- [x] Shell-safe shim generation (single-quote escaping) + recursion guards (own-dir canonicalization via `cd`+`pwd -P`, re-entry sentinel `_RC_BROWSER_SHIM`) — *browser / test_browser_attack_round1/2*
+- [x] Malformed non-empty `viewport` surfaced in the audit note (not silently dropped); `--window-size` omitted — *browser*
+
+### 5.3 Runner wiring  (runner)
+- [x] Injects browser env (TZ), PREPENDS the shim dir to the child's PATH, binds profile dir RW + shim dir RO into the sandbox — *runner / test_browser_path_e2e_regression*
+- [x] Disabled path touches nothing; no regression to non-browser runs — *runner / test_browser_disabled_regression*
+- [x] Audit note records profile dir, whether shims were written, gpu/extensions/sync state, and the best-effort caveat — *runner / audit*
+
+### 5.4 Honest limitations documented
+- [x] Shims are best-effort — only a by-name PATH launch is caught; absolute-path launches / flag overrides bypass them — *README / browser.hpp / examples/browser.toml*
+- [x] Real protection is the already-absent host profiles; the isolated profile + flags reduce casual leakage and normalize a few knobs only — *README*
+- [-] **Deep anti-fingerprinting** (canvas/WebGL/audio/font-metrics/TLS-JA3 normalization) — explicit non-goal for this layer; would require an instrumented/patched browser build, not a launch shim
+- [-] Intercepting absolute-path or flag-overriding launches (would need argv rewriting / `execve` interception) — out of scope
+
+### 5.5 Verification gate (Phase 5)
+- [x] Unit + attack-regression + e2e suites (mechanism via a fake browser stub on PATH that prints its argv; disabled-path + PATH-composition regressions) — *tests/test_browser*, *test_browser_attack_round1/2*, *test_browser_attack_round2_regression*, *test_browser_disabled_regression*, *test_browser_path_e2e_regression*
+- [x] README "Browser isolation" section + roadmap tick + `examples/browser.toml` (browser + strict egress allow-list for a Playwright/Puppeteer job)
+- [x] No regression: 47 suites green, -Wall -Wextra clean
+
+**PHASE 5 (browser isolation, best-effort): COMPLETE ✅**

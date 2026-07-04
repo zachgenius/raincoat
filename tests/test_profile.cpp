@@ -1052,8 +1052,15 @@ TEST(Profile, LoadFullReferenceConfigMapsEverySection) {
     // Egress is enforced this phase, so it must NOT appear as a reserved note.
     EXPECT_FALSE(any_contains(o.ext.reserved_notes, "egress"));
 
-    // ---- reserved sections still recorded (browser/dns) ----
+    // ---- browser: PARSED into ext.browser this phase ----
+    // The fixture sets [browser] enabled=false, isolate_profile=true. The fields must
+    // be parsed onto ext.browser; because it is configured but NOT enabled there is
+    // nothing to apply, so it is still honestly disclosed as an inert reserved note.
+    EXPECT_FALSE(o.ext.browser.enabled);
+    EXPECT_TRUE(o.ext.browser.isolate_profile);
     EXPECT_TRUE(any_contains(o.ext.reserved_notes, "browser"));
+
+    // ---- dns still reserved ----
     EXPECT_TRUE(any_contains(o.ext.reserved_notes, "dns"));
 
     // ---- network_policy: PARSED into ext.network_policy this phase (no reserved note) ----
@@ -1444,4 +1451,62 @@ TEST(Profile, NetworkPolicyMergeCarriesThrough) {
     EXPECT_TRUE(m.ext.network_policy.enabled);
     EXPECT_EQ(m.ext.network_policy.default_action, "deny");
     EXPECT_EQ(m.ext.network_policy.allow_hosts, (std::vector<std::string>{"localhost"}));
+}
+
+// ---------------------------------------------------------------------------
+// [browser] — parsed into ext.browser (phase 4). Enabled => enforced (no reserved
+// note); every field maps; unknown keys are tolerated.
+// ---------------------------------------------------------------------------
+TEST(Profile, BrowserEnabledParsesEveryFieldNoReservedNote) {
+    std::string path = write_temp_file(
+        "[browser]\n"
+        "enabled = true\n"
+        "isolate_profile = true\n"
+        "profile_dir = \"/tmp/rc-browser\"\n"
+        "timezone = \"UTC\"\n"
+        "locale = \"en-US\"\n"
+        "viewport = \"1280x720\"\n"
+        "disable_gpu = true\n"
+        "disable_extensions = false\n"
+        "disable_sync = true\n"
+        "use_launch_shims = true\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    const auto& b = opt->ext.browser;
+    EXPECT_TRUE(b.enabled);
+    EXPECT_TRUE(b.isolate_profile);
+    EXPECT_EQ(b.profile_dir, "/tmp/rc-browser");
+    EXPECT_EQ(b.timezone, "UTC");
+    EXPECT_EQ(b.locale, "en-US");
+    EXPECT_EQ(b.viewport, "1280x720");
+    EXPECT_TRUE(b.disable_gpu);
+    EXPECT_FALSE(b.disable_extensions);
+    EXPECT_TRUE(b.disable_sync);
+    EXPECT_TRUE(b.use_launch_shims);
+    // Enabled => enforced this phase, so NOT disclosed as a reserved/unenforced note.
+    EXPECT_FALSE(any_contains(opt->ext.reserved_notes, "browser"));
+}
+
+TEST(Profile, BrowserConfiguredButDisabledIsDisclosedAsInert) {
+    std::string path = write_temp_file("[browser]\nenabled = false\n");
+    std::string err;
+    auto opt = load_profile(path, err);
+    ASSERT_TRUE(opt.has_value()) << "err=" << err;
+    EXPECT_FALSE(opt->ext.browser.enabled);
+    // Configured but not enabled: honestly disclosed (nothing applied).
+    EXPECT_TRUE(any_contains(opt->ext.reserved_notes, "browser"));
+}
+
+TEST(Profile, BrowserMergeCarriesThrough) {
+    std::string path = write_temp_file(
+        "[browser]\nenabled = true\nuse_launch_shims = true\nlocale = \"fr-FR\"\n");
+    std::string err;
+    auto profile = load_profile(path, err);
+    ASSERT_TRUE(profile.has_value()) << "err=" << err;
+    Options cli;
+    Options m = merge(*profile, cli);
+    EXPECT_TRUE(m.ext.browser.enabled);
+    EXPECT_TRUE(m.ext.browser.use_launch_shims);
+    EXPECT_EQ(m.ext.browser.locale, "fr-FR");
 }

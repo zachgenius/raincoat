@@ -1,0 +1,90 @@
+# Raincoat profile — headless browser automation (Playwright / Puppeteer / Selenium).
+#
+# Goal: run an untrusted browser-automation script so that
+#   * it CANNOT see your real Chrome/Firefox profiles (cookies, passwords, history,
+#     extensions) — the fake $HOME already hides them, so they are simply absent;
+#   * the browser it drives gets a CLEAN, throwaway profile plus generic, low-info
+#     launch flags (via [browser] below); and
+#   * the whole job can reach ONLY the sites it is supposed to scrape/test and
+#     nothing else on your network or the internet (via the strict egress jail).
+#
+# Run it (from a directory that holds the script but no secrets you don't want mounted):
+#   cd /path/to/your/automation
+#   raincoat --profile /path/to/browser.toml -- node run-playwright.js
+#
+# The hostnames below are PLACEHOLDERS — replace allow_hosts with the sites your
+# job actually visits. No provider/site names are baked into Raincoat.
+
+strict = false
+network = "full"          # the guarded proxy needs loopback reachability; CONFLICTS with --net off
+
+# Your automation project. "." resolves to the launch directory.
+allow_read = ["."]
+allow_write = ["."]
+
+# Trim to the credentials (if any) your script truly needs. Everything else
+# (other tokens/keys/secrets) is scrubbed from the environment.
+allow_env = []
+
+[env]
+TZ = "UTC"
+LANG = "en_US.UTF-8"
+LC_ALL = "en_US.UTF-8"
+
+[fontconfig]
+enabled = true
+
+[audit]
+log_file = ".raincoat/audit.log"
+
+# --- Browser isolation --------------------------------------------------------
+# Adds a throwaway profile + generic launch shims on top of the already-hidden
+# real profiles. BEST-EFFORT: the shims only affect a browser launched BY NAME
+# via PATH (google-chrome / chromium / firefox / ...). A script that launches the
+# browser by ABSOLUTE PATH, or passes its own --user-data-dir / conflicting flags,
+# bypasses the shims. Note that many Playwright/Puppeteer setups launch their OWN
+# bundled Chromium by absolute path — in that case the shims won't fire, but the
+# isolated profile is still what you should point the tool at (e.g. Playwright's
+# `userDataDir` / launch `executablePath`), and your real profiles remain absent.
+# This is NOT deep anti-fingerprinting (canvas/WebGL/audio/JA3 are untouched).
+[browser]
+enabled = true
+isolate_profile = true          # throwaway --user-data-dir / -profile inside the sandbox
+use_launch_shims = true         # PATH wrappers ahead of the real browser (best-effort)
+locale = "en-US"                # -> --lang=en-US
+viewport = "1280x720"           # -> --window-size=1280,720
+timezone = "UTC"                # -> TZ in the child env
+disable_gpu = true
+disable_extensions = true
+disable_sync = true
+
+# --- Strict egress firewall ---------------------------------------------------
+# Confine the browser job to an explicit allow-list of hosts and NOTHING else.
+# A host-side filtering forward proxy enforces the policy; the strict pasta netns
+# jail forwards ONLY the proxy port so the proxy is the child's ONLY way out
+# (direct / raw-IP / proxy-ignoring connections are blocked).
+[network_policy]
+enabled = true
+default_action = "deny"         # allow-list mode: ONLY allow_hosts are reachable (strongest)
+
+# The sites your automation is allowed to visit. Exact or dot-suffix match
+# ("example.org" also allows "www.example.org"). Replace with your targets.
+allow_hosts = [
+  "example.org",
+  "www.example.org",
+]
+
+block_hosts = []
+block_private_metadata_endpoints = true   # block 169.254.169.254 & friends (default true)
+metadata_endpoints = []
+
+[egress]
+# STRICT is what makes the allow-list a REAL egress firewall: the child runs in an
+# isolated pasta netns with outbound bound to loopback (-o 127.0.0.1) and only the
+# guarded-proxy port forwarded. REQUIRES `pasta`/passt; fails CLOSED (run refused)
+# if pasta is absent, rather than silently granting general internet.
+#
+# Drop to "auto" if you accept the weaker "proxy-aware clients only" guarantee
+# (a raw-IP or proxy-ignoring client would then bypass the policy). Check
+# availability with `raincoat doctor`.
+isolate_netns = "strict"

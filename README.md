@@ -582,6 +582,48 @@ DNS-rebinding guard).
 
 ---
 
+## Browser isolation (`[browser]`)
+
+The fake `$HOME` already keeps your **real** Chrome/Firefox profiles out of the sandbox — they
+are simply never mounted, so a headless-browser tool can't read your cookies, saved passwords,
+history, or extensions. The optional `[browser]` block **adds** two best-effort layers on top of
+that, aimed at Playwright / Puppeteer / Selenium jobs:
+
+1. an **isolated, throwaway browser profile** dir created inside the sandbox (destroyed with it),
+   so the tool gets a clean `--user-data-dir` / `-profile` instead of reusing anything; and
+2. optional **generic launch shims** — tiny wrapper scripts placed *ahead of the real browser on
+   the child's `PATH`* — that exec the real Chromium/Chrome/Edge/Firefox with low-information
+   flags prepended (`--user-data-dir=<isolated>`, `--lang`, `--window-size`, and
+   `--disable-gpu`/`--disable-extensions`/`--disable-sync`).
+
+```toml
+[browser]
+enabled = true
+isolate_profile = true          # throwaway --user-data-dir / -profile inside the sandbox
+use_launch_shims = true         # PATH wrappers ahead of the real browser
+locale = "en-US"                # -> --lang=en-US
+viewport = "1280x720"           # -> --window-size=1280,720
+timezone = "UTC"                # -> TZ in the child env
+disable_gpu = true
+disable_extensions = true
+disable_sync = true
+```
+
+A ready-to-edit profile lives at [`examples/browser.toml`](examples/browser.toml).
+
+> **Honest limitation — the shims are best-effort, not a boundary.** A shim only affects a browser
+> launched **by name via `PATH`** (e.g. `google-chrome`, `chromium`, `firefox`). A tool that spawns
+> the browser by its **absolute path** (`/usr/bin/google-chrome`), or that passes its **own**
+> `--user-data-dir` / conflicting flags, bypasses the shim entirely — Raincoat does **not** rewrite
+> a caller's argv or intercept `execve`. The isolated profile and the shim flags reduce casual
+> cross-run/profile leakage and normalize a few obvious fingerprint knobs; they are **not**
+> deep anti-fingerprinting (canvas/WebGL/audio/font/TLS-JA3 signals are untouched). The real
+> protection here is that your **actual** browser profiles are absent from the sandbox in the first
+> place. Every run's audit note records the profile dir, whether shims were written, and this
+> caveat.
+
+---
+
 ## Roadmap
 
 The MVP implements the fake home, env scrub, generic locale/timezone, best-effort fonts,
@@ -590,8 +632,12 @@ filesystem restriction, `full`/`off` networking, and the audit log. Planned and 
 - **Network allowlist mode** — the `NetMode` enum already reserves `allowlist`; let a profile
   permit specific destinations instead of all-or-nothing.
 - **Interactive "ask" mode** — prompt before granting access at run time (reserved as `ask`).
-- **Browser profile isolation** — first-class handling for Playwright / Puppeteer / Selenium so
-  headless-browser tools get a clean profile.
+- **Browser profile isolation** *(best-effort layer implemented — see the
+  [Browser isolation](#browser-isolation-browser) section and [`examples/browser.toml`](examples/browser.toml))*.
+  The fake home already hides your real browser profiles; the `[browser]` block adds an isolated
+  throwaway profile and optional generic PATH launch shims for Playwright / Puppeteer / Selenium
+  jobs. Still deferred: **deep anti-fingerprinting** (canvas/WebGL/audio/font/JA3 normalization) and
+  intercepting absolute-path / flag-overriding launches the shims can't reach.
 - **Better font/emoji fingerprint resistance** — bundle a fixed generic font set (Noto
   Sans/Serif/Sans Mono/Color Emoji, DejaVu Sans) so the font list is uniform, not best-effort.
 - **Honeytoken / tripwire files** — plant decoy credentials in the fake home and flag any tool

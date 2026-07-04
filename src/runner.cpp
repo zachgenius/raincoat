@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include "audit.hpp"
+#include "browser.hpp"
 #include "bwrap.hpp"
 #include "doctor.hpp"
 #include "egress.hpp"
@@ -613,6 +614,42 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         record_set(kv.first);
     }
 
+    // ---- 4a2. Browser isolation (best-effort) ----------------------------
+    // Creates a throwaway browser profile dir and (when use_launch_shims) generic PATH
+    // launch shims that start Chromium/Chrome/Firefox with low-information flags. We
+    // merge its env (TZ) into the child, PREPEND the shim dir to the child PATH so the
+    // shims win, and (below, after mount planning) bind the profile + shim dirs into the
+    // sandbox so they are reachable. Honest limitation surfaced in the audit note.
+    std::string browser_shim_dir, browser_profile_dir, browser_note;
+    if (cfg.ext.browser.enabled) {
+        std::string berr;
+        BrowserSetup browser = setup_browser(cfg.ext.browser, root, berr);
+        for (const auto& kv : browser.env) {
+            env.resolved[kv.first] = kv.second;
+            record_set(kv.first);
+        }
+        browser_shim_dir = browser.shim_dir;
+        browser_profile_dir = browser.profile_dir;
+        browser_note = browser.note;
+        if (!browser_shim_dir.empty()) {
+            // Prepend the shim dir so the shims are found before the real browser.
+            auto it = env.resolved.find("PATH");
+            if (it != env.resolved.end() && !it->second.empty())
+                it->second = browser_shim_dir + ":" + it->second;
+            else
+                // No PATH in the resolved env (rare: the base allowlist normally copies
+                // it). Prepend the shim dir onto a sane default so the child keeps
+                // resolvable base bin dirs rather than ONLY the shim dir.
+                env.resolved["PATH"] = browser_shim_dir + ":/usr/bin:/bin";
+            // Raincoat REWROTE PATH (prepended the shim dir), so it is no longer the
+            // parent's verbatim value. Reclassify it as "set" (mirroring HOME/TMPDIR and
+            // the font env vars) so the tamper-evident audit does not label the modified
+            // PATH as "allowed" ("copied verbatim from parent").
+            record_set("PATH");
+        }
+        if (!berr.empty()) std::cerr << "raincoat: note: " << berr << "\n";
+    }
+
     // ---- 4b. Tripwire bait files (inside the FAKE home only) -------------
     // When [filesystem.tripwire] is enabled, plant harmless decoy "credential" files
     // inside the fake home so a probing tool that goes looking for ~/.ssh/id_rsa,
@@ -661,6 +698,19 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         warning +=
             "Warning: strict mode with no writable paths allowed; the command may "
             "fail. Grant one with --allow-write <path>.";
+    }
+
+    // ---- 5a2. Browser isolation binds ------------------------------------
+    // The browser profile + shim dirs live under the sandbox root (or a user path), so
+    // like the fontconfig dir they need explicit binds to be reachable inside the
+    // sandbox. Profile is read-write (the browser writes it); the shims are read-only.
+    if (cfg.ext.browser.enabled) {
+        if (!browser_profile_dir.empty())
+            mounts.push_back(
+                Mount{browser_profile_dir, browser_profile_dir, MountMode::ReadWrite});
+        if (!browser_shim_dir.empty())
+            mounts.push_back(
+                Mount{browser_shim_dir, browser_shim_dir, MountMode::ReadOnly});
     }
 
     // ---- 5b. Minimal /etc view -------------------------------------------
@@ -1172,6 +1222,20 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         rec.active_policy_notes.push_back(
             "tripwire bait planted in the fake home (" +
             std::to_string(tripwire_planted) + " file(s))");
+    }
+    if (cfg.ext.browser.enabled) {
+        const bool shims_on = !browser_shim_dir.empty();
+        std::string note = "Browser isolation: enabled (";
+        note += browser_note.empty()
+                    ? ("profile " + browser_profile_dir + ", shims " +
+                       (shims_on ? "on" : "off"))
+                    : browser_note;
+        note += ")";
+        if (shims_on)
+            note +=
+                " — shims only affect a browser launched by name via PATH (an absolute-"
+                "path launch or overridden flags are not constrained)";
+        rec.active_policy_notes.push_back(note);
     }
     if (etc_hostname || etc_hosts || etc_localtime) {
         std::string files;

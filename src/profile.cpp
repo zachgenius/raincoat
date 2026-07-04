@@ -373,9 +373,34 @@ std::optional<Options> load_profile(const std::string& path, std::string& err) {
                 "network mode \"" + eg.mode + "\" is not yet enforced (phase 2)");
         }
     }
+    // [browser] -> ext.browser (BrowserConfig). Enforced this phase (phase 4) by the
+    // browser module (isolated profile dir + optional PATH launch shims), so this is
+    // REAL parsed config now. Tolerant of unknown keys. When configured but NOT enabled
+    // there is nothing to apply, so disclose that honestly as a reserved (inert) note so
+    // the audit never implies a privacy feature took effect when it did not.
     if (t.contains("browser")) {
-        o.ext.reserved_notes.push_back(
-            "browser isolation configured — not yet enforced (phase 2)");
+        BrowserConfig& br = o.ext.browser;
+        if (auto b = t.get_bool("browser.enabled"); b.has_value()) br.enabled = *b;
+        if (auto b = t.get_bool("browser.isolate_profile"); b.has_value())
+            br.isolate_profile = *b;
+        if (auto s = t.get_string("browser.profile_dir"); s.has_value())
+            br.profile_dir = *s;
+        if (auto s = t.get_string("browser.timezone"); s.has_value()) br.timezone = *s;
+        if (auto s = t.get_string("browser.locale"); s.has_value()) br.locale = *s;
+        if (auto s = t.get_string("browser.viewport"); s.has_value()) br.viewport = *s;
+        if (auto b = t.get_bool("browser.disable_gpu"); b.has_value())
+            br.disable_gpu = *b;
+        if (auto b = t.get_bool("browser.disable_extensions"); b.has_value())
+            br.disable_extensions = *b;
+        if (auto b = t.get_bool("browser.disable_sync"); b.has_value())
+            br.disable_sync = *b;
+        if (auto b = t.get_bool("browser.use_launch_shims"); b.has_value())
+            br.use_launch_shims = *b;
+
+        if (!br.enabled) {
+            o.ext.reserved_notes.push_back(
+                "browser isolation configured but not enabled (enabled=false)");
+        }
     }
     if (t.contains("dns")) {
         o.ext.reserved_notes.push_back(
