@@ -40,8 +40,8 @@ supervisor exists. To be consistent, the fake values MUST match across both path
 
 | Syscall (`x86_64 nr`) | Exposes | How we fake it | Status |
 |---|---|---|---|
-| `uname(2)` (63) | `sysname`, `nodename` (hostname), `release` (kernel), `version` (build string), `machine` (arch), `domainname` | seccomp user-notify: write a fake `struct new_utsname` into the child's buffer | **implemented** (`backend.fake_uname`) |
-| `sysinfo(2)` (99) | `uptime`, load avg, `totalram`/`freeram` (RAM size), swap, process count | seccomp user-notify: write fake `struct sysinfo` | **implemented** (`backend.fake_sysinfo`) |
+| `uname(2)` (63) | `sysname`, `nodename` (hostname), `release` (kernel), `version` (build string), `machine` (arch), `domainname` | seccomp user-notify: write a fake `struct new_utsname` into the child's buffer | **implemented** (set `kernel_osrelease`/`kernel_version`) |
+| `sysinfo(2)` (99) | `uptime`, load avg, `totalram`/`freeram` (RAM size), swap, process count | seccomp user-notify: write fake `struct sysinfo` | **implemented** (set `mem_total_kb`/`uptime_seconds`) |
 | `sched_getaffinity(2)` (204) | logical CPU count (`nproc`) | seccomp user-notify: rewrite the returned cpu-set | planned (risky — breaks pool sizing) |
 | `getcpu(2)` (309) | current CPU/NUMA node → topology inference | user-notify: pin to 0 | low value |
 | `clock_gettime(CLOCK_BOOTTIME)` / `CLOCK_MONOTONIC` | uptime, boot correlation | hard — faking time breaks programs; only offset-able | not planned |
@@ -54,14 +54,14 @@ supervisor exists. To be consistent, the fake values MUST match across both path
 
 | Path | Exposes | Status |
 |---|---|---|
-| `/proc/cpuinfo` | CPU model/family/stepping/microcode/MHz/flags (+ ARM `Serial`) | **masked** (`fake_cpuinfo`, x86) |
-| `/proc/version` | kernel release + **distro build host** + toolchain | **masked** (`fake_kernel`) |
-| `/proc/sys/kernel/osrelease` · `…/version` · `…/ostype` | `uname` mirror | **masked** (`fake_kernel`) |
+| `/proc/cpuinfo` | CPU model/family/stepping/microcode/MHz/flags (+ ARM `Serial`) | **masked** (`cpu_vendor_id`/`cpu_model_name`, x86) |
+| `/proc/version` | kernel release + **distro build host** + toolchain | **masked** (`kernel_osrelease`/`kernel_version`) |
+| `/proc/sys/kernel/osrelease` · `…/version` · `…/ostype` | `uname` mirror | **masked** (`kernel_osrelease`/`kernel_version`) |
 | `/proc/sys/kernel/hostname` · `…/domainname` | hostname | UTS namespace (`--unshare-uts --hostname`) |
-| `/etc/machine-id` · `/var/lib/dbus/machine-id` | stable per-install ID | **masked** (`fake_machine_id`, constant) |
-| `/proc/sys/kernel/random/boot_id` | per-boot UUID (correlation) | **masked** (`fake_boot_id`, default on) |
-| `/proc/meminfo` · `/proc/uptime` · `/proc/loadavg` | RAM size, uptime, load | **masked** (`fake_meminfo` / `fake_uptime`) |
-| `/proc/self/mountinfo` · `/proc/mounts` | **host mount layout + real paths** (strong deanon vector) | partially reduced by bwrap's own mounts; overlay planned |
+| `/etc/machine-id` · `/var/lib/dbus/machine-id` | stable per-install ID | **masked** (`machine_id`) |
+| `/proc/sys/kernel/random/boot_id` | per-boot UUID (correlation) | **masked** (`boot_id`) |
+| `/proc/meminfo` · `/proc/uptime` · `/proc/loadavg` | RAM size, uptime, load | **masked** (`mem_total_kb` / `uptime_seconds`) |
+| `/proc/self/mountinfo` · `/proc/mounts` | **host mount layout + real paths** (username in bind paths, `uid=`, block device, and — self-defeatingly — the `.rc-*` mask mounts themselves) | **hard — no clean mechanism.** A `--ro-bind` over `/proc/self/mountinfo` does NOT reach readers (verified): `self` re-resolves per reading process, so the bind lands on bwrap's own pid dir, not the child's; and there is no `mountinfo` syscall to seccomp. Deferred pending a different mechanism (e.g. mounting cwd at a generic path instead of its host path). |
 | `/sys/class/dmi/id/*` (`product_uuid`, `product_serial`, `board_serial`, `chassis_serial`, `sys_vendor`, `product_name`) | SMBIOS/DMI serials + **product UUID** | **not exposed** — Raincoat never mounts `/sys` |
 | `/sys/class/net/*/address` | interface **MAC** | **not exposed** — no `/sys` mount |
 | `/sys/firmware/dmi/tables/*` · `/dev/mem` | raw SMBIOS | not exposed (no `/sys`, no `/dev/mem`) |
@@ -170,10 +170,10 @@ identity remain Tier 3 / hardware-rooted.
 ## Implementation roadmap
 
 - [x] Tier 1, Linux: `/proc/cpuinfo`, `/proc/version` + `uname` file mirror, `/etc/machine-id`
-- [x] Tier 2, Linux: `uname(2)` via seccomp user-notify (`backend.fake_uname`)
-- [x] Tier 2, Linux: `sysinfo(2)` (`backend.fake_sysinfo`) + paired `/proc/meminfo`, `/proc/uptime`, `/proc/loadavg` overlays
-- [x] Tier 1, Linux: `boot_id` overlay (`backend.fake_boot_id`)
-- [ ] Tier 1, Linux: `/proc/self/mountinfo` overlay (host mount-layout deanon vector)
+- [x] Tier 2, Linux: `uname(2)` via seccomp user-notify (set `kernel_osrelease`/`kernel_version`)
+- [x] Tier 2, Linux: `sysinfo(2)` (set `mem_total_kb`/`uptime_seconds`) + paired `/proc/meminfo`, `/proc/uptime`, `/proc/loadavg` overlays
+- [x] Tier 1, Linux: `boot_id` overlay (set `boot_id`)
+- [ ] Tier 1, Linux: `/proc/self/mountinfo` — **blocked**: bind-overlay can't follow the per-reader `self` indirection (verified), and there's no syscall to trap. Needs a different mechanism (mount cwd at a generic path; strip host paths from binds).
 - [ ] `uname` on non-x86 arches (per-arch syscall numbers)
 - [ ] macOS `DYLD_INSERT_LIBRARIES` interposer (`sysctl`, `gethostuuid`, IOKit)
 - [ ] Windows API-hook layer (`MachineGuid`, SMBIOS, WMI)

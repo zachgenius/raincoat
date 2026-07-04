@@ -14,6 +14,7 @@
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
+#include <sys/utsname.h>
 #include <unistd.h>
 
 #include <linux/audit.h>
@@ -76,27 +77,6 @@ std::array<char, kUtsBufLen> pack_new_utsname(const UtsnameSpoof& s) {
     put(5, s.domainname);
     return b;
 }
-
-#if defined(__x86_64__)
-// Build the fake `struct sysinfo` the supervisor writes into a sysinfo(2) caller's buffer.
-static struct sysinfo pack_sysinfo(const SysinfoSpoof& s) {
-    struct sysinfo si;
-    std::memset(&si, 0, sizeof(si));
-    si.uptime = static_cast<long>(s.uptime_seconds);
-    si.loads[0] = si.loads[1] = si.loads[2] = 0;
-    si.totalram = s.total_ram_bytes;
-    si.freeram = s.free_ram_bytes;
-    si.sharedram = 0;
-    si.bufferram = 0;
-    si.totalswap = 0;
-    si.freeswap = 0;
-    si.procs = s.procs;
-    si.totalhigh = 0;
-    si.freehigh = 0;
-    si.mem_unit = 1;  // values above are already in bytes
-    return si;
-}
-#endif
 
 bool seccomp_identity_supported() {
 #if defined(__x86_64__)
@@ -218,9 +198,6 @@ static bool write_child_mem(int listener_fd, const struct seccomp_notif& req, co
 void seccomp_supervise_identity(int listener_fd, const IdentitySpoof& spoof,
                                 std::atomic<bool>& stop) {
 #if defined(__x86_64__)
-    const std::array<char, kUtsBufLen> uts = pack_new_utsname(spoof.uts);
-    const struct sysinfo si = pack_sysinfo(spoof.sys);
-
     for (;;) {
         if (stop.load()) break;
 
@@ -252,9 +229,42 @@ void seccomp_supervise_identity(int listener_fd, const IdentitySpoof& spoof,
 
         bool ok = true;
         if (req.data.nr == __NR_uname) {
-            ok = write_child_mem(listener_fd, req, uts.data(), uts.size());
+            // Baseline from the host's REAL uname, then override only the requested fields
+            // (nodename always; release/version when set) so unset fields stay the real value.
+            UtsnameSpoof u;
+            struct utsname real;
+            if (::uname(&real) == 0) {
+                u.sysname = real.sysname;
+                u.release = real.release;
+                u.version = real.version;
+                u.machine = real.machine;
+            }
+            u.nodename = spoof.uts_nodename;
+            if (spoof.uts_release) u.release = *spoof.uts_release;
+            if (spoof.uts_version) u.version = *spoof.uts_version;
+            const std::array<char, kUtsBufLen> buf = pack_new_utsname(u);
+            ok = write_child_mem(listener_fd, req, buf.data(), buf.size());
         } else if (req.data.nr == __NR_sysinfo) {
-            ok = write_child_mem(listener_fd, req, &si, sizeof(si));
+            // Baseline from the host's REAL sysinfo, then override memory / uptime when set.
+            struct sysinfo si;
+            if (::sysinfo(&si) == 0) {
+                if (spoof.sys_uptime_seconds)
+                    si.uptime = static_cast<long>(*spoof.sys_uptime_seconds);
+                if (spoof.sys_total_ram_bytes) {
+                    si.totalram = *spoof.sys_total_ram_bytes;
+                    si.freeram = *spoof.sys_total_ram_bytes / 2;
+                    si.sharedram = 0;
+                    si.bufferram = 0;
+                    si.totalswap = 0;
+                    si.freeswap = 0;
+                    si.totalhigh = 0;
+                    si.freehigh = 0;
+                    si.mem_unit = 1;  // totalram/freeram are now in bytes
+                }
+                ok = write_child_mem(listener_fd, req, &si, sizeof(si));
+            } else {
+                ok = false;
+            }
         }
         // else: a syscall we did not mean to trap — answer success (val=0) harmlessly.
         if (!ok) resp.error = -EFAULT;  // make the syscall fail cleanly rather than half-lie

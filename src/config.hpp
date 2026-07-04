@@ -205,44 +205,29 @@ struct BackendConfig {
     bool unshare_cgroup = false;
     bool unshare_net_when_off = true;   // honor NetMode::Off with --unshare-net
     bool mount_proc     = true;
-    bool fake_cpuinfo   = true;         // shadow /proc/cpuinfo with a generic block (x86 hosts)
-    // Identity strings written into the fake /proc/cpuinfo (when fake_cpuinfo is on).
-    // Configurable so a profile can present a chosen CPU rather than the built-in generic.
-    // The logical-processor COUNT is always taken from the host (kept for functionality).
-    std::string cpu_vendor_id  = "GenuineIntel";
-    std::string cpu_model_name = "Generic x86_64 Processor";
-    // Kernel identity mask: shadow /proc/version and /proc/sys/kernel/{osrelease,version}
-    // (the file-readable mirror of `uname`) so the child cannot read the host's exact
-    // kernel release + build host/toolchain — a strong fingerprint --proc leaves exposed.
-    // NOTE: the uname() *syscall* itself is NOT faked (bwrap can't intercept it); this
-    // only covers the /proc file reads. Values below are what the child sees.
-    bool fake_kernel = true;
-    std::string kernel_osrelease = "6.1.0-generic";
-    std::string kernel_version   = "#1 SMP PREEMPT_DYNAMIC Generic";
-    // Machine-id mask: present a constant generic /etc/machine-id instead of exposing (or
-    // leaving absent) the host's stable per-install identifier. A shared constant is
-    // non-identifying by design; configure it if a tool needs a specific value.
-    bool fake_machine_id = true;
-    std::string machine_id = "0123456789abcdef0123456789abcdef";
-    // Syscall-level (Tier 2) mask: intercept the uname(2) SYSCALL via a seccomp user-notify
-    // supervisor and return the same generic kernel/hostname the /proc masks show — closing
-    // the gap for static/Go binaries that call uname() directly instead of reading /proc.
-    // OFF by default: it installs a seccomp filter + a supervisor thread (heavier, newer path)
-    // and is x86_64-only. See docs/FINGERPRINT-SYSCALLS.md. The presented values reuse
-    // kernel_osrelease / kernel_version / the identity hostname.
-    bool fake_uname = false;
-    // Syscall-level (Tier 2) mask for sysinfo(2): intercept the syscall and return generic
-    // uptime/RAM/proc-count. OFF by default (heavier seccomp path + faking RAM can affect
-    // memory-sizing tools). x86_64-only. Pairs with the /proc/meminfo + /proc/uptime overlays.
-    bool fake_sysinfo = false;
-    // Tier-1 /proc overlays for memory/uptime/boot identity. meminfo/uptime default OFF
-    // (faking RAM/uptime can surprise tools); boot_id default ON (a pure per-boot correlation
-    // UUID — nothing depends on its value, so masking it never breaks anything).
-    bool fake_meminfo = false;   // /proc/meminfo
-    bool fake_uptime = false;    // /proc/uptime + /proc/loadavg
-    bool fake_boot_id = true;    // /proc/sys/kernel/random/boot_id
-    std::uint64_t mem_total_kb = 16ull * 1024 * 1024;  // 16 GiB; shared by sysinfo + meminfo
-    std::string boot_id = "00000000-0000-4000-8000-000000000000";
+    // ---- Fingerprint masks (value-driven; see docs/FINGERPRINT-SYSCALLS.md) ---------------
+    // There are NO on/off booleans here: each optional value is the switch. When a value is
+    // SET (present in the profile) the child is shown that value in place of the host's real
+    // one; when it is UNSET (absent / commented out) the real system value is used. For a
+    // datum with both a /proc file and a syscall (kernel<->uname, memory/uptime<->sysinfo),
+    // setting the value masks BOTH the file read AND the syscall (x86_64) together.
+    //
+    // cpu_* -> synthesized /proc/cpuinfo (x86 hosts). Faked if either is set; the unset one
+    // falls back to a generic default. Logical-processor COUNT is always the host's.
+    std::optional<std::string> cpu_vendor_id;          // e.g. "GenuineIntel"
+    std::optional<std::string> cpu_model_name;         // e.g. "Generic x86_64 Processor"
+    // kernel_* -> /proc/version + /proc/sys/kernel/{osrelease,version} AND the uname(2)
+    // syscall (release/version). Faked if either is set; the unset one stays the host's real.
+    std::optional<std::string> kernel_osrelease;       // uname -r
+    std::optional<std::string> kernel_version;         // uname -v (build string)
+    // machine_id -> /etc/machine-id (stable per-install identifier).
+    std::optional<std::string> machine_id;
+    // boot_id -> /proc/sys/kernel/random/boot_id (per-boot correlation UUID).
+    std::optional<std::string> boot_id;
+    // mem_total_kb -> /proc/meminfo AND sysinfo(2).totalram (host RAM size).
+    std::optional<std::uint64_t> mem_total_kb;
+    // uptime_seconds -> /proc/uptime + /proc/loadavg AND sysinfo(2).uptime.
+    std::optional<std::uint64_t> uptime_seconds;
     bool mount_dev      = true;
     bool mount_tmpfs_tmp = true;
     bool die_with_parent = true;

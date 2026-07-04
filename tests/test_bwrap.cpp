@@ -213,7 +213,7 @@ TEST(Bwrap, BaseProcAndDev) {
 }
 
 // ---------------------------------------------------------------------------
-// /proc/cpuinfo mask (fake_cpuinfo_file)
+// /proc overlays (proc_overlays: cpuinfo, kernel, ...)
 // ---------------------------------------------------------------------------
 
 // Rebuild buildTypical with explicit proc overlays passed positionally.

@@ -817,10 +817,10 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             // Constant generic /etc/machine-id (a stable per-install identifier the host
             // would otherwise expose, or leave absent). A shared constant is non-
             // identifying; configurable via backend.machine_id.
-            if (cfg.ext.backend.fake_machine_id) {
+            if (cfg.ext.backend.machine_id) {
                 const std::string mid_path = etc_dir + "/machine-id";
                 std::ofstream mf(mid_path, std::ios::binary | std::ios::trunc);
-                mf << cfg.ext.backend.machine_id << "\n";
+                mf << *cfg.ext.backend.machine_id << "\n";
                 if (mf) {
                     mounts.push_back(
                         Mount{mid_path, "/etc/machine-id", MountMode::ReadOnly});
@@ -1218,40 +1218,53 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             proc_overlays.emplace_back(path, target);
             return true;
         };
-        if (cfg.ext.backend.fake_cpuinfo) {
+        const BackendConfig& bk = cfg.ext.backend;
+        // cpuinfo: faked when either cpu identity value is set; unset one -> generic default.
+        if (bk.cpu_vendor_id || bk.cpu_model_name) {
             if (host_is_x86()) {
                 cpuinfo_masked = write_overlay(
                     ".rc-cpuinfo", "/proc/cpuinfo",
                     generic_cpuinfo(std::thread::hardware_concurrency(),
-                                    cfg.ext.backend.cpu_vendor_id,
-                                    cfg.ext.backend.cpu_model_name));
+                                    bk.cpu_vendor_id.value_or("GenuineIntel"),
+                                    bk.cpu_model_name.value_or("Generic x86_64 Processor")));
             } else {
                 cpuinfo_skipped_arch = true;
             }
         }
-        if (cfg.ext.backend.fake_kernel) {
-            const std::string& rel = cfg.ext.backend.kernel_osrelease;
-            const std::string& ver = cfg.ext.backend.kernel_version;
-            // /proc/version plus the file mirror of `uname -r` / `uname -v`.
+        // kernel: faked when either kernel value is set. For /proc/version (a composite of
+        // release + build string) the UNSET part uses the host's REAL value, honoring
+        // "unset => system". The individual mirror files are written only for the value set.
+        if (bk.kernel_osrelease || bk.kernel_version) {
+            struct utsname real;
+            const bool have_real = (::uname(&real) == 0);
+            const std::string rel =
+                bk.kernel_osrelease.value_or(have_real ? real.release : "6.1.0-generic");
+            const std::string ver = bk.kernel_version.value_or(
+                have_real ? real.version : "#1 SMP PREEMPT_DYNAMIC Generic");
             bool v = write_overlay(".rc-version", "/proc/version",
                                    generic_proc_version(rel, ver));
-            bool r = write_overlay(".rc-osrelease", "/proc/sys/kernel/osrelease", rel + "\n");
-            bool k = write_overlay(".rc-kversion", "/proc/sys/kernel/version", ver + "\n");
-            kernel_masked = v || r || k;
+            bool r = true, k = true;
+            if (bk.kernel_osrelease)
+                r = write_overlay(".rc-osrelease", "/proc/sys/kernel/osrelease",
+                                  *bk.kernel_osrelease + "\n");
+            if (bk.kernel_version)
+                k = write_overlay(".rc-kversion", "/proc/sys/kernel/version",
+                                  *bk.kernel_version + "\n");
+            kernel_masked = v && r && k;
         }
-        if (cfg.ext.backend.fake_meminfo) {
-            meminfo_masked =
-                write_overlay(".rc-meminfo", "/proc/meminfo",
-                              generic_meminfo(cfg.ext.backend.mem_total_kb));
+        if (bk.mem_total_kb) {
+            meminfo_masked = write_overlay(".rc-meminfo", "/proc/meminfo",
+                                           generic_meminfo(*bk.mem_total_kb));
         }
-        if (cfg.ext.backend.fake_uptime) {
-            bool up = write_overlay(".rc-uptime", "/proc/uptime", "3600.00 3600.00\n");
+        if (bk.uptime_seconds) {
+            const std::string u = std::to_string(*bk.uptime_seconds) + ".00";
+            bool up = write_overlay(".rc-uptime", "/proc/uptime", u + " " + u + "\n");
             bool la = write_overlay(".rc-loadavg", "/proc/loadavg", "0.00 0.00 0.00 1/128 1\n");
-            uptime_masked = up || la;
+            uptime_masked = up && la;
         }
-        if (cfg.ext.backend.fake_boot_id) {
+        if (bk.boot_id) {
             boot_id_masked = write_overlay(".rc-bootid", "/proc/sys/kernel/random/boot_id",
-                                           cfg.ext.backend.boot_id + "\n");
+                                           *bk.boot_id + "\n");
         }
     }
 
@@ -1451,10 +1464,14 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             "/proc/sys/kernel/random/boot_id presented as a constant (per-boot correlation "
             "UUID hidden).");
     }
-    if (cfg.ext.backend.fake_uname || cfg.ext.backend.fake_sysinfo) {
+    const bool note_uname =
+        cfg.ext.backend.kernel_osrelease.has_value() || cfg.ext.backend.kernel_version.has_value();
+    const bool note_sysinfo =
+        cfg.ext.backend.mem_total_kb.has_value() || cfg.ext.backend.uptime_seconds.has_value();
+    if (note_uname || note_sysinfo) {
         std::string which;
-        if (cfg.ext.backend.fake_uname) which += "uname(2)";
-        if (cfg.ext.backend.fake_sysinfo)
+        if (note_uname) which += "uname(2)";
+        if (note_sysinfo)
             which += (which.empty() ? "" : " + ") + std::string("sysinfo(2)");
         if (seccomp_identity_supported()) {
             rec.active_policy_notes.push_back(
@@ -1642,8 +1659,12 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // HERE (parent) so the child path stays allocation-free; the listener fd is handed back over
     // a socketpair. Best-effort: any setup failure disables the hook and leaves the syscalls
     // real (the kernel returns ENOSYS to any orphaned trap). See docs/FINGERPRINT-SYSCALLS.md.
-    const bool want_uname = cfg.ext.backend.fake_uname;
-    const bool want_sysinfo = cfg.ext.backend.fake_sysinfo;
+    // The syscall hooks turn on with the same values that drive the /proc file masks: a set
+    // kernel value hooks uname(2); a set memory/uptime value hooks sysinfo(2).
+    const bool want_uname =
+        cfg.ext.backend.kernel_osrelease.has_value() || cfg.ext.backend.kernel_version.has_value();
+    const bool want_sysinfo =
+        cfg.ext.backend.mem_total_kb.has_value() || cfg.ext.backend.uptime_seconds.has_value();
     bool id_hook = (want_uname || want_sysinfo) && seccomp_identity_supported();
     std::vector<sock_filter> id_prog;
     int sc_sock[2] = {-1, -1};
@@ -1696,12 +1717,12 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             IdentitySpoof spoof;
             spoof.trap_uname = want_uname;
             spoof.trap_sysinfo = want_sysinfo;
-            spoof.uts.nodename = identity_host;
-            spoof.uts.release = cfg.ext.backend.kernel_osrelease;
-            spoof.uts.version = cfg.ext.backend.kernel_version;
-            spoof.sys.total_ram_bytes =
-                static_cast<std::uint64_t>(cfg.ext.backend.mem_total_kb) * 1024;
-            spoof.sys.free_ram_bytes = spoof.sys.total_ram_bytes / 2;
+            spoof.uts_nodename = identity_host;
+            spoof.uts_release = cfg.ext.backend.kernel_osrelease;
+            spoof.uts_version = cfg.ext.backend.kernel_version;
+            if (cfg.ext.backend.mem_total_kb)
+                spoof.sys_total_ram_bytes = *cfg.ext.backend.mem_total_kb * 1024;
+            spoof.sys_uptime_seconds = cfg.ext.backend.uptime_seconds;
             sigset_t block, old;
             sigemptyset(&block);
             sigaddset(&block, SIGINT);

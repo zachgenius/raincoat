@@ -502,50 +502,36 @@ unshare_net_when_off = true
 
 # Mount basic virtual filesystems.
 mount_proc = true
-# Shadow /proc/cpuinfo with a generic block so the child cannot read the host's exact
-# CPU (model/stepping/microcode/MHz/flags) as a fingerprint. The logical-processor
-# COUNT is preserved so tools that size thread pools still work. Only takes effect when
-# mount_proc = true and the host is x86 (a wrong-arch fake would mislead tools, so it is
-# skipped elsewhere). Best-effort: the uname() kernel/arch string is NOT faked.
-fake_cpuinfo = true
-# The identity strings written into the fake /proc/cpuinfo. Configure these to present a
-# chosen CPU instead of the built-in generic. (The logical-processor count is always taken
-# from the host so thread-pool sizing stays correct.)
+# ---- Fingerprint masks: VALUE-DRIVEN (no on/off booleans) ----------------------------
+# Each key below is BOTH the switch and the value: set it and the child is shown that value
+# in place of the host's real one; COMMENT IT OUT (or omit it) and the real system value is
+# used. For a datum that has both a /proc file and a syscall, setting the value masks BOTH
+# the file read AND the syscall (x86_64) together — e.g. kernel_osrelease masks /proc/version
+# and /proc/sys/kernel/osrelease AND uname(2)'s release field (so even a static/Go binary
+# issuing the raw syscall, which an LD_PRELOAD shim would miss, gets the fake). Fields you
+# leave unset stay the host's real value (the syscall supervisor baselines from the real
+# struct and overrides only what you set). See docs/FINGERPRINT-SYSCALLS.md.
+#
+# This block sets ALL of them as a "mask everything" demo — comment out any line to fall
+# back to the real system value for that datum. (The syscall hooks install a seccomp filter
+# plus a supervisor thread, x86_64 only; on a non-x86 host the cpuinfo mask is skipped.)
+
+# /proc/cpuinfo (x86). Faked if either is set; the unset one uses a generic default. The
+# logical-processor COUNT is always the host's, so thread-pool sizing stays correct.
 cpu_vendor_id = "GenuineIntel"
 cpu_model_name = "Generic x86_64 Processor"
-# Kernel identity mask: shadow /proc/version and /proc/sys/kernel/{osrelease,version} (the
-# file-readable mirror of `uname`) so the child cannot read the host's exact kernel release
-# or distro build host. NOTE: the uname() SYSCALL itself is not intercepted — this covers
-# the /proc file reads only. Values below are what the child sees.
-fake_kernel = true
+# Kernel: /proc/version + /proc/sys/kernel/{osrelease,version} AND uname(2). Faked if either
+# is set; the unset one stays the host's real value.
 kernel_osrelease = "6.1.0-generic"
 kernel_version = "#1 SMP PREEMPT_DYNAMIC Generic"
-# Present a constant generic /etc/machine-id instead of the host's stable per-install id.
-fake_machine_id = true
+# /etc/machine-id (stable per-install identifier). A shared constant is non-identifying.
 machine_id = "0123456789abcdef0123456789abcdef"
-# Tier-2 (syscall-level) mask, OPT-IN, x86_64 only. Intercepts the uname(2) SYSCALL via a
-# seccomp user-notify supervisor and returns the same generic kernel/hostname the /proc masks
-# show — closing the gap for static/Go binaries that call uname() directly (which the /proc
-# file overlays and an LD_PRELOAD shim both miss). Off by default: it installs a seccomp filter
-# and a supervisor thread. Presented values reuse kernel_osrelease / kernel_version / the
-# identity hostname. See docs/FINGERPRINT-SYSCALLS.md.
-fake_uname = false
-# Tier-2 (syscall-level) mask for sysinfo(2), OPT-IN, x86_64 only. Intercepts the syscall and
-# returns generic uptime / RAM / process count. Off by default (heavier seccomp path + faking
-# RAM can affect memory-sizing tools). Pairs with the /proc/meminfo + /proc/uptime overlays.
-fake_sysinfo = false
-# Tier-1 /proc overlays for memory/uptime/boot identity.
-#   fake_meminfo -> /proc/meminfo (RAM size). OFF by default (faking RAM can surprise tools).
-#   fake_uptime  -> /proc/uptime + /proc/loadavg. OFF by default.
-#   fake_boot_id -> /proc/sys/kernel/random/boot_id. ON by default: it is a pure per-boot
-#                   correlation UUID, so masking it never breaks anything.
-fake_meminfo = false
-fake_uptime = false
-fake_boot_id = true
-# Presented total RAM in kB (shared by fake_sysinfo and fake_meminfo). Default 16 GiB.
-mem_total_kb = 16777216
-# Presented /proc/sys/kernel/random/boot_id value.
+# /proc/sys/kernel/random/boot_id (per-boot correlation UUID).
 boot_id = "00000000-0000-4000-8000-000000000000"
+# Memory: /proc/meminfo AND sysinfo(2).totalram. Total RAM in kB (here 16 GiB).
+mem_total_kb = 16777216
+# Uptime: /proc/uptime + /proc/loadavg AND sysinfo(2).uptime. Seconds (here 1h).
+uptime_seconds = 3600
 mount_dev = true
 mount_tmpfs_tmp = true
 
