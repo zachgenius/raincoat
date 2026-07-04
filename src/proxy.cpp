@@ -21,12 +21,12 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <signal.h>
-#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 
 #include "egress.hpp"  // parse_url / parse_request_head / find_header / content_length / framing
+#include "util.hpp"    // make_wakeup_fds / close_wakeup_fds (portable poll-wakeup)
 
 namespace raincoat {
 
@@ -521,9 +521,7 @@ bool ProxyServer::start(const std::string& loopback_addr, int port, const Networ
     policy_ = policy;
     timeout_s_ = timeout_seconds >= 1 ? timeout_seconds : 1;
 
-    shutdown_fd_ = ::eventfd(0, EFD_NONBLOCK);
-    if (shutdown_fd_ < 0) {
-        err = "eventfd() failed: " + std::string(std::strerror(errno));
+    if (!make_wakeup_fds(shutdown_fd_, shutdown_wfd_, err)) {
         return false;
     }
 
@@ -766,9 +764,9 @@ void ProxyServer::handle_connection(int client_fd) {
 void ProxyServer::stop() {
     running_.exchange(false);
 
-    if (shutdown_fd_ >= 0) {
+    if (shutdown_wfd_ >= 0) {
         uint64_t one = 1;
-        ssize_t w = ::write(shutdown_fd_, &one, sizeof(one));
+        ssize_t w = ::write(shutdown_wfd_, &one, sizeof(one));
         (void)w;
     }
 
@@ -786,10 +784,7 @@ void ProxyServer::stop() {
         conn_cv_.wait(lk, [this] { return active_conns_ == 0; });
     }
 
-    if (shutdown_fd_ >= 0) {
-        ::close(shutdown_fd_);
-        shutdown_fd_ = -1;
-    }
+    close_wakeup_fds(shutdown_fd_, shutdown_wfd_);
     port_ = -1;
 }
 

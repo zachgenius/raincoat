@@ -2,6 +2,7 @@
 //
 // See egress.hpp for the contract and the honest networking-model caveat.
 #include "egress.hpp"
+#include "util.hpp"  // make_wakeup_fds / close_wakeup_fds (portable poll-wakeup)
 
 #include <algorithm>
 #include <cctype>
@@ -17,7 +18,6 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <signal.h>
-#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -819,9 +819,7 @@ bool EgressServer::start(const EgressConfig& cfg, std::string& err) {
     ignore_sigpipe_once();
     cfg_ = cfg;
 
-    shutdown_fd_ = ::eventfd(0, EFD_NONBLOCK);
-    if (shutdown_fd_ < 0) {
-        err = "eventfd() failed: " + std::string(std::strerror(errno));
+    if (!make_wakeup_fds(shutdown_fd_, shutdown_wfd_, err)) {
         return false;
     }
 
@@ -1231,9 +1229,9 @@ void EgressServer::stop() {
     bool was_running = running_.exchange(false);
 
     // Wake accept threads out of poll().
-    if (shutdown_fd_ >= 0) {
+    if (shutdown_wfd_ >= 0) {
         uint64_t one = 1;
-        ssize_t w = ::write(shutdown_fd_, &one, sizeof(one));
+        ssize_t w = ::write(shutdown_wfd_, &one, sizeof(one));
         (void)w;
     }
 
@@ -1254,10 +1252,7 @@ void EgressServer::stop() {
         conn_cv_.wait(lk, [this] { return active_conns_ == 0; });
     }
 
-    if (shutdown_fd_ >= 0) {
-        ::close(shutdown_fd_);
-        shutdown_fd_ = -1;
-    }
+    close_wakeup_fds(shutdown_fd_, shutdown_wfd_);
     (void)was_running;
 }
 

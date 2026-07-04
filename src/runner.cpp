@@ -263,7 +263,7 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     struct sigaction sa;
     std::memset(&sa, 0, sizeof(sa));
     sa.sa_handler = forward_terminating_signal;
-    ::sigemptyset(&sa.sa_mask);
+    sigemptyset(&sa.sa_mask);  // NB: a macro on macOS/BSD — no :: qualifier
     sa.sa_flags = 0;  // no SA_RESTART: let waitpid() return EINTR so we re-check.
     struct sigaction old_int, old_term, old_hup;
     ::sigaction(SIGINT, &sa, &old_int);

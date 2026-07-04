@@ -96,7 +96,8 @@ private:
     std::atomic<bool> running_{false};
     int listen_fd_ = -1;
     int port_ = -1;
-    int shutdown_fd_ = -1;
+    int shutdown_fd_ = -1;   // poll this for POLLIN (eventfd on Linux; self-pipe read end elsewhere)
+    int shutdown_wfd_ = -1;  // poke this to signal (== shutdown_fd_ on Linux eventfd)
     std::thread accept_thread_;
 
     // Detached per-connection workers, reaped continuously like EgressServer: each bumps

@@ -7,10 +7,51 @@
 #include <cstring>
 #include <sstream>
 
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
+#ifdef __linux__
+#include <sys/eventfd.h>
+#endif
 
 namespace raincoat {
+
+bool make_wakeup_fds(int& read_fd, int& write_fd, std::string& err) {
+    read_fd = -1;
+    write_fd = -1;
+#ifdef __linux__
+    int fd = ::eventfd(0, EFD_NONBLOCK);
+    if (fd < 0) {
+        err = "eventfd() failed: " + std::string(std::strerror(errno));
+        return false;
+    }
+    read_fd = fd;
+    write_fd = fd;  // eventfd is read+write on one fd (historic behavior preserved)
+    return true;
+#else
+    int fds[2];
+    if (::pipe(fds) != 0) {
+        err = "pipe() failed: " + std::string(std::strerror(errno));
+        return false;
+    }
+    // Non-blocking both ends so signal() never blocks and a drained poll never stalls.
+    for (int i = 0; i < 2; ++i) {
+        int fl = ::fcntl(fds[i], F_GETFL, 0);
+        if (fl != -1) ::fcntl(fds[i], F_SETFL, fl | O_NONBLOCK);
+    }
+    read_fd = fds[0];
+    write_fd = fds[1];
+    return true;
+#endif
+}
+
+void close_wakeup_fds(int& read_fd, int& write_fd) {
+    if (write_fd >= 0 && write_fd != read_fd) ::close(write_fd);
+    if (read_fd >= 0) ::close(read_fd);
+    read_fd = -1;
+    write_fd = -1;
+}
 
 std::optional<std::string> canonicalize(const std::string& path) {
     if (path.empty()) return std::nullopt;

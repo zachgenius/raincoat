@@ -136,7 +136,8 @@ private:
 
     EgressConfig cfg_;
     std::atomic<bool> running_{false};
-    int shutdown_fd_ = -1;  // eventfd used to wake accept threads out of poll()
+    int shutdown_fd_ = -1;   // poll this for POLLIN (eventfd on Linux; self-pipe read end elsewhere)
+    int shutdown_wfd_ = -1;  // poke this to wake accept threads (== shutdown_fd_ on Linux eventfd)
 
     std::vector<std::unique_ptr<Listener>> listeners_;
 

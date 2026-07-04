@@ -1683,7 +1683,9 @@ namespace {
 // Drain a socket until EOF, using a bounded per-recv timeout so a stalled peer
 // can't hang the test.
 std::string drain_with_timeout(int fd, long ms) {
-    timeval tv{ms / 1000, (ms % 1000) * 1000};
+    timeval tv;
+    tv.tv_sec = static_cast<time_t>(ms / 1000);
+    tv.tv_usec = static_cast<suseconds_t>((ms % 1000) * 1000);  // macOS suseconds_t is int; avoid narrowing
     ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     std::string b;
     char t[8192];
