@@ -80,6 +80,7 @@ Capabilities backend_capabilities() {
     c.supports_netns_jail = false;            // no netns; kernel firewall replaces it
     c.supports_proc_overlays = false;         // no /proc to overlay; Tier-1 masks are Linux-only
     c.supports_seccomp_identity = false;      // no seccomp; identity faking would need DYLD interpose
+    c.supports_path_remap = false;            // no bind mount; the child keeps its real cwd
     c.label = "Seatbelt (sandbox-exec, best-effort)";
     return c;
 }

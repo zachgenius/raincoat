@@ -300,7 +300,10 @@ Verdict: this tool did not get to see you naked.
 - **The filesystem.** Only the paths you allow (plus the CWD in non-strict mode) are visible.
   `--allow-read` is read-only; `--allow-write` is read-write. A `[filesystem].mode =
   "deny-by-default"` profile drops even the CWD auto-mount, and optional `[filesystem.tripwire]`
-  decoys plant inert bait files in the fake home.
+  decoys plant inert bait files in the fake home. Optional `[filesystem].remap_cwd = "/work"`
+  presents the working directory at a neutral path instead of its real host path, so the child
+  can't read your username/layout via `pwd`/`realpath`/`$PWD` (opt-in; breaks absolute-host-path
+  arguments, and is a *partial* fix — see `docs/MOUNT-REMAP.md`).
 - **The network (optional).** `--net off` (the default in strict mode) isolates networking. Beyond
   all-or-nothing, Raincoat also ships an opt-in filtering egress layer — an endpoint-hiding
   **egress bridge**, an isolated-netns **jail** (`pasta`), and a domain-level **guarded proxy**

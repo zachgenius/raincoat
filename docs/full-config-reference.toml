@@ -83,6 +83,14 @@ create_standard_dirs = true
 # - "project-rw": current project mounted read-write by default
 mode = "deny-by-default"
 
+# Mount the working directory at this neutral path (instead of its real host path) and chdir
+# there, so the child can't read your username/layout via pwd, realpath, $PWD, or logs. UNSET
+# (default) => the working dir is mounted at its real path (same-path, backward compatible).
+# OPT-IN because absolute-path command arguments that reference the host path stop resolving
+# (relative-path workflows are unaffected). PARTIAL: /proc/self/mountinfo's mount-SOURCE field
+# still shows the host path (a bind mount always records its source). See docs/MOUNT-REMAP.md.
+# remap_cwd = "/work"
+
 # Read-only mounts from host into sandbox.
 #
 # Recommended:

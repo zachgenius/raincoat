@@ -75,6 +75,11 @@ struct Capabilities {
     bool supports_proc_overlays        = true;  // Tier 1: --ro-bind generic /proc/{cpuinfo,version,...}
     bool supports_seccomp_identity     = true;  // Tier 2: fake uname(2)/sysinfo(2) via seccomp user-notify
 
+    // [filesystem].remap_cwd — mount the working dir at a neutral path (e.g. /work) to hide the
+    // host path. Needs a real bind mount that remaps the path (bwrap); a Filter backend
+    // (Seatbelt) has no bind mount and the child keeps its real cwd, so it cannot remap.
+    bool supports_path_remap           = true;
+
     std::string label = "bubblewrap (Linux user namespaces)";  // for audit + doctor
 };
 
