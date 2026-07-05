@@ -29,6 +29,25 @@ TZ = "UTC"
 LANG = "en_US.UTF-8"
 LC_ALL = "en_US.UTF-8"
 
+# --- Machine fingerprint: mask stable IDENTITY, keep functional quantities --
+# Present a generic CPU/kernel and mask the stable machine identifiers an agent
+# could use to fingerprint or track your host. Value-driven: set = fake, omit =
+# real. kernel_* also fakes the uname(2) syscall on x86_64.
+#
+# Deliberately OMITTED so the agent keeps working: cpu_count / mem_total_kb /
+# uptime_seconds (an agent may size parallel builds/tests by real core count and
+# RAM), and remap_cwd (agents often reference absolute project paths, which a
+# remap would break — see examples/strict.toml + docs/MOUNT-REMAP.md if you want
+# it). See docs/FINGERPRINT-SYSCALLS.md.
+[backend]
+cpu_vendor_id    = "GenuineIntel"
+cpu_model_name   = "Generic x86_64 Processor"
+kernel_osrelease = "6.1.0-generic"
+kernel_version   = "#1 SMP PREEMPT_DYNAMIC Generic"
+kernel_cmdline   = "BOOT_IMAGE=/boot/vmlinuz root=/dev/sda1 ro quiet"
+machine_id       = "0123456789abcdef0123456789abcdef"
+boot_id          = "00000000-0000-4000-8000-000000000000"
+
 [fontconfig]
 enabled = true
 
