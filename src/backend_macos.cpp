@@ -7,6 +7,7 @@
 // see docs/MACOS.md for the honest guarantee downgrade vs the Linux backend.
 #include "backend.hpp"
 
+#include <algorithm>
 #include <climits>
 #include <cstddef>
 #include <cstdint>
@@ -151,10 +152,35 @@ std::optional<LaunchPlan> backend_build_launch(const LaunchInputs& in, std::stri
     // OWN scratch (sandbox_tmp/out under the Darwin TEMP dir) survives while sibling temp files
     // stay hidden. The child's TMPDIR already points at its private scratch.
     c.fs_deny_early.clear();
+    std::string darwin_tmp = darwin_temp_dir();
     if (in.cfg->ext.backend.mount_tmpfs_tmp) {
         c.fs_deny_early.push_back("/private/tmp");
-        std::string tmp = darwin_temp_dir();
-        if (!tmp.empty()) c.fs_deny_early.push_back(tmp);
+        if (!darwin_tmp.empty()) c.fs_deny_early.push_back(darwin_tmp);
+    }
+
+    // The fake home / scratch dirs live UNDER the denied Darwin TEMP tree. The re-allow covers the
+    // scratch itself, but path-walking tools (`mkdir -p ~/.codex`, SQLite opening a DB) explicitly
+    // stat() each ANCESTOR, and those ancestors are under the deny -> EPERM. Collect the ancestor
+    // dirs from the Darwin TEMP root down to (but not including) the scratch leaves; the generator
+    // re-allows STAT (metadata only) on them, so traversal works while contents stay hidden.
+    c.fs_traverse_allow.clear();
+    if (in.cfg->ext.backend.mount_tmpfs_tmp && !darwin_tmp.empty()) {
+        auto add_ancestors = [&](const std::string& leaf) {
+            std::string p = leaf;
+            for (;;) {
+                auto slash = p.find_last_of('/');
+                if (slash == std::string::npos || slash == 0) break;
+                p = p.substr(0, slash);
+                if (p.size() < darwin_tmp.size() || p.compare(0, darwin_tmp.size(), darwin_tmp) != 0)
+                    break;  // walked above the denied Darwin TEMP tree
+                if (std::find(c.fs_traverse_allow.begin(), c.fs_traverse_allow.end(), p) ==
+                    c.fs_traverse_allow.end())
+                    c.fs_traverse_allow.push_back(p);
+            }
+        };
+        add_ancestors(c.fake_home);
+        add_ancestors(c.sandbox_tmp);
+        add_ancestors(c.sandbox_out);
     }
 
     // A local Config with a canonical workdir (the generator reads cfg->workdir/strict/net).

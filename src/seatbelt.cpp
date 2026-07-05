@@ -176,6 +176,21 @@ std::string build_seatbelt_profile(const LaunchInputs& in, std::string& err) {
         }
     }
 
+    // --- (7d) Re-allow STAT (metadata only) on the fake home's denied ancestors, so path-walking
+    // tools (`mkdir -p`, SQLite) can traverse to the scratch that lives under the denied Darwin
+    // TEMP dir. `(literal ...)` is the exact dir — NOT a subpath — so only these ancestors become
+    // stat-able; their CONTENTS (sibling temp files) stay hidden (file-read-data still denied, and
+    // readdir needs it). After all denies so it wins by last-match-wins. ---
+    for (const std::string& d : in.fs_traverse_allow) {
+        if (d.empty()) continue;
+        std::string q = sbpl_str(d, ok);
+        if (!ok) {
+            err = "seatbelt: unrepresentable fs_traverse_allow path";
+            return std::string();
+        }
+        os << "(allow file-read-metadata (literal " << q << "))\n";
+    }
+
     // --- (8) Network ---
     // A non-empty allow_loopback_ports means a guarded proxy / egress bridge is active:
     // deny ALL outbound at the kernel level (for EVERY client, not just proxy-aware ones —
