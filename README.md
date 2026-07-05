@@ -508,6 +508,31 @@ honest reasons. Read [`docs/MACOS.md`](docs/MACOS.md) before trusting it:
    guarded-proxy egress firewall is kernel-enforced for **all** clients with no pasta helper — see
    [`docs/MACOS.md`](docs/MACOS.md).)
 
+#### "Hardened Runtime" costs you fingerprint faking — **not** confinement
+
+Hardened Runtime is a code-signing flag Apple **requires for notarization**, so nearly every
+distributed macOS app carries it (Chrome, Slack, VS Code, Docker, Claude Code, most Homebrew casks).
+It blocks `DYLD_INSERT_LIBRARIES`, which strips raincoat's interposer — so on a hardened tool the
+**identity/fingerprint faking (hostname / username / CPU / machine-id) does not apply**.
+
+It does **not** touch raincoat's load-bearing protection. Filesystem confinement and network control
+are enforced by the **Seatbelt kernel sandbox**, which applies to *every* binary regardless of
+hardening. A hardened tool under raincoat still **cannot read your `$HOME`, `~/.ssh`, `~/.aws`, or
+browser profiles** (unless you allow them), still has its network off/proxied/firewalled, and still
+gets its environment secrets scrubbed — you can watch Apple's own hardened `cat` be denied your SSH
+keys:
+
+```
+$ raincoat -- cat ~/.ssh/id_rsa
+cat: /Users/you/.ssh/id_rsa: No such file or directory
+$ raincoat -- ls ~/.ssh
+ls: /Users/you/.ssh: Operation not permitted
+```
+
+So on macOS, hardening costs you **anti-fingerprinting**, not **confinement**. If "don't let this tool
+read my secrets or phone home" is the goal, raincoat delivers that on hardened tools today; if
+anti-fingerprinting a hardened binary is the goal, that's the real gap.
+
 Same raincoat, thinner fabric: it keeps the everyday drizzle off on macOS too, but the seams are wider
 and honestly disclosed.
 
