@@ -126,6 +126,31 @@ TEST(Seatbelt, CommandExecPathReAllowedAfterHomeDeny) {
     EXPECT_EQ(p2.find(".local/share/tool"), std::string::npos);
 }
 
+// The fake home lives under the denied Darwin TEMP dir; its ancestors must be STAT-able (metadata
+// only, via `literal`) so mkdir -p / SQLite can traverse to it — without exposing their contents.
+TEST(Seatbelt, TraverseAllowEmitsMetadataOnlyLiterals) {
+    Fixture f;
+    f.in.fs_traverse_allow = {
+        "/private/var/folders/ab/T",
+        "/private/var/folders/ab/T/raincoat-XY",
+        "/private/var/folders/ab/T/raincoat-XY/home",
+    };
+    std::string err;
+    std::string p = f.build(err);
+    EXPECT_TRUE(err.empty());
+    for (const auto& d : f.in.fs_traverse_allow) {
+        EXPECT_NE(p.find("(allow file-read-metadata (literal \"" + d + "\"))"), std::string::npos)
+            << "missing metadata allow for " << d << "\n" << p;
+    }
+    // Metadata only — never a broad file-read* nor a subpath (which would expose contents).
+    EXPECT_EQ(p.find("(allow file-read* (literal \"/private/var/folders/ab/T\""), std::string::npos);
+
+    // Empty -> no such rule.
+    f.in.fs_traverse_allow.clear();
+    std::string p2 = f.build(err);
+    EXPECT_EQ(p2.find("file-read-metadata"), std::string::npos);
+}
+
 // ===========================================================================
 // sbpl_str() — the SBPL string-literal escaper
 // ===========================================================================

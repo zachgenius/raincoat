@@ -134,6 +134,11 @@ struct LaunchInputs {
     std::string              profile_path;        // where the runner will write the .sb
     std::vector<int>         allow_loopback_ports;// proxy + egress-bridge child ports for the firewall
     std::string              interpose_dylib;     // macOS: re-allow reading the injected interposer
+    // macOS: ancestor dirs of the sandbox scratch that fall under a denied tree (the fake home
+    // lives UNDER the denied Darwin TEMP dir). Re-allow STAT (metadata only) on them so path-
+    // walking tools — `mkdir -p ~/.codex`, SQLite's DB init — can traverse to the fake home.
+    // Contents stay hidden (file-read-data still denied), so sibling temp files aren't listable.
+    std::vector<std::string> fs_traverse_allow;
 };
 
 // The result the runner needs to fork/exec and to audit. Built by the backend so the
