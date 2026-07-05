@@ -59,9 +59,14 @@ Concretely, this forces two rules the Linux path never needs:
   home, the sandbox temp/out dirs, the audit dir, every mount, and the fs-deny set before building the
   profile.
 - **Deny is last-match-wins, so ordering is load-bearing.** The profile starts `(allow default)`, then
-  *subtracts* the real home and `/Users`, *re-allows* the sandbox-private dirs + the working dir + user
-  mounts, then *re-denies* the fs-deny set and the audit dir last so a deny beats a broad re-allow
-  (e.g. workdir `== $HOME` re-allowed, but `~/.ssh` still denied).
+  *subtracts* the real home and `/Users` **plus an early broad-deny tier** (the host `/private/tmp`
+  and the per-user Darwin TEMP dir — see `mount_tmpfs_tmp` below), *re-allows* the sandbox-private dirs
+  (including the child's own scratch nested *under* the just-denied Darwin TEMP dir, which the re-allow
+  rescues) + the working dir + user mounts, then *re-denies* the fs-deny set and the audit dir last so
+  a deny beats a broad re-allow (e.g. workdir `== $HOME` re-allowed, but `~/.ssh` still denied). Two
+  places where the order does real work: an `--allow-read` (RO) mount's `(deny file-write*)` is emitted
+  **after** every RW allow, so a read-only subdir of the RW cwd stays read-only; and the audit-log dir
+  deny is emitted last, so the child can never re-reach it.
 
 ## The honesty substitute: a fail-closed pre-flight probe (every run)
 
@@ -90,16 +95,21 @@ Per-guarantee, with the backend `Capabilities` flag that gates each one. `[x]` v
 | Real `$HOME` / credentials hidden | `[x]` structural (never mounted) | `[~]` deny-based `(deny file-read* file-write* (subpath <home>))` + pre-flight probe | `fs_hiding` = `Structural` → `Filter` |
 | Username enumeration (`ls /Users`) | `[x]` not present | `[~]` `(deny file-read* (subpath "/Users"))` (measured: EPERM) | `fs_hiding` |
 | Filesystem restriction (mounts) | `[x]` structural binds | `[~]` deny-default-permissive + re-allow rules | `fs_hiding` |
+| Read-only mount (`--allow-read`) is *truly* read-only | `[x]` `--ro-bind` (EROFS) | `[~]` `(allow file-read*)` + `(deny file-write*)`, the write-deny emitted **after** every RW allow, so an `--allow-read` subdir of the RW cwd stays read-only | `fs_hiding` |
+| Private `/tmp` (`mount_tmpfs_tmp`, default on) | `[x]` fresh tmpfs `/tmp` | `[~]` host `/private/tmp` + the Darwin per-user TEMP dir early-denied; child sees only its own `$TMPDIR` scratch, sibling/host temp files hidden | `fs_hiding` |
+| Audit-log tamper protection | `[x]` tmpfs mask over the audit dir | `[~]` audit-log parent dir **always** denied by real (realpath'd) path — child EPERM; raincoat (unsandboxed parent) still writes it | `fs_hiding` |
 | Network off (`--net off`) | `[x]` fresh empty netns (`--unshare-net`) | `[~]` `(deny network*)` kernel policy | `net_off` = `UnshareNet` → `PolicyDeny` |
 | Egress firewall (proxy/bridge only) | `[~]` needs the pasta **strict** netns jail; proxy-aware-only without it | **`[x]` kernel firewall for ALL clients, no helper** | `net_firewall_kernel` = false → **true** |
 | Identity: `USER` / `LOGNAME` faked | `[x]` env | `[x]` env (applied at `execve`) | `env_apply` = `ViaArgv` → `ViaExec` |
 | Hostname masking | `[x]` fresh UTS ns fakes `gethostname()` | `[~]` `$HOSTNAME` env always; `gethostname()`/`uname().nodename` faked by the DYLD interposer for injectable (non-hardened) targets — hardened/static callers still leak | `supports_uts_hostname` = **false**; `supports_dyld_interpose` = **true** |
-| Machine fingerprint (CPU brand, kernel release/version, RAM) | `[x]` `/proc` overlays + `uname(2)`/`sysinfo(2)` seccomp user-notify | `[~]` DYLD interposer rewrites `sysctlbyname`/`uname` for injectable targets (value-driven; unset → real) — no seccomp backstop for static/raw-syscall callers | `supports_dyld_interpose` = **true** |
+| Machine fingerprint (CPU brand/vendor, core count, kernel release/version, RAM, machine-id, boot-id, uptime) | `[x]` `/proc` overlays + `uname(2)`/`sysinfo(2)`/`sched_getaffinity(2)` seccomp user-notify | `[~]` DYLD interposer rewrites `sysctlbyname`/`uname`/`gethostuuid` for injectable targets (value-driven; unset → real) — no seccomp backstop for static/raw-syscall callers. `cpu_vendor_id` is **Intel-only** (no `machdep.cpu.vendor` on Apple Silicon); `kernel_cmdline` has **no macOS analog** (disclosed as ignored) | `supports_dyld_interpose` = **true** |
 | User identity (`getpwuid`/`getlogin` login name + home) | `[x]` bwrap userns + faked name via env | `[~]` DYLD interposer fakes `pw_name`/`pw_dir` + `getlogin` for injectable targets — previously an un-closable opendirectoryd leak | `supports_dyld_interpose` = **true** |
 | Curated generic font set | `[x]` tmpfs + re-bind Noto/DejaVu | `[-]` cannot overlay `/usr/share/fonts` (Core Text, not fontconfig) | `supports_curated_fonts` / `supports_fontconfig_isolation` = **false** |
 | Minimal `/etc` view | `[x]` generic hostname/hosts/localtime binds | `[-]` cannot bind a fake `/etc` | `supports_minimal_etc` = **false** |
 | Env injection | `[x]` `--clearenv` + `--setenv` in argv | `[x]` installed at `execve` (SBPL has no env directives) | `env_apply` |
 | Isolated-netns jail + `/proc/net/tcp` leak fix | `[x]` pasta jail | `[-]` no `/proc`, no netns — kernel firewall replaces it | `supports_netns_jail` = **false** |
+| Namespace toggles (`unshare_user/pid/ipc/uts/cgroup`, `mount_dev`) | `[x]` real namespaces / minimal `/dev` | `[-]` Linux-mechanism — Seatbelt has none; disclosed in the audit as not enforced | — |
+| `die_with_parent` (child killed when raincoat dies) | `[x]` `PR_SET_PDEATHSIG` (any death, incl. `SIGKILL`) | `[~]` `SIGINT`/`SIGTERM` forwarded to the child, but on a raincoat `SIGKILL`/crash the child is **orphaned** (no PID-death kill) | — |
 
 ## What works (verified on macOS 26.5.1)
 
@@ -111,6 +121,23 @@ Per-guarantee, with the backend `Capabilities` flag that gates each one. `[x]` v
   which turns it into EPERM (measured). The Darwin per-user cache dir (`_CS_DARWIN_USER_CACHE_DIR`,
   under `/private/var/folders/.../C/`), which holds app caches/credentials and is *not* under `$HOME`,
   is folded into the deny set too.
+- **`--allow-read` is genuinely read-only.** Under `(allow default)` a bare read-allow would leave
+  the path *writable* (unlike Linux's `--ro-bind`, which is EROFS). The profile now emits
+  `(deny file-write*)` for every RO mount, **after** every RW allow, so even an `--allow-read` subdir
+  of the auto-mounted RW working directory stays read-only (Linux gives each mount its own mount
+  point; the filter model needs the explicit write-deny + ordering). Measured: writing to an RO mount
+  nested under the RW cwd returns *Operation not permitted*.
+- **A private `/tmp` (`mount_tmpfs_tmp`, default on).** Linux gives the child a fresh tmpfs `/tmp`;
+  macOS has no bind, so instead the host's shared temp dirs — the classic `/private/tmp` **and** the
+  per-user Darwin TEMP dir (`_CS_DARWIN_USER_TEMP_DIR`, under `/private/var/folders/.../T/`) — are
+  **early-denied** (emitted before the sandbox re-allows). The child's own scratch (`$TMPDIR`, nested
+  under the Darwin TEMP dir) survives because that re-allow wins by last-match; sibling and host temp
+  files stay hidden. Measured: host `/tmp` files invisible, child scratch usable.
+- **Audit-log tamper protection.** The audit-log's parent directory is **always** denied by its real
+  (realpath'd) path, so the child gets `EPERM` trying to read, forge, or erase the log — while
+  raincoat, the unsandboxed parent, still writes it. (On Linux this is a tmpfs mask; on the Filter
+  backend `(allow default)` left the dir child-reachable unless a RW mount happened to cover it, so the
+  unconditional deny is what restores the guarantee.) Measured: a child forge attempt → `EPERM`.
 - **Fake identity via env.** `HOME`, `USER`, `LOGNAME`, `HOSTNAME`, `TZ`, `LANG`, `LC_ALL` are set
   to generic values and reach the child at `exec` (SBPL has no env directives, so the runner installs
   the resolved child env into `environ` immediately before `execvp`). Beyond the env, `gethostname()`
@@ -141,8 +168,40 @@ Per-guarantee, with the backend `Capabilities` flag that gates each one. `[x]` v
   the strict-egress case instead (and covers it *better* — see below).
 - **`--strict` is not kernel default-deny.** A bare `(deny default)` cannot even `execvp`
   `/usr/bin/true` on macOS (it can't load libSystem — measured, exit 71). So macOS `strict` =
-  **allow-default + expanded denies + no cwd auto-grant**, not a `(deny default)` allow-list. It is
-  honest expanded denial, and the profile says so in a comment.
+  **allow-default + no cwd auto-grant**: it simply *withholds* the automatic RW mount of the working
+  directory; the deny set is otherwise **identical** to non-strict. It is **not** a `(deny default)`
+  allow-list and — contrary to an earlier claim now corrected — it does **not** emit any "expanded"
+  extra denies. The profile comment says exactly this.
+
+## Backend toggles & namespaces (Linux-mechanism — not enforced by Seatbelt)
+
+Several `[backend]` toggles have a mechanism that *is* a Linux namespace or bind-mount, which Seatbelt
+does not have. On macOS these are **not enforced** — the runner discloses that in the audit ("backend
+overrides … Linux-mechanism toggles; NOT enforced by the Seatbelt backend …") rather than pretending
+they took effect:
+
+- **`unshare_user` / `unshare_pid` / `unshare_ipc` / `unshare_uts` / `unshare_cgroup`.** There are no
+  user/PID/IPC/UTS/cgroup namespaces on macOS. The child shares the host's process table, IPC, and
+  (for UTS) sees the real hostname unless the DYLD interposer happens to catch the call (best-effort,
+  below). None of this is structural isolation.
+- **`mount_dev`.** No minimal `/dev` is constructed; the child sees the host `/dev`.
+- **`die_with_parent` — downgraded; disclose the gap.** On Linux this is `PR_SET_PDEATHSIG`: the
+  kernel `SIGKILL`s the child the instant raincoat dies, for **any** death including `SIGKILL` or a
+  crash. macOS has no equivalent. Raincoat **forwards `SIGINT`/`SIGTERM`/`SIGHUP`** to the child, so a
+  normal Ctrl-C or `kill` still tears it down — but if **raincoat itself is `SIGKILL`ed or crashes**,
+  the child is **orphaned** (reparented to `launchd`) and keeps running. This is a real reduction from
+  the Linux guarantee, and the audit says so.
+
+### deny-by-default is not a structural whitelist on macOS
+
+`[filesystem].mode = "deny-by-default"` on Linux builds a structural whitelist: nothing is present
+unless explicitly allowed. On the Seatbelt Filter backend it **cannot** mean that. All it does is
+**withhold the automatic RW mount of the working directory** — the rest of the host filesystem stays
+`(allow default)`-reachable, minus only the `[filesystem].deny` paths and the real home. The audit
+says exactly this: *"the working directory is not auto-mounted, but on this backend (allow-default
+filter) the rest of the host filesystem stays reachable — only [filesystem].deny paths + the real home
+are withheld. This is NOT the structural whitelist the Linux backend gives; add explicit denies."*
+Treat macOS deny-by-default as "don't auto-expose the cwd," not as a lockdown.
 
 ## Disclosed residual bypasses (present, not hidden)
 
@@ -210,7 +269,14 @@ one — return the real value" (the same value-driven contract as the Linux knob
 | `uname` | `nodename`, `release`, `version` | `RC_FAKE_HOSTNAME` / `_OSRELEASE` / `_OSVERSION` |
 | `getlogin` / `getlogin_r` | login name | `RC_FAKE_USER` |
 | `getpwuid` / `getpwnam` | `pw_name`, `pw_dir` | `RC_FAKE_USER` / `RC_FAKE_HOME` |
-| `sysctlbyname` | `kern.hostname`, `machdep.cpu.brand_string`, `kern.osrelease`, `kern.osversion`, `hw.memsize` | the matching `RC_FAKE_*` |
+| `gethostuuid` | 16-byte host UUID (hex-parsed) | `RC_FAKE_HOSTUUID` (from `machine_id`) |
+| `sysctlbyname` | `kern.hostname`, `machdep.cpu.brand_string`, `machdep.cpu.vendor`, `hw.memsize`, `hw.ncpu` (+ `hw.logicalcpu`/`hw.activecpu`/`hw.physicalcpu`), `kern.osrelease`, `kern.osversion`, `kern.uuid`, `kern.bootsessionuuid`, `kern.boottime` | the matching `RC_FAKE_*` |
+
+The identity fakes (hostname/user/home) are **sourced from the child's actual resolved env**
+(`$HOSTNAME`/`$USER`/`$HOME`), so `getpwuid`/`getlogin`/`gethostname` can never disagree with the env
+the child also reads — a mismatch is itself a fingerprint. `kern.boottime` is **derived** from the
+requested `uptime_seconds` (`boottime = now − uptime`) so that `now − boottime == uptime`, keeping
+`sysctl kern.boottime` and `/usr/bin/uptime` consistent.
 
 `getpwuid`/`getpwnam`/`getlogin` are exactly the opendirectoryd path that path-denials could not close
 — so the "username via directory services" bypass listed above is now **closed for injectable
@@ -227,11 +293,17 @@ The identity values (hostname, username, home) are always faked; the fingerprint
 | `[identity].hostname` / `.username` | `gethostname`/`uname.nodename`/`kern.hostname`; login name + `pw_name`/`pw_dir` |
 | `[backend].kernel_osrelease` / `.kernel_version` | `uname.release`/`.version` + `kern.osrelease`/`kern.osversion` |
 | `[backend].cpu_model_name` | `machdep.cpu.brand_string` |
+| `[backend].cpu_vendor_id` | `machdep.cpu.vendor` — **Intel Macs only** (Apple Silicon has no such sysctl; a no-op there) |
+| `[backend].cpu_count` | `hw.ncpu` (+ `hw.logicalcpu`/`hw.activecpu`/`hw.physicalcpu`) |
 | `[backend].mem_total_kb` | `hw.memsize` (× 1024) |
+| `[backend].machine_id` | `kern.uuid` + `gethostuuid(2)` |
+| `[backend].boot_id` | `kern.bootsessionuuid` |
+| `[backend].uptime_seconds` | `kern.boottime` (derived so `now − boottime == uptime`) |
+| `[backend].kernel_cmdline` | **no macOS analog** (there is no `/proc/cmdline`) — ignored, and disclosed as ignored in the audit rather than silently dropped |
 
 **Verified on macOS 26.5.1:** with those set, a non-hardened test binary saw
-`uname.release = 6.1.0-generic`, CPU brand `Generic CPU`, and `hw.memsize` = 16 GiB; with them unset,
-each returned the host's **real** value.
+`uname.release = 6.1.0-generic`, CPU brand `Generic CPU`, `hw.memsize` = 16 GiB, and a faked
+`machine_id`/`uptime`; with them unset, each returned the host's **real** value.
 
 ### Honest limits (best-effort — read before you trust it)
 
@@ -247,9 +319,13 @@ it bites:
    macOS has **no seccomp-notify equivalent**, so — unlike Linux Tier-2 — there is no syscall-boundary
    fallback to catch those. This makes **macOS Tier-2 strictly weaker than Linux Tier-2**, the exact
    inverse of the Linux argument for preferring seccomp over `LD_PRELOAD`.
-3. **Not everything is faked.** Numeric `uid`/`gid`, the IOKit `IOPlatformUUID`/serial pair, and CPUID
-   (Intel) / `hw.optional.*` feature flags are **not** intercepted. CPUID is Tier-3 (instruction-level)
-   and needs a hypervisor — a documented non-goal.
+3. **Not everything is faked.** Numeric `uid`/`gid`, the IOKit `IOPlatformUUID`/`IOPlatformSerialNumber`
+   pair, and CPUID (Intel) / `hw.optional.*` feature flags are **not** intercepted. `machine_id` **is**
+   now faked at the `gethostuuid(2)`/`kern.uuid` layer, but the IOKit pair is a heavier IORegistry walk
+   (not a libc call) and is not yet interposed, so a licensing-grade reader that goes straight to IOKit
+   still recovers the real hardware UUID/serial. On **Apple Silicon** `machdep.cpu.vendor` does not
+   exist, so `cpu_vendor_id` is a no-op there (it fakes only on Intel Macs). CPUID is Tier-3
+   (instruction-level) and needs a hypervisor — a documented non-goal.
 4. **`sandbox_init` / `sandbox-exec` are Apple-deprecated.** They work today and are the only way to
    confine an arbitrary CLI, but there is no supported replacement (see the top of this doc).
 

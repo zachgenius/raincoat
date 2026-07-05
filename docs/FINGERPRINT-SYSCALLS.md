@@ -114,9 +114,11 @@ The macOS **Seatbelt backend** is implemented (filesystem hiding, network, and *
 identity — `USER`/`HOME`/`HOSTNAME`/`TZ`; see `docs/MACOS.md`). The machine-fingerprint *syscall*
 faking below — the macOS analog of the Linux Tier-2 seccomp supervisor — is **now implemented too**,
 via a `DYLD_INSERT_LIBRARIES` interposer (`src/rc_interpose.c`) rather than seccomp (macOS has no
-seccomp-notify). It fakes `gethostname`, `uname`, `getlogin`/`getlogin_r`, `getpwuid`/`getpwnam`, and
-`sysctlbyname` (`kern.hostname`, `machdep.cpu.brand_string`, `kern.osrelease`/`kern.osversion`,
-`hw.memsize`), driven by the same value-driven config as Linux. The Tier-1 `/proc` overlays +
+seccomp-notify). It fakes `gethostname`, `uname`, `getlogin`/`getlogin_r`, `getpwuid`/`getpwnam`,
+`gethostuuid(2)`, and `sysctlbyname` (`kern.hostname`, `machdep.cpu.brand_string`,
+`machdep.cpu.vendor`, `hw.memsize`, `hw.ncpu`, `kern.osrelease`/`kern.osversion`, `kern.uuid`,
+`kern.bootsessionuuid`, `kern.boottime`), driven by the same value-driven config as Linux. The Tier-1
+`/proc` overlays +
 `uname`/`sysinfo` seccomp hook stay Linux-only and gated OFF on macOS (`supports_proc_overlays =
 false`, `supports_seccomp_identity = false`); the new capability `supports_dyld_interpose = true`
 gates the interposer path instead.
@@ -147,20 +149,36 @@ Endpoint-Security/DriverKit approach.
 
 **Faking (implemented).** A `__DATA,__interpose` dylib (`src/rc_interpose.c`) injected with
 `DYLD_INSERT_LIBRARIES` interposes `gethostname`, `uname`, `getlogin`/`getlogin_r`,
-`getpwuid`/`getpwnam`, and `sysctlbyname` (`kern.hostname`, `machdep.cpu.brand_string`,
-`kern.osrelease`/`kern.osversion`, `hw.memsize`). Each field is faked only when its `RC_FAKE_*` env
-var is set (unset → real value), the same value-driven contract as the Linux knobs. Raincoat scrubs
-`DYLD_*` from the child env and then sets its **own** controlled `DYLD_INSERT_LIBRARIES` value (which
-wins over the scrub — the scrub still blocks an *attacker's* injection).
+`getpwuid`/`getpwnam`, `gethostuuid(2)`, and `sysctlbyname`. The full config → call mapping:
+
+| Config knob | Faked sysctl / call | Notes |
+|---|---|---|
+| `[identity].hostname` | `kern.hostname` + `gethostname` / `uname.nodename` | |
+| `[identity].username` | `getlogin`/`getlogin_r`, `getpwuid`/`getpwnam` (`pw_name`/`pw_dir`) | |
+| `[backend].cpu_model_name` | `machdep.cpu.brand_string` | |
+| `[backend].cpu_vendor_id` | `machdep.cpu.vendor` | **Intel Macs only** — no such sysctl on Apple Silicon (no-op there) |
+| `[backend].cpu_count` | `hw.ncpu` (+ `hw.logicalcpu`/`hw.activecpu`/`hw.physicalcpu`) | |
+| `[backend].mem_total_kb` | `hw.memsize` (× 1024) | |
+| `[backend].kernel_osrelease`/`.kernel_version` | `kern.osrelease`/`kern.osversion` + `uname.release`/`.version` | |
+| `[backend].machine_id` | `kern.uuid` + `gethostuuid(2)` | 16-byte host UUID (hex-parsed) |
+| `[backend].boot_id` | `kern.bootsessionuuid` | |
+| `[backend].uptime_seconds` | `kern.boottime` | derived so `now − boottime == uptime` — keeps `sysctl kern.boottime` and `/usr/bin/uptime` consistent |
+| `[backend].kernel_cmdline` | — | **no macOS analog** (there is no `/proc/cmdline`); ignored, and disclosed as ignored in the audit rather than silently dropped |
+
+Each field is faked only when its `RC_FAKE_*` env var is set (unset → real value), the same
+value-driven contract as the Linux knobs. Raincoat scrubs `DYLD_*` from the child env and then sets
+its **own** controlled `DYLD_INSERT_LIBRARIES` value (which wins over the scrub — the scrub still
+blocks an *attacker's* injection).
 
 **User identity is now faked.** `getpwuid(getuid())->pw_name`/`->pw_dir` and `getlogin()` are the
 opendirectoryd path Seatbelt's file-denials could **not** close (the lookup is not a file read); the
 interposer now rewrites them to the fake user/home for injectable targets — closing what `docs/MACOS.md`
 previously listed as an un-closable residual leak (the honest caveat stays for non-injectable targets).
 
-**Still future (not yet interposed):** `gethostuuid(2)`, the IOKit `IOPlatformUUID` /
-`IOPlatformSerialNumber` pair (the highest-value hardware IDs), and `getifaddrs` MACs. Raincoat does
-not fake these today.
+**Still future (not yet interposed):** the IOKit `IOPlatformUUID` / `IOPlatformSerialNumber` pair (the
+highest-value hardware IDs — a heavier IORegistry walk, not a libc call) and `getifaddrs` MACs.
+`gethostuuid(2)` **is** now faked (driven by `machine_id`), but a reader that goes straight to IOKit
+still recovers the real hardware UUID/serial. Raincoat does not fake the IOKit pair today.
 
 **Honest limit — macOS Tier-2 is strictly weaker than Linux Tier-2.** DYLD interposition is the
 `LD_PRELOAD`-class technique, and macOS has **no seccomp-notify equivalent**. So it only catches
@@ -168,13 +186,19 @@ not fake these today.
 directly, bypasses the interposer entirely — with no syscall-boundary backstop (short of Endpoint
 Security, which is heavy and entitlement-gated). This is the exact opposite of the Linux argument
 for preferring seccomp over `LD_PRELOAD`. On top of that, SIP-protected/`hardened-runtime` binaries
-ignore `DYLD_INSERT_LIBRARIES` outright, and CPUID on Intel remains Tier 3. The
-`IOPlatformUUID`/`IOPlatformSerialNumber` pair is the highest-value target.
+ignore `DYLD_INSERT_LIBRARIES` outright, and CPUID on Intel remains Tier 3. Two macOS-specific
+residuals: `machdep.cpu.vendor` **does not exist on Apple Silicon**, so `cpu_vendor_id` fakes only on
+Intel Macs; and the `IOPlatformUUID`/`IOPlatformSerialNumber` pair — reached via a heavier IOKit /
+IORegistry walk rather than a libc call — is not yet interposed and remains the highest-value target.
 
 **Consistency requirement.** A datum leaks by multiple paths that must agree or you create a
 *tell*: on macOS the interposer must keep `sysctlbyname("kern.hostname")`, `gethostname()`, and
 `uname().nodename` identical (and matching `$HOSTNAME`) — the same cross-path rule the Linux
-`uname(2)` ↔ `/proc/sys/kernel/osrelease` pairing follows.
+`uname(2)` ↔ `/proc/sys/kernel/osrelease` pairing follows. To guarantee it, the interposer's identity
+values (hostname/user/home) are **sourced from the child's actual resolved env** (`$HOSTNAME`/`$USER`/
+`$HOME`), so `getpwuid`/`getlogin`/`gethostname` can never disagree with the env the child also reads.
+Likewise `kern.boottime` is **derived** from the requested `uptime_seconds` (`boottime = now − uptime`)
+so `sysctl kern.boottime` and `/usr/bin/uptime` never contradict each other.
 
 ---
 
@@ -236,11 +260,17 @@ identity remain Tier 3 / hardware-rooted.
       on the flag; the Tier-2 seccomp hook is `#ifdef __linux__` + a Linux-only `seccomp_notify.cpp` TU.
 - [x] macOS Seatbelt backend (fs/network/env identity) — see `docs/MACOS.md`
 - [x] macOS `DYLD_INSERT_LIBRARIES` interposer — `gethostname`, `uname`, `getlogin`/`getlogin_r`,
-      `getpwuid`/`getpwnam`, `sysctlbyname` (hostname/CPU/kernel/RAM/`hw.ncpu`); routes the
+      `getpwuid`/`getpwnam`, `gethostuuid(2)`, `sysctlbyname` (hostname / CPU brand + vendor / kernel /
+      RAM / `hw.ncpu` / `kern.uuid` / `kern.bootsessionuuid` / `kern.boottime`); routes the
       value-driven config to Tier-2 on macOS via an **in-process `sandbox_init` pivot** (SIP strips
-      the injection through `sandbox-exec` — measured). Honest limits: libc-caller-only, **no
-      seccomp-notify backstop**, SIP/hardened-runtime/static targets opt out — strictly weaker than
-      Linux Tier-2. Still future: `gethostuuid`, IOKit UUID/serial, `getifaddrs` MACs.
+      the injection through `sandbox-exec` — measured). Covers `machine_id` (`kern.uuid` +
+      `gethostuuid`), `boot_id` (`kern.bootsessionuuid`), `uptime_seconds` (`kern.boottime`, derived so
+      `now − boottime == uptime`), `cpu_vendor_id` (`machdep.cpu.vendor`, **Intel-only**), `cpu_count`
+      (`hw.ncpu`). `kernel_cmdline` has **no macOS analog** (no `/proc/cmdline`) — disclosed as ignored,
+      not silently dropped. Honest limits: libc-caller-only, **no seccomp-notify backstop**,
+      SIP/hardened-runtime/static targets opt out — strictly weaker than Linux Tier-2. Still residual:
+      IOKit `IOPlatformUUID`/serial (heavier IORegistry walk, not done), `getifaddrs` MACs, and
+      `machdep.cpu.vendor`'s absence on Apple Silicon.
 
 **Open (candidates):**
 
