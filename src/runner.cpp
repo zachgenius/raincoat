@@ -33,6 +33,9 @@
 #include "seccomp_notify.hpp"
 #endif
 
+#include <ctime>          // time() for the run-status started_at
+#include "run_status.hpp"  // publish a per-run status file for the macOS menu-bar app
+
 #ifdef __APPLE__
 #include <crt_externs.h>  // _NSGetEnviron for the in-process-sandbox exec path
 // sandbox_init is a public but deprecated libSystem entry point (used internally by
@@ -592,8 +595,10 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // the child has a private output area that is destroyed with the sandbox root.
     const std::string sandbox_out = root + "/out";
 
-    // Remove the sandbox root unless the user asked to keep it.
+    // Remove the sandbox root unless the user asked to keep it. Also drop this run's status
+    // file (best-effort; the menu-bar app treats a leftover as stale via kill(pid,0) anyway).
     auto cleanup_root = [&]() {
+        run_status_remove(static_cast<long>(::getpid()));
         if (cfg.keep_temp) {
             std::cerr << "kept sandbox: " << root << "\n";
         } else {
@@ -2023,6 +2028,33 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // window before this assignment, forward it now so we don't swallow it.
     g_child_pid = pid;
     if (g_pending_signal != 0) ::kill(pid, static_cast<int>(g_pending_signal));
+
+    // Publish a per-run status file so the macOS menu-bar app can show this sandbox live
+    // (best-effort; see docs/GUI-MACOS.md). Removed in cleanup_root().
+    {
+        RunStatus st;
+        st.supervisor_pid = static_cast<long>(::getpid());
+        st.child_pid = static_cast<long>(pid);
+        for (std::size_t i = 0; i < cfg.command.size(); ++i)
+            st.command += (i ? " " : "") + cfg.command[i];
+        st.audit_log = cfg.audit_log_path;
+        st.backend = caps.label;
+        st.started_at = static_cast<long>(::time(nullptr));
+        if (egress_active)
+            st.net_mode = "egress-bridge";
+        else if (netpolicy_active)
+            st.net_mode = "proxied";
+        else
+            st.net_mode = (cfg.net == NetMode::Off) ? "off" : "open";
+        st.capabilities["filesystem"] = "confined";
+        st.capabilities["network"] = (cfg.net == NetMode::Off) ? "blocked"
+                                      : (egress_active || netpolicy_active) ? "proxied"
+                                                                            : "open";
+        st.capabilities["identity"] =
+            (caps.supports_dyld_interpose || caps.supports_seccomp_identity) ? "faked" : "partial";
+        st.notes = rec.active_policy_notes;
+        run_status_write(st);  // best-effort; ignore failure
+    }
 
     // Bring up the identity supervisor thread (Linux). It runs with SIGINT/SIGTERM/SIGHUP
     // blocked so those keep hitting the main thread's handlers; the main thread waits on the
