@@ -104,7 +104,50 @@ The launcher must resolve and disclose these — they are OS facts, not Raincoat
   executable into `Raincoat.app` (Info.plist + icon); optional `LaunchAgent` for start-at-login.
 - **Signing:** dev builds run unsigned (hotkey + login-item are flaky unsigned but functional);
   distribution needs Developer ID signing + notarization. Documented, not required to build.
-- The app finds the `raincoat` binary via `$PATH`, then a configured path, then common install dirs.
+- The app finds the `raincoat` binary via `$PATH`, common install dirs, a configured path, then the
+  copy **bundled inside the app** (see below).
+
+## Bundled CLI & install
+
+The app is **self-contained**: `scripts/embed-raincoat.sh` builds the `raincoat` C++ CLI and drops it
+into `Raincoat.app/Contents/Helpers/raincoat`, code-signed. It runs from both packaging paths — the
+SwiftPM `scripts/make-app-bundle.sh` (before the ad-hoc outer signature) and the Xcode target (a
+`postCompileScripts` "Embed raincoat CLI" phase in `project.yml`, before Xcode's final signing). It is
+**non-fatal without cmake**: a machine with no C++ toolchain builds the app *without* the CLI, and the
+app degrades to reporting "not found".
+
+`RaincoatLocator` resolution order (`find()`): `$PATH` → `/usr/local/bin`, `/opt/homebrew/bin` →
+`UserDefaults` override → **bundled copy**. The bundled fallback is why the GUI works with no prior
+install. `findOnPath()` is the same minus the bundled copy — `RaincoatInstaller` uses it to decide
+whether `raincoat` is actually reachable from a shell.
+
+**Install (expose on `$PATH`).** `RaincoatInstaller` manages exactly one symlink,
+`/usr/local/bin/raincoat -> <app>/Contents/Helpers/raincoat` (`/usr/local/bin` is on the default
+shell PATH via `/etc/paths`). It tries an **unprivileged** symlink first (a Homebrew-style user-owned
+`/usr/local/bin` needs no auth) and only escalates to a native admin prompt (`osascript … with
+administrator privileges`) when the write is denied. `Status` distinguishes `installedManaged` (our
+symlink), `installedExternal` (the user's own raincoat — never touched), `bundledOnly` (present but not
+on PATH), and `missing`. Uninstall removes **only** the managed symlink.
+
+- **First-run prompt** (`AppDelegate.maybePromptCLIInstall`): on launch, if status is `bundledOnly`,
+  offer to install with `Install… / Not Now / Don't Ask Again` (the last sets a `UserDefaults` flag).
+  Never shown when raincoat is already on PATH, or for un-bundled dev builds.
+- **Preferences → "Command-line tool"** row: contextual `Install / Reinstall / Uninstall / Reveal`
+  buttons plus a status line reflecting the same four states.
+- Headless check: `RaincoatMenuBar --selftest-install` prints bundled path, PATH resolution, and the
+  resulting `Status` (no auth, no writes).
+
+**Hardened Runtime note.** The bundled CLI is signed with Hardened Runtime + the
+`com.apple.security.cs.disable-library-validation` entitlement (`scripts/raincoat-helper.entitlements`).
+Without it a hardened raincoat **SIGABRTs at launch**: it dynamically links third-party dylibs (Homebrew
+OpenSSL) whose Team IDs differ, and library validation refuses to load them.
+
+> **⚠ Distribution blockers (not yet solved).** The embedded binary here still links **Homebrew
+> OpenSSL at absolute paths** (`/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib`, `…/libcrypto.3.dylib`)
+> and is built **arm64-only**. A shippable app must (1) make OpenSSL resolvable on machines without
+> Homebrew — statically link it, or bundle the dylibs and rewrite install names to `@loader_path` — and
+> (2) build a **universal** binary (`RAINCOAT_UNIVERSAL=1` sets `-DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"`,
+> which also requires universal OpenSSL). Until then the bundled CLI is dev-only.
 
 ## Phasing
 

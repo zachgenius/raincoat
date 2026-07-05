@@ -29,6 +29,14 @@ targets:
     dependencies:
       - package: RaincoatMenuBar
         product: RaincoatMenuBarKit
+    # Build + embed the raincoat CLI into Contents/Helpers before Xcode signs the app, so the
+    # bundle is self-contained (RaincoatLocator falls back to it; the in-app Install button
+    # symlinks it onto $PATH). Non-fatal without cmake — see scripts/embed-raincoat.sh.
+    postCompileScripts:
+      - name: Embed raincoat CLI
+        basedOnDependencyAnalysis: false
+        script: |
+          "$PROJECT_DIR/scripts/embed-raincoat.sh" "$CODESIGNING_FOLDER_PATH" "${EXPANDED_CODE_SIGN_IDENTITY:--}"
     settings:
       base:
         PRODUCT_NAME: Raincoat

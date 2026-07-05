@@ -27,6 +27,12 @@ cp "$BIN" "$APP/Contents/MacOS/$EXE_NAME"
 # Info.plist lives with the library sources (embedded into the exe via -sectcreate too).
 cp "$ROOT/Sources/RaincoatMenuBarKit/Info.plist" "$APP/Contents/Info.plist"
 
+# Build + embed the raincoat CLI into Contents/Helpers (self-contained app). Non-fatal: if
+# cmake is missing the app is assembled without it. Must run BEFORE the outer signature below
+# so the app seals the nested binary.
+echo "==> embedding raincoat CLI"
+"$ROOT/scripts/embed-raincoat.sh" "$APP" -
+
 # Ad-hoc signature so Gatekeeper on this Mac will run it locally. For distribution,
 # replace with: codesign --deep --force --options runtime --sign "Developer ID Application: …"
 echo "==> ad-hoc codesign (local dev only)"

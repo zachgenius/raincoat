@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Entitlements for the bundled raincoat CLI (Contents/Helpers/raincoat), signed with
+	  Hardened Runtime. raincoat dynamically links third-party dylibs (e.g. Homebrew OpenSSL)
+	  whose Team IDs differ from ours; Hardened Runtime's library validation would otherwise
+	  refuse to load them (dyld: "different Team IDs" → SIGABRT). Disabling library validation
+	  lets the CLI load them. This is a separate process from the GUI app, so the entitlement
+	  is scoped to the CLI only.
+
+	  NOTE (distribution): a shippable build must ALSO make those dylibs resolvable on machines
+	  without Homebrew — statically link OpenSSL, or bundle the dylibs and rewrite install
+	  names (@loader_path). See docs/GUI-MACOS.md → "Bundled CLI".
+	-->
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+</dict>
+</plist>

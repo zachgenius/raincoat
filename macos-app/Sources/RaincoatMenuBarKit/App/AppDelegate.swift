@@ -25,6 +25,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ) { [weak self] in
             self?.launcher.toggle()
         }
+
+        maybePromptCLIInstall()
+    }
+
+    // First-run check: if the app carries a bundled raincoat that isn't yet on the user's
+    // $PATH, offer to install it (so `raincoat` works in Terminal too). Skipped once the user
+    // picks "Don't Ask Again", when raincoat is already on $PATH, or for un-bundled dev builds
+    // (nothing to install). The GUI itself already works via the bundled fallback either way.
+    private func maybePromptCLIInstall() {
+        guard !Defaults.cliInstallPromptSuppressed else { return }
+        guard case .bundledOnly = RaincoatInstaller.status() else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Install the raincoat command-line tool?"
+        alert.informativeText = """
+        Raincoat works right now using the copy bundled with this app. To also run \
+        `raincoat` from Terminal, install it onto your PATH (a symlink in \
+        \(RaincoatInstaller.installDir)). You'll be asked for your password once.
+
+        You can always do this later from Preferences.
+        """
+        alert.addButton(withTitle: "Install…")
+        alert.addButton(withTitle: "Not Now")
+        alert.addButton(withTitle: "Don't Ask Again")
+
+        NSApp.activate(ignoringOtherApps: true)
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            do {
+                _ = try RaincoatInstaller.install()
+            } catch RaincoatInstaller.InstallError.cancelled {
+                // Auth dismissed — leave it; they can retry from Preferences.
+            } catch {
+                let err = NSAlert()
+                err.alertStyle = .warning
+                err.messageText = "Couldn't install the command-line tool"
+                err.informativeText = error.localizedDescription
+                err.addButton(withTitle: "OK")
+                err.runModal()
+            }
+        case .alertThirdButtonReturn:
+            Defaults.cliInstallPromptSuppressed = true
+        default:
+            break   // "Not Now" — ask again next launch
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {

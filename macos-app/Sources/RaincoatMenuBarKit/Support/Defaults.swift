@@ -12,6 +12,7 @@ enum Defaults {
         static let hotKeyCode = "hotkey.keyCode"
         static let hotKeyModifiers = "hotkey.modifiers"
         static let recents = "launcher.recents"
+        static let cliInstallPromptSuppressed = "cli.installPromptSuppressed"
     }
 
     /// Optional explicit path to the `raincoat` binary, used as a final fallback by RaincoatLocator.
@@ -65,5 +66,12 @@ enum Defaults {
     static var recentCommands: [String] {
         get { store.stringArray(forKey: Key.recents) ?? [] }
         set { store.set(newValue, forKey: Key.recents) }
+    }
+
+    /// Set once the user picks "Don't Ask Again" on the first-run CLI-install prompt, so the
+    /// app never nags again (they can still install from Preferences).
+    static var cliInstallPromptSuppressed: Bool {
+        get { store.bool(forKey: Key.cliInstallPromptSuppressed) }
+        set { store.set(newValue, forKey: Key.cliInstallPromptSuppressed) }
     }
 }

@@ -73,6 +73,7 @@
 			buildConfigurationList = 5C096C3FB366B90CE77FDA0F /* Build configuration list for PBXNativeTarget "Raincoat" */;
 			buildPhases = (
 				F2638E19F9E0760C6CDCF2B7 /* Sources */,
+				C9838104CDBAFEDE89401A91 /* Embed raincoat CLI */,
 				442F9B0D151EB1D103C1E795 /* Resources */,
 				2E664F2CDAD485017CC06D86 /* Frameworks */,
 			);
@@ -135,6 +136,28 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		C9838104CDBAFEDE89401A91 /* Embed raincoat CLI */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Embed raincoat CLI";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"$PROJECT_DIR/scripts/embed-raincoat.sh\" \"$CODESIGNING_FOLDER_PATH\" \"${EXPANDED_CODE_SIGN_IDENTITY:--}\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		F2638E19F9E0760C6CDCF2B7 /* Sources */ = {

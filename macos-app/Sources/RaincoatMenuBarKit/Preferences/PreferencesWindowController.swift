@@ -20,6 +20,9 @@ final class PreferencesWindowController: NSObject, NSWindowDelegate, NSTextField
     private let raincoatField = NSTextField()
     private let raincoatStatus = PreferencesWindowController.makeHint()
 
+    private let cliButtonRow = NSStackView()
+    private let cliStatus = PreferencesWindowController.makeHint()
+
     private let profileField = NSTextField()
     private let profileStatus = PreferencesWindowController.makeHint()
 
@@ -78,9 +81,13 @@ final class PreferencesWindowController: NSObject, NSWindowDelegate, NSTextField
         profileBrowse.bezelStyle = .rounded
         let profileRow = fieldRow(profileField, profileBrowse)
 
+        cliButtonRow.orientation = .horizontal
+        cliButtonRow.spacing = 8
+
         let grid = NSGridView(views: [
             [label("Global hotkey:"), stackedCell([hotKeyRow, hotKeyMessage])],
             [label("raincoat binary:"), stackedCell([raincoatRow, raincoatStatus])],
+            [label("Command-line tool:"), stackedCell([cliButtonRow, cliStatus])],
             [label("Default profile:"), stackedCell([profileRow, profileStatus])],
             [label("Start at login:"), stackedCell([loginCheckbox, loginHint])],
         ])
@@ -126,6 +133,7 @@ final class PreferencesWindowController: NSObject, NSWindowDelegate, NSTextField
 
         raincoatField.stringValue = Defaults.raincoatPath ?? ""
         refreshRaincoatStatus()
+        refreshCLIStatus()
 
         profileField.stringValue = Defaults.defaultProfilePath ?? ""
         refreshProfileStatus()
@@ -169,6 +177,95 @@ final class PreferencesWindowController: NSObject, NSWindowDelegate, NSTextField
         } else {
             setMessage(raincoatStatus, "not found ✗  (install raincoat or set a path above)", kind: .warning)
         }
+    }
+
+    // MARK: - Command-line tool (bundled CLI → $PATH)
+
+    // Rebuilds the button row + status line to match the current install state. The buttons
+    // shown are contextual: install when only bundled, reinstall/uninstall when managed, etc.
+    private func refreshCLIStatus() {
+        for view in cliButtonRow.arrangedSubviews { cliButtonRow.removeArrangedSubview(view); view.removeFromSuperview() }
+
+        switch RaincoatInstaller.status() {
+        case .installedManaged(let url):
+            setMessage(cliStatus, "installed ✓  \(url.path) → bundled copy", kind: .ok)
+            addCLIButton("Reinstall", #selector(installCLI))
+            addCLIButton("Uninstall", #selector(uninstallCLI))
+            addCLIButton("Reveal", #selector(revealCLI))
+        case .installedExternal(let url):
+            setMessage(cliStatus, "on your PATH ✓  \(url.path)  (your own install — not managed here)", kind: .ok)
+            addCLIButton("Reveal", #selector(revealCLI))
+        case .bundledOnly:
+            setMessage(cliStatus, "bundled with this app, but not on your PATH — install to run `raincoat` in Terminal.", kind: .warning)
+            addCLIButton("Install to \(RaincoatInstaller.installDir)", #selector(installCLI))
+            addCLIButton("Reveal", #selector(revealCLI))
+        case .missing:
+            setMessage(cliStatus, "not found — run from Raincoat.app, or install raincoat manually.", kind: .warning)
+            addCLIButton("How to Install…", #selector(showInstallHelp))
+        }
+    }
+
+    private func addCLIButton(_ title: String, _ action: Selector) {
+        let button = NSButton(title: title, target: self, action: action)
+        button.bezelStyle = .rounded
+        button.controlSize = .small
+        cliButtonRow.addArrangedSubview(button)
+    }
+
+    @objc private func installCLI() {
+        do {
+            _ = try RaincoatInstaller.install()
+        } catch RaincoatInstaller.InstallError.cancelled {
+            // User dismissed the auth prompt — leave state as-is, no error.
+        } catch {
+            presentCLIError("Couldn't install the command-line tool", error)
+        }
+        refreshCLIStatus()
+        refreshRaincoatStatus()
+    }
+
+    @objc private func uninstallCLI() {
+        do {
+            _ = try RaincoatInstaller.uninstall()
+        } catch RaincoatInstaller.InstallError.cancelled {
+        } catch {
+            presentCLIError("Couldn't remove the command-line tool", error)
+        }
+        refreshCLIStatus()
+        refreshRaincoatStatus()
+    }
+
+    @objc private func revealCLI() {
+        let target = RaincoatLocator.bundledBinary ?? RaincoatLocator.findOnPath()
+        guard let url = target else { NSSound.beep(); return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    @objc private func showInstallHelp() {
+        let alert = NSAlert()
+        alert.messageText = "Install the raincoat command-line tool"
+        alert.informativeText = """
+        This build has no bundled copy to install (you're running an unpackaged build).
+
+        Build raincoat from source and put it on your PATH:
+
+          cmake -S . -B build
+          cmake --build build -j
+          sudo cp build/raincoat /usr/local/bin/
+
+        Or set an explicit path under “raincoat binary” above.
+        """
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
+    private func presentCLIError(_ title: String, _ error: Error) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = title
+        alert.informativeText = error.localizedDescription
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     // MARK: - Default profile

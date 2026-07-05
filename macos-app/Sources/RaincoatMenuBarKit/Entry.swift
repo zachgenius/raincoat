@@ -21,6 +21,12 @@ public func runRaincoatMenuBar() {
         exit(0)
     }
 
+    // Headless CLI-install status smoke test (no auth, no GUI).
+    if CommandLine.arguments.contains("--selftest-install") {
+        SelfTest.runInstall()
+        exit(0)
+    }
+
     let app = NSApplication.shared
     let delegate = AppDelegate()
     app.delegate = delegate

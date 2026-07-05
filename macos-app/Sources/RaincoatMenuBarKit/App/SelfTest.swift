@@ -25,6 +25,22 @@ enum SelfTest {
         }
     }
 
+    // Reports how the bundled-CLI installer sees the world: bundled path, PATH resolution, and
+    // the resulting install Status. No auth prompt, no writes — purely diagnostic.
+    static func runInstall() {
+        print("bundled binary: \(RaincoatLocator.bundledBinary?.path ?? "none (un-bundled build)")")
+        print("on PATH:        \(RaincoatLocator.findOnPath()?.path ?? "not found")")
+        print("managed link:   \(RaincoatInstaller.installedLinkPath)")
+        let state: String
+        switch RaincoatInstaller.status() {
+        case .installedManaged(let u): state = "installedManaged(\(u.path))"
+        case .installedExternal(let u): state = "installedExternal(\(u.path))"
+        case .bundledOnly(let u): state = "bundledOnly(\(u.path))"
+        case .missing: state = "missing"
+        }
+        print("status:         \(state)")
+    }
+
     // Constructs the Preferences window (and exercises LoginItem / RaincoatLocator /
     // KeyCombo) without running the event loop, to confirm nothing throws off-screen.
     static func runPrefs() {
