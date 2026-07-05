@@ -1,0 +1,42 @@
+# Maintainer: Zach <zachgenius@gmail.com>
+#
+# AUR package for Raincoat (VCS package — builds latest master; there are no release
+# tags yet). To publish: push this file (plus a generated .SRCINFO via
+# `makepkg --printsrcinfo > .SRCINFO`) to the AUR repo ssh://aur@aur.archlinux.org/raincoat-git.git
+#
+# TODO before publishing: add a LICENSE file to the repo and set license=() accordingly.
+pkgname=raincoat-git
+pkgver=r1.0000000
+pkgrel=1
+pkgdesc="Lightweight privacy sandbox for nosy CLI tools and AI agents (git)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/zachgenius/raincoat"
+license=('custom')
+depends=('bubblewrap' 'openssl')
+makedepends=('git' 'cmake' 'gcc' 'gtest')
+optdepends=('passt: isolated-netns egress jail (pasta)')
+provides=('raincoat')
+conflicts=('raincoat')
+source=("raincoat::git+https://github.com/zachgenius/raincoat.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd raincoat
+  printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+  cmake -S raincoat -B build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr
+  cmake --build build
+}
+
+check() {
+  # Integration tests that need bwrap/user namespaces skip gracefully in a chroot.
+  ctest --test-dir build --output-on-failure
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+}

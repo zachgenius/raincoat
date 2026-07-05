@@ -50,6 +50,17 @@ Raincoat is a C++17 project built with CMake (≥ 3.16). Building needs a C/C++ 
 suite is built by default). The runtime dependency is per-platform: **bubblewrap** on Linux;
 on macOS the sandbox is Apple's built-in Seatbelt, so there is nothing extra to install.
 
+### Quick install (one-liner)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zachgenius/raincoat/master/install.sh | sh
+```
+
+The script installs the build dependencies with your package manager (apt/dnf/pacman/brew),
+builds, installs to `/usr/local`, and runs `raincoat doctor`. From a checkout, run
+`./install.sh` — flags: `--prefix <dir>` (or `PREFIX=`), `--no-deps` (skip the package
+manager), `--no-install` (build only). Prefer to do it by hand? Follow the steps below.
+
 ### 1. Install the dependencies
 
 **Linux**
@@ -97,6 +108,13 @@ The binary lands at `./build/raincoat`. CMake selects the sandbox backend at con
 bubblewrap on Linux, Seatbelt on macOS (where it also builds the `rc_interpose.dylib`
 identity interposer next to the binary). See
 [`docs/MACOS.md`](docs/MACOS.md#building-and-running-on-macos) for macOS specifics.
+
+`sudo cmake --install build` installs to `/usr/local` (`bin/raincoat`, plus
+`lib/raincoat/rc_interpose.dylib` on macOS). Packaging lives in
+[`packaging/`](packaging/): a Homebrew formula (`packaging/homebrew/raincoat.rb`, ready for
+a `zachgenius/homebrew-raincoat` tap) and an AUR `PKGBUILD` (`packaging/aur/PKGBUILD`);
+`cpack -G DEB` / `cpack -G RPM` from the build dir produces installable `.deb`/`.rpm`
+packages with the right runtime dependencies (`bubblewrap`, recommends `passt`).
 
 ### 3. Check your host
 

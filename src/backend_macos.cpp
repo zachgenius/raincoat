@@ -59,18 +59,22 @@ std::string darwin_temp_dir() {
     return canon_or(std::string(buf));
 }
 
-// Locate rc_interpose.dylib next to the running raincoat executable (CMake builds it there).
-// Returns "" if it cannot be found — the interposer is then simply not injected (best-effort;
-// env-level identity still applies).
+// Locate rc_interpose.dylib next to the running raincoat executable (CMake builds it there),
+// falling back to ../lib/raincoat/ relative to the executable (the installed layout:
+// <prefix>/bin/raincoat + <prefix>/lib/raincoat/rc_interpose.dylib). Returns "" if it cannot
+// be found — the interposer is then simply not injected (best-effort; env-level identity
+// still applies).
 std::string interpose_dylib_path() {
     char buf[PATH_MAX];
     uint32_t sz = sizeof(buf);
     if (_NSGetExecutablePath(buf, &sz) != 0) return std::string();
-    std::string exe(buf);
+    std::string exe = canon_or(std::string(buf));
     auto slash = exe.find_last_of('/');
     std::string dir = (slash == std::string::npos) ? std::string(".") : exe.substr(0, slash);
-    std::string dylib = dir + "/rc_interpose.dylib";
-    if (::access(dylib.c_str(), R_OK) == 0) return dylib;
+    for (const std::string& dylib : {dir + "/rc_interpose.dylib",
+                                     dir + "/../lib/raincoat/rc_interpose.dylib"}) {
+        if (::access(dylib.c_str(), R_OK) == 0) return canon_or(dylib);
+    }
     return std::string();
 }
 
