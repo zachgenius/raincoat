@@ -3,24 +3,41 @@ import PackageDescription
 
 // Raincoat menu-bar GUI — a thin, read-only layer over the `raincoat` CLI.
 //
-// This is a standalone SwiftPM executable (NOT part of the CMake build). It builds a
-// menu-bar-only agent app: `LSUIElement = true` in the embedded Info.plist plus a runtime
-// `.accessory` activation policy, so it never shows a Dock icon.
+// The code lives in a LIBRARY target (RaincoatMenuBarKit) so it can be consumed both by:
+//   • the thin SwiftPM executable `RaincoatMenuBar` (below), and
+//   • the Xcode app target `Raincoat` (macos-app/Raincoat.xcodeproj, generated from
+//     project.yml), which depends on this package as a LOCAL PACKAGE and links the library.
+// An app target can't depend on an executable product, hence the split.
 //
-// The Info.plist is embedded directly into the executable's `__TEXT,__info_plist` section via
-// the linker flags below, so even the bare `.build/**/RaincoatMenuBar` binary is treated as an
-// agent. `scripts/make-app-bundle.sh` wraps the same binary + plist into `Raincoat.app`.
+// The executable stays a menu-bar-only agent: `LSUIElement = true` in Info.plist, embedded
+// into `__TEXT,__info_plist` via the -sectcreate linker flags so even the bare
+// `.build/**/RaincoatMenuBar` binary is a Dock-less agent. `scripts/make-app-bundle.sh`
+// wraps that binary + plist into `Raincoat.app`.
 let package = Package(
     name: "RaincoatMenuBar",
     platforms: [
         .macOS(.v14)
     ],
+    products: [
+        .executable(name: "RaincoatMenuBar", targets: ["RaincoatMenuBar"]),
+        .library(name: "RaincoatMenuBarKit", targets: ["RaincoatMenuBarKit"]),
+    ],
     targets: [
+        // All app code. `runRaincoatMenuBar()` is the only public symbol.
+        .target(
+            name: "RaincoatMenuBarKit",
+            path: "Sources/RaincoatMenuBarKit",
+            // The plist is embedded via -sectcreate (see below), not compiled as a resource.
+            exclude: ["Info.plist"],
+            swiftSettings: [
+                .swiftLanguageMode(.v6)
+            ]
+        ),
+        // Thin executable: main.swift → runRaincoatMenuBar().
         .executableTarget(
             name: "RaincoatMenuBar",
+            dependencies: ["RaincoatMenuBarKit"],
             path: "Sources/RaincoatMenuBar",
-            // The plist is embedded via -sectcreate, not compiled as a resource.
-            exclude: ["Info.plist"],
             swiftSettings: [
                 .swiftLanguageMode(.v6)
             ],
@@ -31,9 +48,9 @@ let package = Package(
                     "-Xlinker", "-sectcreate",
                     "-Xlinker", "__TEXT",
                     "-Xlinker", "__info_plist",
-                    "-Xlinker", "Sources/RaincoatMenuBar/Info.plist",
+                    "-Xlinker", "Sources/RaincoatMenuBarKit/Info.plist",
                 ])
             ]
-        )
+        ),
     ]
 )

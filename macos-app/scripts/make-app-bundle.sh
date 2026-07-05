@@ -24,7 +24,8 @@ echo "==> assembling $APP"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/$EXE_NAME"
-cp "$ROOT/Sources/$EXE_NAME/Info.plist" "$APP/Contents/Info.plist"
+# Info.plist lives with the library sources (embedded into the exe via -sectcreate too).
+cp "$ROOT/Sources/RaincoatMenuBarKit/Info.plist" "$APP/Contents/Info.plist"
 
 # Ad-hoc signature so Gatekeeper on this Mac will run it locally. For distribution,
 # replace with: codesign --deep --force --options runtime --sign "Developer ID Application: …"

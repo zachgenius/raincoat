@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  NO App Sandbox. Raincoat spawns the `raincoat` CLI (which itself applies the sandbox)
+	  and registers a Carbon global hotkey — the App Sandbox would block subprocess exec and
+	  the hotkey, defeating the whole app. Hardened Runtime is enabled via the build setting
+	  ENABLE_HARDENED_RUNTIME for future Developer ID signing + notarization.
+	-->
+	<key>com.apple.security.app-sandbox</key>
+	<false/>
+</dict>
+</plist>

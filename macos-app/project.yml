@@ -1,0 +1,65 @@
+# XcodeGen spec for the Raincoat macOS app.
+#
+#   cd macos-app && xcodegen generate   →   Raincoat.xcodeproj
+#
+# The SwiftPM package (Package.swift, in this same directory) stays the code home; this
+# app target consumes it as a LOCAL PACKAGE dependency and links the RaincoatMenuBarKit
+# library. Regenerate after editing this file. `swift build` still works independently.
+name: Raincoat
+
+options:
+  bundleIdPrefix: dev.raincoat
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+
+# Local Swift package at "." (the macos-app dir) — i.e. ./Package.swift.
+packages:
+  RaincoatMenuBar:
+    path: .
+
+targets:
+  Raincoat:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: App/main.swift
+      - path: App/Assets.xcassets
+    dependencies:
+      - package: RaincoatMenuBar
+        product: RaincoatMenuBarKit
+    settings:
+      base:
+        PRODUCT_NAME: Raincoat
+        PRODUCT_BUNDLE_IDENTIFIER: dev.raincoat.menubar
+        INFOPLIST_FILE: App/Info.plist
+        CODE_SIGN_ENTITLEMENTS: App/Raincoat.entitlements
+        SWIFT_VERSION: "6.0"
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # Hardened Runtime ON for future notarization.
+        ENABLE_HARDENED_RUNTIME: YES
+        # ---- Signing STUBBED for local ad-hoc builds (no Developer ID required) ----
+        # For a distributable / notarizable build, open Signing & Capabilities in Xcode and:
+        #   • set DEVELOPMENT_TEAM to your Apple Developer Team ID, and
+        #   • choose a "Developer ID Application" identity
+        #     (or switch CODE_SIGN_STYLE to Automatic and let Xcode manage it).
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "-"
+        DEVELOPMENT_TEAM: ""
+
+# A shared scheme so "Raincoat" shows up in Xcode's Run menu out of the box.
+schemes:
+  Raincoat:
+    build:
+      targets:
+        Raincoat: all
+    run:
+      config: Debug
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release

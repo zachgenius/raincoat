@@ -2,7 +2,14 @@
 .build/
 # Assembled app bundle (produced by scripts/make-app-bundle.sh)
 Raincoat.app/
-# Xcode / SwiftPM local state
-*.xcodeproj
+# SwiftPM local state
 .swiftpm/
 Package.resolved
+
+# Xcode build + per-user state.
+# NOTE: Raincoat.xcodeproj and project.yml ARE committed (open the project directly).
+# Only build outputs and per-user cruft are ignored — do NOT add "*.xcodeproj" here.
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
