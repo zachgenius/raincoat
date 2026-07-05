@@ -93,6 +93,7 @@ set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "passt")
 set(CPACK_DEBIAN_PACKAGE_SECTION "utils")
 set(CPACK_RPM_PACKAGE_REQUIRES "bubblewrap")
 set(CPACK_RPM_PACKAGE_SUGGESTS "passt")
+set(CPACK_RPM_PACKAGE_LICENSE "GPL-3.0-or-later")
 include(CPack)
 
 # ---------------------------------------------------------------------------

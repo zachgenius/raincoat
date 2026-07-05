@@ -1,17 +1,15 @@
-# Maintainer: Zach <zachgenius@gmail.com>
+# Maintainer: zachgenius <zachgenius@gmail.com>
 #
 # AUR package for Raincoat (VCS package — builds latest master; there are no release
 # tags yet). To publish: push this file (plus a generated .SRCINFO via
 # `makepkg --printsrcinfo > .SRCINFO`) to the AUR repo ssh://aur@aur.archlinux.org/raincoat-git.git
-#
-# TODO before publishing: add a LICENSE file to the repo and set license=() accordingly.
 pkgname=raincoat-git
 pkgver=r1.0000000
 pkgrel=1
 pkgdesc="Lightweight privacy sandbox for nosy CLI tools and AI agents (git)"
 arch=('x86_64' 'aarch64')
 url="https://github.com/zachgenius/raincoat"
-license=('custom')
+license=('GPL-3.0-or-later')
 depends=('bubblewrap' 'openssl')
 makedepends=('git' 'cmake' 'gcc' 'gtest')
 optdepends=('passt: isolated-netns egress jail (pasta)')

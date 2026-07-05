@@ -12,6 +12,7 @@ class Raincoat < Formula
   homepage "https://github.com/zachgenius/raincoat"
   url "https://github.com/zachgenius/raincoat.git", branch: "master"
   version "0.1.0"
+  license "GPL-3.0-or-later"
   head "https://github.com/zachgenius/raincoat.git", branch: "master"
 
   depends_on "cmake" => :build

@@ -874,4 +874,12 @@ roadmap have since shipped.
 
 ---
 
+## License
+
+Raincoat is free software, licensed under the **GNU General Public License v3.0 or later**
+([GPL-3.0-or-later](LICENSE)). Copyright (C) 2026 zachgenius. You may run, study, share, and
+modify it; if you distribute a modified version, it must stay under the same license.
+
+---
+
 *Raincoat: it won't stop a hurricane, but it'll keep the casual drizzle off your data.*
