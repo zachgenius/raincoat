@@ -156,6 +156,128 @@ hosts without it.
 
 ---
 
+## Example profiles
+
+Profiles are TOML. `--profile <path>` loads one; **CLI flags always override the profile.**
+`raincoat init` writes a starter `.raincoat.toml` you can edit. Ready-made, heavily-commented
+templates live in [`examples/`](examples/) — see the [index](#the-examples-directory) below. They
+use generic placeholders (no real hosts/secrets); adapt the paths and hostnames before use.
+
+### `.raincoat.toml` schema
+
+```toml
+strict  = false            # deny CWD unless explicitly allowed
+network = "full"           # "full" (host networking) or "off" (isolated)
+
+allow_read  = ["./src"]    # mounted read-only  at the same absolute path (must exist)
+allow_write = ["./out"]    # mounted read-write at the same absolute path (must exist)
+allow_env   = ["OPENAI_API_KEY"]   # copied from the parent env if present
+
+[env]                      # synthetic locale/timezone handed to the command
+TZ     = "UTC"
+LANG   = "en_US.UTF-8"
+LC_ALL = "en_US.UTF-8"
+
+[fontconfig]
+enabled = true             # curated Noto/DejaVu font-set isolation
+
+[audit]
+log_file = ".raincoat/audit.log"
+```
+
+Every path listed in `allow_read` / `allow_write` **must exist**, or Raincoat refuses to start
+with `Error: allowed path does not exist: <path>`. `set_env` is CLI-only (not read from
+profiles). Wrong-typed `strict` / `network` / `fontconfig.enabled` values are rejected rather
+than silently ignored — a silently-dropped `strict` would be a privacy downgrade. The full
+sectioned schema (identity / environment / filesystem / backend / egress / network_policy /
+browser / proxy / tripwire) is documented in
+[`docs/full-config-reference.toml`](docs/full-config-reference.toml).
+
+### The `examples/` directory
+
+Each template is heavily commented and safe to *parse*; several need you to point paths and
+hostnames at real targets first. All values are generic placeholders — **no** real
+providers/secrets/hosts.
+
+| Profile | Job | Highlights |
+|---------|-----|------------|
+| [`strict.toml`](examples/strict.toml) | Fully untrusted tool | `strict`, network off, grants nothing until you add paths. Runs as-is. |
+| [`paranoid.toml`](examples/paranoid.toml) | Maximum lockdown | `strict` + net off + deny-by-default fs + genericized identity + curated fonts + tripwire decoys + JSON audit. Runs as-is. |
+| [`ai-agent.toml`](examples/ai-agent.toml) | AI coding agent | Non-strict, project RW, network on, a couple of API keys forwarded. |
+| [`node-build.toml`](examples/node-build.toml) | npm / pnpm / yarn build | Project RO, `node_modules`/`dist` RW; optional registry allow-list. Pre-create the write dirs. |
+| [`python-tool.toml`](examples/python-tool.toml) | pip / poetry / CLI run | Project RO, `out` RW, extra env scrub; optional index allow-list. Pre-create `out`. |
+| [`egress.toml`](examples/egress.toml) | Hide one upstream's URL | Egress bridge (endpoint indirection); `isolate_netns` defaults to `auto` (URL hidden, general net retained). |
+| [`api-agent.toml`](examples/api-agent.toml) | Agent that may talk to **one** API only | Egress bridge **+ `isolate_netns = "strict"`** = real bridge-only egress firewall. Keep the profile **outside** mounted paths. Needs `pasta`. |
+| [`guarded.toml`](examples/guarded.toml) | Domain allow-list firewall | `[network_policy]` guarded proxy **+ strict jail** = real domain-level egress firewall. Needs `pasta`. |
+| [`browser.toml`](examples/browser.toml) | Playwright / Puppeteer / Selenium | Browser profile isolation + launch shims + strict egress allow-list. Needs `pasta` for the firewall. |
+
+The `api-agent`, `guarded`, and `browser` templates use `isolate_netns = "strict"`, which requires
+[`pasta`](https://passt.top/) and fails **closed** (refuses the run) if it is absent — check with
+`raincoat doctor`. Drop them to `"auto"` to accept the weaker (NAT / proxy-aware-clients-only)
+guarantee. Below are the two simplest templates in full; the rest are best read in `examples/`.
+
+### `examples/strict.toml` — fully untrusted
+
+Denies the working directory, forces network off, grants nothing until you add paths. Safe to
+run as-is (it just warns that no writable paths were allowed and falls back to the fake home).
+
+```toml
+strict  = true
+network = "off"
+
+allow_read  = []           # adjust to your project, then create the dirs
+allow_write = []
+allow_env   = []
+
+[env]
+TZ     = "UTC"
+LANG   = "en_US.UTF-8"
+LC_ALL = "en_US.UTF-8"
+
+[fontconfig]
+enabled = true
+
+[audit]
+log_file = ".raincoat/audit.log"
+```
+
+### `examples/ai-agent.toml` — AI coding agent
+
+Non-strict so the agent can edit your project, network on for model APIs, and a couple of API
+keys forwarded explicitly. `"."` resolves to the directory you launch from, so it is safe to run
+from any project.
+
+```toml
+strict  = false
+network = "full"
+
+allow_read  = ["."]        # your project (the launch directory)
+allow_write = ["."]
+
+allow_env = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]   # trim to the provider you use
+
+[env]
+TZ     = "UTC"
+LANG   = "en_US.UTF-8"
+LC_ALL = "en_US.UTF-8"
+
+[fontconfig]
+enabled = true
+
+[audit]
+log_file = ".raincoat/audit.log"
+```
+
+Run either with:
+
+```sh
+raincoat --profile examples/strict.toml   -- true
+cd /path/to/your/project
+raincoat --profile /path/to/ai-agent.toml -- your-agent ...
+```
+
+---
+
 ## Usage
 
 `raincoat -- <cmd>` is shorthand for `raincoat run -- <cmd>`. Everything after the first `--` is
@@ -523,128 +645,6 @@ Being honest about the sharp edges:
   `--set-env` are escape hatches by design. Grant the minimum the tool needs.
 - **`--net full` shares host networking.** In `full` mode the command has normal network access
   and can reach your LAN and the internet just like any local process.
-
----
-
-## Example profiles
-
-Profiles are TOML. `--profile <path>` loads one; **CLI flags always override the profile.**
-`raincoat init` writes a starter `.raincoat.toml` you can edit. Ready-made, heavily-commented
-templates live in [`examples/`](examples/) — see the [index](#the-examples-directory) below. They
-use generic placeholders (no real hosts/secrets); adapt the paths and hostnames before use.
-
-### `.raincoat.toml` schema
-
-```toml
-strict  = false            # deny CWD unless explicitly allowed
-network = "full"           # "full" (host networking) or "off" (isolated)
-
-allow_read  = ["./src"]    # mounted read-only  at the same absolute path (must exist)
-allow_write = ["./out"]    # mounted read-write at the same absolute path (must exist)
-allow_env   = ["OPENAI_API_KEY"]   # copied from the parent env if present
-
-[env]                      # synthetic locale/timezone handed to the command
-TZ     = "UTC"
-LANG   = "en_US.UTF-8"
-LC_ALL = "en_US.UTF-8"
-
-[fontconfig]
-enabled = true             # curated Noto/DejaVu font-set isolation
-
-[audit]
-log_file = ".raincoat/audit.log"
-```
-
-Every path listed in `allow_read` / `allow_write` **must exist**, or Raincoat refuses to start
-with `Error: allowed path does not exist: <path>`. `set_env` is CLI-only (not read from
-profiles). Wrong-typed `strict` / `network` / `fontconfig.enabled` values are rejected rather
-than silently ignored — a silently-dropped `strict` would be a privacy downgrade. The full
-sectioned schema (identity / environment / filesystem / backend / egress / network_policy /
-browser / proxy / tripwire) is documented in
-[`docs/full-config-reference.toml`](docs/full-config-reference.toml).
-
-### The `examples/` directory
-
-Each template is heavily commented and safe to *parse*; several need you to point paths and
-hostnames at real targets first. All values are generic placeholders — **no** real
-providers/secrets/hosts.
-
-| Profile | Job | Highlights |
-|---------|-----|------------|
-| [`strict.toml`](examples/strict.toml) | Fully untrusted tool | `strict`, network off, grants nothing until you add paths. Runs as-is. |
-| [`paranoid.toml`](examples/paranoid.toml) | Maximum lockdown | `strict` + net off + deny-by-default fs + genericized identity + curated fonts + tripwire decoys + JSON audit. Runs as-is. |
-| [`ai-agent.toml`](examples/ai-agent.toml) | AI coding agent | Non-strict, project RW, network on, a couple of API keys forwarded. |
-| [`node-build.toml`](examples/node-build.toml) | npm / pnpm / yarn build | Project RO, `node_modules`/`dist` RW; optional registry allow-list. Pre-create the write dirs. |
-| [`python-tool.toml`](examples/python-tool.toml) | pip / poetry / CLI run | Project RO, `out` RW, extra env scrub; optional index allow-list. Pre-create `out`. |
-| [`egress.toml`](examples/egress.toml) | Hide one upstream's URL | Egress bridge (endpoint indirection); `isolate_netns` defaults to `auto` (URL hidden, general net retained). |
-| [`api-agent.toml`](examples/api-agent.toml) | Agent that may talk to **one** API only | Egress bridge **+ `isolate_netns = "strict"`** = real bridge-only egress firewall. Keep the profile **outside** mounted paths. Needs `pasta`. |
-| [`guarded.toml`](examples/guarded.toml) | Domain allow-list firewall | `[network_policy]` guarded proxy **+ strict jail** = real domain-level egress firewall. Needs `pasta`. |
-| [`browser.toml`](examples/browser.toml) | Playwright / Puppeteer / Selenium | Browser profile isolation + launch shims + strict egress allow-list. Needs `pasta` for the firewall. |
-
-The `api-agent`, `guarded`, and `browser` templates use `isolate_netns = "strict"`, which requires
-[`pasta`](https://passt.top/) and fails **closed** (refuses the run) if it is absent — check with
-`raincoat doctor`. Drop them to `"auto"` to accept the weaker (NAT / proxy-aware-clients-only)
-guarantee. Below are the two simplest templates in full; the rest are best read in `examples/`.
-
-### `examples/strict.toml` — fully untrusted
-
-Denies the working directory, forces network off, grants nothing until you add paths. Safe to
-run as-is (it just warns that no writable paths were allowed and falls back to the fake home).
-
-```toml
-strict  = true
-network = "off"
-
-allow_read  = []           # adjust to your project, then create the dirs
-allow_write = []
-allow_env   = []
-
-[env]
-TZ     = "UTC"
-LANG   = "en_US.UTF-8"
-LC_ALL = "en_US.UTF-8"
-
-[fontconfig]
-enabled = true
-
-[audit]
-log_file = ".raincoat/audit.log"
-```
-
-### `examples/ai-agent.toml` — AI coding agent
-
-Non-strict so the agent can edit your project, network on for model APIs, and a couple of API
-keys forwarded explicitly. `"."` resolves to the directory you launch from, so it is safe to run
-from any project.
-
-```toml
-strict  = false
-network = "full"
-
-allow_read  = ["."]        # your project (the launch directory)
-allow_write = ["."]
-
-allow_env = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]   # trim to the provider you use
-
-[env]
-TZ     = "UTC"
-LANG   = "en_US.UTF-8"
-LC_ALL = "en_US.UTF-8"
-
-[fontconfig]
-enabled = true
-
-[audit]
-log_file = ".raincoat/audit.log"
-```
-
-Run either with:
-
-```sh
-raincoat --profile examples/strict.toml   -- true
-cd /path/to/your/project
-raincoat --profile /path/to/ai-agent.toml -- your-agent ...
-```
 
 ---
 
