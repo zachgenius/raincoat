@@ -4,9 +4,9 @@ import AppKit
 // commands. Fuzzy-ranks results, and on Enter spawns the selection under raincoat.
 @MainActor
 final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate {
-    private let panelWidth: CGFloat = 680
-    private let fieldAreaHeight: CGFloat = 56
-    private let rowHeight: CGFloat = 46
+    private let panelWidth: CGFloat = 640
+    private let fieldAreaHeight: CGFloat = 52
+    private let rowHeight: CGFloat = 42
     private let maxVisibleRows = 8
 
     private let panel: LauncherPanel
@@ -79,7 +79,7 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
 
         // Search field: large, borderless, no focus ring.
         searchField.translatesAutoresizingMaskIntoConstraints = false
-        searchField.font = .systemFont(ofSize: 22, weight: .regular)
+        searchField.font = .systemFont(ofSize: 21, weight: .regular)
         searchField.isBezeled = false
         searchField.isBordered = false
         searchField.drawsBackground = false
@@ -132,12 +132,14 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
 
             searchField.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 18),
             searchField.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -18),
-            searchField.topAnchor.constraint(equalTo: container.topAnchor),
-            searchField.heightAnchor.constraint(equalToConstant: fieldAreaHeight),
+            // Center the field vertically within a fixed-height field area: a single-line
+            // NSTextField top-aligns its text, so pinning it to the top left it hugging the top
+            // with dead space below. centerY on the field-area midline puts the text in the middle.
+            searchField.centerYAnchor.constraint(equalTo: container.topAnchor, constant: fieldAreaHeight / 2),
 
             divider.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             divider.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            divider.topAnchor.constraint(equalTo: searchField.bottomAnchor),
+            divider.topAnchor.constraint(equalTo: container.topAnchor, constant: fieldAreaHeight),
 
             scrollView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
@@ -209,7 +211,11 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
 
         let height = panel.frame.height
         let x = visible.midX - panelWidth / 2
-        let y = visible.minY + visible.height * 0.62   // upper third, Spotlight-like
+        // Pin the panel's TOP ~18% below the screen top and let the results grow DOWNWARD, so a
+        // tall list never clips above the menu bar (positioning by the bottom origin did). Clamp
+        // so the bottom never falls below the visible area either.
+        let topY = visible.maxY - visible.height * 0.18
+        let y = max(visible.minY, topY - height)
         panel.setFrame(NSRect(x: x, y: y, width: panelWidth, height: height), display: false)
     }
 
