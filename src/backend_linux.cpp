@@ -61,7 +61,7 @@ std::optional<LaunchPlan> backend_build_launch(const LaunchInputs& in, std::stri
         in.backend_path, *in.cfg, in.mounts, in.env, in.fake_home, in.sandbox_tmp,
         in.bind_resolv_conf, in.font_dir, in.audit_mask_dir, in.sandbox_out,
         in.mask_empty_file, in.mask_files, in.curated_font_dirs, in.mask_usr_local_fonts,
-        in.proc_overlays);
+        in.proc_overlays, in.command_exec_path);
     plan.launch_path = in.backend_path;
 
     // Isolated-netns wrapping (pasta): prepend `pasta --config-net -t none -T <ports>

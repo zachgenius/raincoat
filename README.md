@@ -265,6 +265,12 @@ cat: /home/you/.ssh/id_rsa: No such file or directory
 
 The fake `$HOME` is empty, and your real `~/.ssh` simply isn't there.
 
+**The tool you run is always runnable.** Hiding your home would otherwise hide the tool itself when
+it's installed there (`~/.local/bin`, a version manager, etc.). Raincoat resolves the command's own
+binary and exposes just that file (read-only) inside the sandbox — so `raincoat -- mytool` works even
+when `mytool` lives under the hidden `$HOME`, without exposing anything else. The sandbox hides your
+*data*, not the tool you asked it to run.
+
 ### Non-strict (default): the working directory is writable
 
 By default Raincoat mounts your current directory read-write so ordinary "run this tool on my

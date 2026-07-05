@@ -97,6 +97,11 @@ struct Capabilities {
 struct LaunchInputs {
     std::string              backend_path;      // located executable (argv[0]); from backend_locate
     const Config*            cfg = nullptr;      // = cfg_copy
+    // Host-resolved realpath of the command's OWN executable (cfg.command[0]); "" if unresolved.
+    // Both backends EXPOSE this (Linux ro-binds it, macOS re-allows read) so a tool that lives
+    // under a hidden path — e.g. ~/.local/bin/foo — can still be found and exec'd. The wrapped
+    // command must be runnable by definition; the sandbox hides your data, not your own tool.
+    std::string              command_exec_path;
     std::vector<Mount>       mounts;
     EnvResolution            env;                // env.resolved == the exact child env
     std::string              fake_home;

@@ -102,6 +102,30 @@ TEST(Seatbelt, InterposeDylibReAllowed) {
     EXPECT_EQ(p2.find("rc_interpose.dylib"), std::string::npos);
 }
 
+// The command's OWN binary must be re-allowed for reading even under the hidden $HOME, AFTER
+// the home deny (last-match-wins), so a tool under ~/.local/bin can still be exec'd.
+TEST(Seatbelt, CommandExecPathReAllowedAfterHomeDeny) {
+    Fixture f;
+    f.in.command_exec_path = "/Users/tester/.local/share/tool/bin/tool";
+    std::string err;
+    std::string p = f.build(err);
+    EXPECT_TRUE(err.empty());
+
+    const std::string deny = "(deny file-read* file-write* (subpath \"/Users/tester\"))";
+    const std::string allow =
+        "(allow file-read* (subpath \"/Users/tester/.local/share/tool/bin/tool\"))";
+    auto deny_pos = p.find(deny);
+    auto allow_pos = p.find(allow);
+    ASSERT_NE(deny_pos, std::string::npos) << p;
+    ASSERT_NE(allow_pos, std::string::npos) << p;
+    EXPECT_LT(deny_pos, allow_pos) << "command re-allow must come AFTER the home deny\n" << p;
+
+    // Empty command_exec_path -> no such allow rule.
+    f.in.command_exec_path.clear();
+    std::string p2 = f.build(err);
+    EXPECT_EQ(p2.find(".local/share/tool"), std::string::npos);
+}
+
 // ===========================================================================
 // sbpl_str() — the SBPL string-literal escaper
 // ===========================================================================

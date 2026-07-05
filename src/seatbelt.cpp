@@ -165,6 +165,17 @@ std::string build_seatbelt_profile(const LaunchInputs& in, std::string& err) {
         }
     }
 
+    // --- (7c) Re-allow reading the command's OWN binary, even under a denied path (e.g. a tool
+    // installed in ~/.local/bin). Read-only, after the denies so it wins by last-match-wins:
+    // the wrapped command must be runnable by definition. The sandbox hides your data, not the
+    // tool you asked it to run. ---
+    if (!in.command_exec_path.empty()) {
+        if (!emit_subpath(os, "(allow file-read*", in.command_exec_path, ok)) {
+            err = "seatbelt: unrepresentable command_exec_path";
+            return std::string();
+        }
+    }
+
     // --- (8) Network ---
     // A non-empty allow_loopback_ports means a guarded proxy / egress bridge is active:
     // deny ALL outbound at the kernel level (for EVERY client, not just proxy-aware ones —
