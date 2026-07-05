@@ -84,16 +84,25 @@ one-line `Note:` so it's never silent), letting you set standing allows once ins
 It's a **single** config (the first found wins, not layered), and your CLI `--allow-*` flags still
 add on top (allow-lists union). An explicit `--profile` disables discovery. Paths support a leading
 `~/`. This is the fix for tools installed under your home: e.g. **Claude Code** keeps its config in
-`~/.claude` *and* `~/.claude.json`, so a user config of
+`~/.claude` *and* `~/.claude.json` plus a per-user scratch dir at `/tmp/claude-<uid>`, so a user
+config of
 
 ```toml
 # ~/.config/raincoat/config.toml
 allow_read  = ["~/.claude", "~/.claude.json"]
-allow_write = ["~/.claude", "~/.claude.json"]
+allow_write = ["~/.claude", "~/.claude.json", "/tmp/claude-501"]  # /tmp = /private/tmp on macOS
 ```
 
-makes `raincoat -- claude` work with no flags. (A global allow means *any* tool you sandbox can read
+lets `raincoat -- claude` start with no flags. (A global allow means *any* tool you sandbox can read
 those paths — keep the list to things you're comfortable exposing.)
+
+Two honest caveats for interactive coding agents on **macOS**:
+- **Run them from a project directory, not bare `~`.** raincoat can't mount your home (that's the
+  point — the fail-closed probe even refuses `--allow-read ~`), so the agent's cwd must be a real
+  project dir it can auto-mount.
+- **Keychain-based login won't work.** Agents that store their auth token in the macOS login Keychain
+  (`~/Library/Keychains`) will run but read as *not logged in* — exposing the Keychain would hand the
+  sandboxed tool all your secrets, which is exactly what raincoat prevents.
 
 ### `.raincoat.toml` schema
 
