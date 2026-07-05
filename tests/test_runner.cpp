@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -407,4 +408,87 @@ TEST(AuditHidesUpstream, ChildReadableForcesHideRegardlessOfFlags) {
     EXPECT_TRUE(hides(/*global*/ false, /*bridge*/ false, /*child_readable*/ true));
     EXPECT_TRUE(hides(/*global*/ false, /*bridge*/ true, /*child_readable*/ true));
     EXPECT_TRUE(hides(/*global*/ true, /*bridge*/ false, /*child_readable*/ true));
+}
+
+// ===========================================================================
+// discover_default_config — config auto-discovery precedence
+// ===========================================================================
+namespace {
+namespace fs = std::filesystem;
+
+fs::path make_temp_dir() {
+    static std::atomic<int> ctr{0};
+    fs::path d = fs::temp_directory_path() / ("rc_disc_test_" + std::to_string(ctr++));
+    fs::remove_all(d);
+    fs::create_directories(d);
+    return d;
+}
+
+void write_toml(const fs::path& p) {
+    fs::create_directories(p.parent_path());
+    std::ofstream(p) << "allow_read = []\n";
+}
+
+// RAII env override so tests don't leak HOME/XDG changes into each other.
+struct ScopedEnv {
+    std::string key, old;
+    bool had;
+    ScopedEnv(const char* k, const std::string& v) : key(k) {
+        const char* o = std::getenv(k);
+        had = (o != nullptr);
+        if (had) old = o;
+        ::setenv(k, v.c_str(), 1);
+    }
+    ~ScopedEnv() {
+        if (had) ::setenv(key.c_str(), old.c_str(), 1);
+        else ::unsetenv(key.c_str());
+    }
+};
+}  // namespace
+
+using raincoat::discover_default_config;
+
+TEST(DiscoverConfig, ProjectLocalRaincoatTomlWins) {
+    fs::path cwd = make_temp_dir();
+    write_toml(cwd / ".raincoat.toml");
+    auto got = discover_default_config(cwd.string());
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(*got, (cwd / ".raincoat.toml").string());
+    fs::remove_all(cwd);
+}
+
+TEST(DiscoverConfig, XdgUserConfigWhenNoProjectLocal) {
+    fs::path cwd = make_temp_dir();               // no project config
+    fs::path xdg = make_temp_dir();
+    write_toml(xdg / "raincoat" / "config.toml");
+    ScopedEnv e("XDG_CONFIG_HOME", xdg.string());
+    auto got = discover_default_config(cwd.string());
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(*got, (xdg / "raincoat" / "config.toml").string());
+    fs::remove_all(cwd);
+    fs::remove_all(xdg);
+}
+
+TEST(DiscoverConfig, ProjectLocalBeatsUserConfig) {
+    fs::path cwd = make_temp_dir();
+    write_toml(cwd / ".raincoat.toml");
+    fs::path xdg = make_temp_dir();
+    write_toml(xdg / "raincoat" / "config.toml");
+    ScopedEnv e("XDG_CONFIG_HOME", xdg.string());
+    auto got = discover_default_config(cwd.string());
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(*got, (cwd / ".raincoat.toml").string());
+    fs::remove_all(cwd);
+    fs::remove_all(xdg);
+}
+
+TEST(DiscoverConfig, NothingFoundIsNullopt) {
+    fs::path cwd = make_temp_dir();               // empty
+    fs::path home = make_temp_dir();               // empty home, no ~/.config or ~/.raincoat.toml
+    ScopedEnv eh("HOME", home.string());
+    ScopedEnv ex("XDG_CONFIG_HOME", (home / "nope").string());
+    auto got = discover_default_config(cwd.string());
+    EXPECT_FALSE(got.has_value());
+    fs::remove_all(cwd);
+    fs::remove_all(home);
 }

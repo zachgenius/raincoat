@@ -256,6 +256,39 @@ void forward_terminating_signal(int sig) {
 
 }  // namespace
 
+// Discover an implicit config when no --profile is given. First existing (readable) wins:
+//   1. ./.raincoat.toml                       — project-local, most specific
+//   2. $XDG_CONFIG_HOME/raincoat/config.toml   — user default (fallback ~/.config/raincoat/…)
+//   3. ~/.raincoat.toml                        — simple home dotfile
+// This lets a user set their standing allows once (e.g. allow_read = ["~/.claude"]) instead of
+// retyping --allow-* every run. It is a SINGLE config (not layered): the first found is the base
+// and CLI flags still win over it via merge() (whose allow_* lists union, so CLI --allow-* add to
+// the config's). An explicit --profile disables discovery entirely. Called from main.cpp (the CLI
+// layer) — kept OUT of resolve_config so that stays a pure, filesystem-free resolution step.
+std::optional<std::string> discover_default_config(const std::string& cwd) {
+    auto readable = [](const std::string& p) {
+        return !p.empty() && ::access(p.c_str(), R_OK) == 0;
+    };
+    std::string proj = cwd + "/.raincoat.toml";
+    if (readable(proj)) return proj;
+
+    const char* home = std::getenv("HOME");
+    const char* xdg = std::getenv("XDG_CONFIG_HOME");
+    std::string user_cfg;
+    if (xdg && xdg[0]) {
+        user_cfg = std::string(xdg) + "/raincoat/config.toml";
+    } else if (home && home[0]) {
+        user_cfg = std::string(home) + "/.config/raincoat/config.toml";
+    }
+    if (readable(user_cfg)) return user_cfg;
+
+    if (home && home[0]) {
+        std::string dot = std::string(home) + "/.raincoat.toml";
+        if (readable(dot)) return dot;
+    }
+    return std::nullopt;
+}
+
 Config resolve_config(const CliInvocation& inv,
                       const std::map<std::string, std::string>& /*parent_env*/,
                       const std::string& cwd, std::string& err) {
@@ -263,7 +296,9 @@ Config resolve_config(const CliInvocation& inv,
 
     Options options = inv.options;
 
-    // A profile, if any, is the base; explicit CLI flags win via merge().
+    // A profile, if any, is the base; explicit CLI flags win via merge(). The caller (main.cpp)
+    // may have already set profile_path from config auto-discovery — resolve_config just loads
+    // whatever path it is given, staying a pure resolution step (see discover_default_config).
     if (options.profile_path.has_value()) {
         std::string perr;
         std::optional<Options> prof = load_profile(*options.profile_path, perr);
@@ -383,8 +418,18 @@ Config resolve_config(const CliInvocation& inv,
         if (!replaced) cfg.ext.reserved_notes.push_back(reconciled);
     }
 
-    cfg.allow_read = options.allow_read;
-    cfg.allow_write = options.allow_write;
+    // Expand a leading `~/` against $HOME. CLI --allow-* paths are already shell-expanded, but
+    // allows read from a config FILE are not — a user naturally writes allow_read = ["~/.claude"]
+    // and expects it to work (mirrors the fs_deny `~` handling below).
+    auto expand_tilde = [](const std::string& p) -> std::string {
+        if (p.size() >= 2 && p[0] == '~' && p[1] == '/') {
+            if (const char* home = std::getenv("HOME"); home && home[0])
+                return std::string(home) + p.substr(1);
+        }
+        return p;
+    };
+    for (const auto& p : options.allow_read) cfg.allow_read.push_back(expand_tilde(p));
+    for (const auto& p : options.allow_write) cfg.allow_write.push_back(expand_tilde(p));
     cfg.allow_env = options.allow_env;
     cfg.set_env = options.set_env;
 
@@ -408,7 +453,10 @@ Config resolve_config(const CliInvocation& inv,
     // Carry the --profile path (if any) so run() can detect and mask a profile that
     // lands inside a mounted path — it holds egress upstream_endpoint values that must
     // never reach the child. Sourced from the CLI invocation (where --profile came from).
-    cfg.profile_path = inv.options.profile_path;
+    // Whatever profile was resolved (explicit --profile, or a config the caller auto-discovered
+    // and set into profile_path) — so the egress profile-leak mask hides an auto-loaded project
+    // ./.raincoat.toml from the child too.
+    cfg.profile_path = options.profile_path;
 
     return cfg;
 }
