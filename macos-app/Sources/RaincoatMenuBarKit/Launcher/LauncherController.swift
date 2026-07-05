@@ -256,6 +256,9 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
 
               defaults write dev.raincoat.menubar raincoat.binaryPath /full/path/to/raincoat
             """
+        } else if case LaunchService.LaunchError.appSandboxed = error {
+            alert.messageText = "Can't sandbox an App Store app"
+            alert.informativeText = error.localizedDescription
         } else {
             alert.messageText = "Couldn't launch under Raincoat"
             alert.informativeText = error.localizedDescription

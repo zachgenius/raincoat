@@ -17,7 +17,7 @@ final class TrayController: NSObject, NSMenuDelegate {
     private let menu = NSMenu()
     private var watcher: DirectoryWatcher?
 
-    private static let iconSymbol = "shield.lefthalf.filled"
+    private static let iconSymbol = "umbrella.fill"
 
     func start() {
         menu.delegate = self

@@ -12,6 +12,7 @@ enum LaunchService {
     enum LaunchError: Error, LocalizedError {
         case unresolved
         case raincoatNotFound
+        case appSandboxed(String)
 
         var errorDescription: String? {
             switch self {
@@ -19,12 +20,19 @@ enum LaunchService {
                 return "Couldn't resolve that item to a runnable command."
             case .raincoatNotFound:
                 return "The raincoat binary wasn't found."
+            case .appSandboxed(let name):
+                return "\(name) already uses Apple's App Sandbox, and macOS won't let Raincoat wrap an app that sandboxes itself — it would crash on launch. App Store apps generally can't be run under Raincoat on macOS."
             }
         }
     }
 
     /// Launches `item` under raincoat and records it in recents. Throws on resolution or spawn failure.
     static func launch(_ item: SearchItem) throws {
+        // App-Sandboxed apps (most Mac App Store apps) trap at launch if wrapped — macOS forbids
+        // nesting sandboxes. Detect and refuse cleanly rather than crash. See AppSandboxProbe.
+        if case .app(let url) = item.kind, AppSandboxProbe.isSandboxed(url) {
+            throw LaunchError.appSandboxed(url.deletingPathExtension().lastPathComponent)
+        }
         guard let argv = resolveArgv(for: item), !argv.isEmpty else { throw LaunchError.unresolved }
         guard let raincoat = RaincoatLocator.find() else { throw LaunchError.raincoatNotFound }
 

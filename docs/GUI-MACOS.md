@@ -96,6 +96,14 @@ The launcher must resolve and disclose these — they are OS facts, not Raincoat
    The launcher tags such apps `identity: N/A (hardened)` so the tray never overclaims.
 3. **Multi-process apps** (Chrome helpers, XPC services spawned via launchd) escape a per-process
    sandbox. Best for CLI tools + single-binary apps; disclosed for the rest.
+4. **App-Sandboxed apps can't be nested** → most Mac App Store apps (WeChat, etc.) carry
+   `com.apple.security.app-sandbox` and install *their own* container profile at launch
+   (`SET_USERLAND_PROFILE` in `libsecinit`). macOS refuses to sandbox an already-sandboxed process,
+   so wrapping one **traps at startup** (SIGTRAP in `_libsecinit_appsandbox`) before it runs. The
+   launcher checks the target's entitlements (`AppSandboxProbe`, via `SecCodeCopySigningInformation`)
+   and **refuses with a clear message** instead of launching into a crash. *(The bare CLI —
+   `raincoat -- /Applications/WeChat.app/Contents/MacOS/WeChat` — has no such guard yet; that belongs
+   in the macOS backend on `master`.)*
 
 ## Build & packaging
 
