@@ -391,8 +391,14 @@ and honestly disclosed.
 ### macOS menu-bar app (optional GUI)
 
 macOS users get an optional menu-bar app (`macos-app/`, on the `macos-gui` branch): a tray that shows
-what's running under Raincoat and a Spotlight-style launcher (⌥Space) to start apps sandboxed. It is a
-thin, read-only layer over the CLI — see [`docs/GUI-MACOS.md`](docs/GUI-MACOS.md).
+what's running under Raincoat and a Spotlight-style launcher (⌥Space) to start things sandboxed. It is
+a thin, read-only layer over the CLI — see [`docs/GUI-MACOS.md`](docs/GUI-MACOS.md).
+
+> **The launcher is for CLI tools and agents, not GUI apps.** Raincoat's protection is hiding your
+> real `$HOME`, and GUI apps need it (`~/Library`): App Store apps can't be wrapped at all (App Sandbox
+> won't nest), and hardened apps like Chrome abort when their real profile dir is denied. So the
+> launcher **warns before launching an `.app`** (Try under Raincoat / Start without Raincoat / Cancel)
+> and runs bare commands straight under Raincoat. See `docs/GUI-MACOS.md` for the full why.
 
 **Build it:**
 

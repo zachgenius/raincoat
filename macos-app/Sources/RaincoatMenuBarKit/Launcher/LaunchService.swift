@@ -29,6 +29,26 @@ enum LaunchService {
         }
     }
 
+    /// How a chosen item should be launched — decided up front so the launcher can warn before
+    /// running something that can't be confined.
+    enum Target {
+        case cliCommand              // a bare command / CLI tool — run under raincoat, no prompt
+        case guiApp(URL)             // an .app bundle — GUI apps usually need real $HOME; warn first
+        case appSandboxed(URL)       // App-Sandboxed (App Store) — can't be wrapped at all
+    }
+
+    /// Classifies what `item` resolves to, so the caller can prompt appropriately. `guiApp` /
+    /// `appSandboxed` carry the `.app` bundle URL (for launching it normally). Works for both
+    /// `.app` items and `.command` items whose path points into a bundle (e.g. from recents).
+    static func classify(_ item: SearchItem) -> Target {
+        guard let argv = resolveArgv(for: item), !argv.isEmpty else { return .cliCommand }
+        let exeURL = URL(fileURLWithPath: argv[0])
+        let bundle = appBundle(containing: exeURL)
+        if AppSandboxProbe.isSandboxed(exeURL) { return .appSandboxed(bundle ?? exeURL) }
+        if let bundle { return .guiApp(bundle) }
+        return .cliCommand
+    }
+
     /// Launches `item` under raincoat and records it in recents. Throws on resolution or spawn failure.
     static func launch(_ item: SearchItem) throws {
         guard let argv = resolveArgv(for: item), !argv.isEmpty else { throw LaunchError.unresolved }

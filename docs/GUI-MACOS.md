@@ -105,6 +105,16 @@ The launcher must resolve and disclose these — they are OS facts, not Raincoat
    via LaunchServices — unconfined by Raincoat, but still in Apple's own App Sandbox) or **Cancel**.
    *(The bare CLI — `raincoat -- /Applications/WeChat.app/Contents/MacOS/WeChat` — has no such guard
    yet; that belongs in the macOS backend on `master`.)*
+5. **GUI apps usually need the real `$HOME`, which Raincoat hides** → this is the deepest one, and it
+   is by design. Raincoat's protection *is* denying the real `~/Library` and handing the child a
+   throwaway home. GUI apps keep everything there, so they typically fail: a **hardened** app (Chrome)
+   ignores the fake-home interposer, resolves the *real* home, writes to `~/Library/…`, hits the deny
+   and **aborts** (`Failed to create …/SingletonLock: Operation not permitted … Aborting`); a
+   **non-hardened** app gets the empty fake home and comes up blank. So the launcher is genuinely for
+   **CLI tools and AI agents** (which respect `$HOME` and don't need `~/Library`), not GUI apps. When
+   a chosen target resolves to an `.app` bundle, the launcher warns up front — **Try under Raincoat /
+   Start without Raincoat / Cancel** — rather than let it fail silently. Bare commands launch straight
+   under Raincoat with no prompt.
 
 ## Build & packaging
 

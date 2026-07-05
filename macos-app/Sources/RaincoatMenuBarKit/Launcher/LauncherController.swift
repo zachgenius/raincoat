@@ -235,17 +235,51 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
         }
 
         hide()
+        // Decide before launching: CLI commands run straight under raincoat; GUI apps get a
+        // heads-up (they usually need the real home Raincoat hides); App-Sandboxed apps can't be
+        // wrapped at all. See LaunchService.classify.
+        switch LaunchService.classify(item) {
+        case .cliCommand:
+            runUnderRaincoat(item)
+        case .guiApp(let bundle):
+            presentGuiAppChoice(item: item, bundle: bundle)
+        case .appSandboxed(let bundle):
+            presentAppSandboxChoice(bundle)
+        }
+    }
+
+    private func runUnderRaincoat(_ item: SearchItem) {
         do {
             try LaunchService.launch(item)
-        } catch LaunchService.LaunchError.appSandboxed(let appURL) {
-            presentAppSandboxChoice(appURL)
         } catch {
             presentLaunchError(error)
         }
     }
 
-    // An App-Sandboxed app can't be wrapped (it would trap at launch). Rather than dead-end, offer
-    // to start it normally — outside Raincoat — or cancel.
+    // A GUI .app usually needs the real home folder, which Raincoat hides — so it may fail or come
+    // up blank when confined. Offer to try anyway, start it normally, or cancel.
+    private func presentGuiAppChoice(item: SearchItem, bundle: URL) {
+        NSApp.activate(ignoringOtherApps: true)
+        let name = bundle.deletingPathExtension().lastPathComponent
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "\(name) may not run under Raincoat"
+        alert.informativeText = """
+        Raincoat hides your real home folder, but GUI apps usually need it (~/Library), so many \
+        fail to launch or come up blank when confined. You can try anyway, or start \(name) normally.
+        """
+        alert.addButton(withTitle: "Try under Raincoat")
+        alert.addButton(withTitle: "Start without Raincoat")
+        alert.addButton(withTitle: "Cancel")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn: runUnderRaincoat(item)
+        case .alertSecondButtonReturn: launchNormally(bundle)
+        default: break
+        }
+    }
+
+    // An App-Sandboxed app can't be wrapped (it would trap at launch). Offer to start it normally
+    // — outside Raincoat — or cancel. No "try anyway": it is guaranteed to crash.
     private func presentAppSandboxChoice(_ appURL: URL) {
         NSApp.activate(ignoringOtherApps: true)
         let name = appURL.deletingPathExtension().lastPathComponent
@@ -261,15 +295,26 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
         alert.addButton(withTitle: "Start without Raincoat")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
+        launchNormally(appURL)
+    }
 
-        // Launch via LaunchServices (NOT under raincoat) — the normal way to open a GUI app.
-        if !NSWorkspace.shared.open(appURL) {
-            let fail = NSAlert()
-            fail.alertStyle = .warning
-            fail.messageText = "Couldn't open \(name)"
-            fail.addButton(withTitle: "OK")
-            fail.runModal()
+    // Launch a target the NORMAL way (not under raincoat): an .app via LaunchServices, a bare
+    // executable directly.
+    private func launchNormally(_ url: URL) {
+        let ok: Bool
+        if url.pathExtension == "app" {
+            ok = NSWorkspace.shared.open(url)
+        } else {
+            let process = Process()
+            process.executableURL = url
+            ok = (try? process.run()) != nil
         }
+        guard !ok else { return }
+        let fail = NSAlert()
+        fail.alertStyle = .warning
+        fail.messageText = "Couldn't open \(url.deletingPathExtension().lastPathComponent)"
+        fail.addButton(withTitle: "OK")
+        fail.runModal()
     }
 
     private func presentLaunchError(_ error: Error) {
