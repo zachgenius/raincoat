@@ -1,0 +1,8 @@
+# SwiftPM build products
+.build/
+# Assembled app bundle (produced by scripts/make-app-bundle.sh)
+Raincoat.app/
+# Xcode / SwiftPM local state
+*.xcodeproj
+.swiftpm/
+Package.resolved
