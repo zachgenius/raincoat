@@ -75,7 +75,10 @@ enum RaincoatInstaller {
     @discardableResult
     static func install() throws -> Status {
         guard let src = RaincoatLocator.bundledBinary else { throw InstallError.noBundledBinary }
-        if directLink(from: src.path) {
+        // RAINCOAT_INSTALL_FORCE_PRIVILEGED=1 skips the unprivileged path so the admin dialog can
+        // be exercised even where /usr/local/bin is already user-writable (testing/diagnostics).
+        let forcePrivileged = ProcessInfo.processInfo.environment["RAINCOAT_INSTALL_FORCE_PRIVILEGED"] == "1"
+        if !forcePrivileged, directLink(from: src.path) {
             return status()
         }
         let cmd = "/bin/mkdir -p \(shq(installDir)) && /bin/ln -sf \(shq(src.path)) \(shq(installedLinkPath))"
@@ -113,28 +116,28 @@ enum RaincoatInstaller {
 
     // MARK: - Privileged exec
 
-    // Runs a POSIX shell command as root via the native authorization prompt. Uses an
-    // osascript SUBPROCESS (not in-process NSAppleScript) so no Apple-Events entitlement or
-    // in-process AppleEvent machinery is involved.
+    // Runs a POSIX shell command as root via the native macOS authorization dialog (password or
+    // Touch ID). Uses IN-PROCESS NSAppleScript so the dialog is attributed to "Raincoat" (with
+    // its icon), not a bare "osascript" subprocess. `do shell script … with administrator
+    // privileges` does NOT target another app, so it needs no Apple-Events automation
+    // entitlement. Must run on the main thread — RaincoatInstaller is @MainActor.
     private static func runPrivileged(_ shellCommand: String) throws {
-        let script = "do shell script \(appleQuote(shellCommand)) with administrator privileges"
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        proc.arguments = ["-e", script]
-        let errPipe = Pipe()
-        proc.standardError = errPipe
-        proc.standardOutput = Pipe()
-        try proc.run()
-        proc.waitUntilExit()
-        guard proc.terminationStatus != 0 else { return }
+        let source = "do shell script \(appleQuote(shellCommand)) with administrator privileges"
+        guard let script = NSAppleScript(source: source) else {
+            throw InstallError.authFailed("Couldn't construct the authorization request.")
+        }
+        var errorInfo: NSDictionary?
+        script.executeAndReturnError(&errorInfo)
+        guard let error = errorInfo else { return }   // nil error dict == success
 
-        let msg = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        // osascript reports a cancelled auth prompt as error -128 / "User canceled."
-        if msg.contains("-128") || msg.localizedCaseInsensitiveContains("cancel") {
+        let code = (error[NSAppleScript.errorNumber] as? Int) ?? 0
+        let message = ((error[NSAppleScript.errorMessage] as? String) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // A dismissed auth dialog surfaces as error -128 ("User canceled.").
+        if code == -128 || message.localizedCaseInsensitiveContains("cancel") {
             throw InstallError.cancelled
         }
-        throw InstallError.authFailed(msg)
+        throw InstallError.authFailed(message)
     }
 
     // MARK: - Quoting helpers

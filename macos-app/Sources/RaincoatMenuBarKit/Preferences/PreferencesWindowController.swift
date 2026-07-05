@@ -22,6 +22,7 @@ final class PreferencesWindowController: NSObject, NSWindowDelegate, NSTextField
 
     private let cliButtonRow = NSStackView()
     private let cliStatus = PreferencesWindowController.makeHint()
+    private let cliInstruction = PreferencesWindowController.makeHint()
 
     private let profileField = NSTextField()
     private let profileStatus = PreferencesWindowController.makeHint()
@@ -83,11 +84,16 @@ final class PreferencesWindowController: NSObject, NSWindowDelegate, NSTextField
 
         cliButtonRow.orientation = .horizontal
         cliButtonRow.spacing = 8
+        // Persistent one-liner so the buttons are self-explanatory in every state.
+        cliInstruction.stringValue = "Puts `raincoat` on your PATH (a symlink in \(RaincoatInstaller.installDir)) so you can run it in Terminal. Uninstall removes only that symlink — never a raincoat you installed yourself."
+        cliInstruction.lineBreakMode = .byWordWrapping
+        cliInstruction.maximumNumberOfLines = 3
+        cliInstruction.preferredMaxLayoutWidth = 320
 
         let grid = NSGridView(views: [
             [label("Global hotkey:"), stackedCell([hotKeyRow, hotKeyMessage])],
             [label("raincoat binary:"), stackedCell([raincoatRow, raincoatStatus])],
-            [label("Command-line tool:"), stackedCell([cliButtonRow, cliStatus])],
+            [label("Command-line tool:"), stackedCell([cliButtonRow, cliStatus, cliInstruction])],
             [label("Default profile:"), stackedCell([profileRow, profileStatus])],
             [label("Start at login:"), stackedCell([loginCheckbox, loginHint])],
         ])

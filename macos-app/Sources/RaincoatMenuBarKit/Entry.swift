@@ -27,6 +27,15 @@ public func runRaincoatMenuBar() {
         exit(0)
     }
 
+    // Headless install / uninstall of the bundled CLI onto $PATH. Shows the real admin dialog
+    // when escalation is needed (RAINCOAT_INSTALL_FORCE_PRIVILEGED=1 forces it).
+    if CommandLine.arguments.contains("--install-cli") {
+        exit(SelfTest.runInstallAction(uninstall: false))
+    }
+    if CommandLine.arguments.contains("--uninstall-cli") {
+        exit(SelfTest.runInstallAction(uninstall: true))
+    }
+
     let app = NSApplication.shared
     let delegate = AppDelegate()
     app.delegate = delegate

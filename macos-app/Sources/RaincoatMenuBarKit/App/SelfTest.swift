@@ -31,14 +31,33 @@ enum SelfTest {
         print("bundled binary: \(RaincoatLocator.bundledBinary?.path ?? "none (un-bundled build)")")
         print("on PATH:        \(RaincoatLocator.findOnPath()?.path ?? "not found")")
         print("managed link:   \(RaincoatInstaller.installedLinkPath)")
-        let state: String
-        switch RaincoatInstaller.status() {
-        case .installedManaged(let u): state = "installedManaged(\(u.path))"
-        case .installedExternal(let u): state = "installedExternal(\(u.path))"
-        case .bundledOnly(let u): state = "bundledOnly(\(u.path))"
-        case .missing: state = "missing"
+        print("status:         \(describe(RaincoatInstaller.status()))")
+    }
+
+    // Actually performs the install (or uninstall) from the command line, INCLUDING the admin
+    // auth dialog when escalation is needed (force it anywhere with
+    // RAINCOAT_INSTALL_FORCE_PRIVILEGED=1). Prints the resulting status. Returns an exit code.
+    static func runInstallAction(uninstall: Bool) -> Int32 {
+        do {
+            let result = uninstall ? try RaincoatInstaller.uninstall() : try RaincoatInstaller.install()
+            print("\(uninstall ? "uninstall" : "install") OK → \(describe(result))")
+            return 0
+        } catch RaincoatInstaller.InstallError.cancelled {
+            print("cancelled by user")
+            return 1
+        } catch {
+            print("error: \(error.localizedDescription)")
+            return 1
         }
-        print("status:         \(state)")
+    }
+
+    private static func describe(_ status: RaincoatInstaller.Status) -> String {
+        switch status {
+        case .installedManaged(let u): return "installedManaged(\(u.path))"
+        case .installedExternal(let u): return "installedExternal(\(u.path))"
+        case .bundledOnly(let u): return "bundledOnly(\(u.path))"
+        case .missing: return "missing"
+        }
     }
 
     // Constructs the Preferences window (and exercises LoginItem / RaincoatLocator /

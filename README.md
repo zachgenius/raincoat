@@ -388,6 +388,40 @@ honest reasons. Read [`docs/MACOS.md`](docs/MACOS.md) before trusting it:
 Same raincoat, thinner fabric: it keeps the everyday drizzle off on macOS too, but the seams are wider
 and honestly disclosed.
 
+### macOS menu-bar app (optional GUI)
+
+macOS users get an optional menu-bar app (`macos-app/`, on the `macos-gui` branch): a tray that shows
+what's running under Raincoat and a Spotlight-style launcher (⌥Space) to start apps sandboxed. It is a
+thin, read-only layer over the CLI — see [`docs/GUI-MACOS.md`](docs/GUI-MACOS.md).
+
+**Build it:**
+
+```sh
+cd macos-app
+./scripts/make-app-bundle.sh release      # → macos-app/Raincoat.app
+open Raincoat.app
+```
+
+The app is **self-contained**: it embeds a copy of the `raincoat` CLI, so the GUI works with no prior
+install. (Building the bundle needs `cmake` to compile the embedded CLI; without it the app is built
+without one and reports the tool as "not found".)
+
+**Command-line tool (run `raincoat` in Terminal too).** The app can put `raincoat` on your `$PATH` by
+symlinking its bundled copy into `/usr/local/bin`:
+
+- **Install** — on first launch the app offers to install it, or use **Preferences › Command-line
+  tool › Install**. If `/usr/local/bin` isn't writable you'll get one native admin prompt (password or
+  Touch ID); a Homebrew-style user-owned `/usr/local/bin` needs no prompt.
+- **Uninstall** — **Preferences › Command-line tool › Uninstall** removes the symlink. It only ever
+  touches the symlink it created (`/usr/local/bin/raincoat` → the app) and never a raincoat you
+  installed yourself (Homebrew, hand-built, etc.).
+- **Scriptable** — `Raincoat.app/Contents/MacOS/RaincoatMenuBar --install-cli` / `--uninstall-cli` do
+  the same headlessly.
+
+> **Distribution note.** The embedded CLI here links Homebrew OpenSSL at absolute paths and is
+> arm64-only, so the bundled copy is **dev-only** until OpenSSL is statically linked (or bundled) and a
+> universal binary is built. See [`docs/GUI-MACOS.md`](docs/GUI-MACOS.md) → "Bundled CLI".
+
 ---
 
 ## Dependency: bubblewrap
