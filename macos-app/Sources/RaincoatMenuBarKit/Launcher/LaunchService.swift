@@ -68,6 +68,11 @@ enum LaunchService {
         process.executableURL = raincoat
         // raincoat [--profile <p>] -- <target...>
         process.arguments = profileArguments() + ["--"] + argv
+        // A menu-bar app launched by LaunchServices inherits cwd = "/", which makes raincoat try to
+        // write its audit log to "//.raincoat" (read-only → fails) and have no usable working dir.
+        // Run from the real home so the audit log lands in ~/.raincoat and cwd is sane. (raincoat
+        // still won't auto-mount the home root — that's the intended privacy behavior.)
+        process.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
         // Run detached; raincoat is the sandbox supervisor and owns its own lifecycle/status file.
         try process.run()
 
