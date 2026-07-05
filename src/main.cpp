@@ -151,6 +151,16 @@ int main(int argc, char** argv, char** envp) {
             std::string cwd = current_working_dir();
             std::string assets_dir = resolve_assets_dir(argv[0], cwd);
             std::string err;
+            // No explicit --profile? Auto-discover a default config (project-local or user) so
+            // standing allows apply without retyping --allow-* every run. Announce it, so a
+            // config is never applied silently. resolve_config then loads whatever path it gets.
+            if (!inv.options.profile_path.has_value()) {
+                if (auto found = discover_default_config(cwd)) {
+                    inv.options.profile_path = *found;
+                    std::cerr << "Note: applied config " << *found
+                              << " (no --profile given). Pass --profile to override.\n";
+                }
+            }
             Config cfg = resolve_config(inv, parent, cwd, err);
             if (!err.empty()) {
                 std::cerr << err << "\n";
