@@ -31,12 +31,17 @@ enum LaunchService {
 
     /// Launches `item` under raincoat and records it in recents. Throws on resolution or spawn failure.
     static func launch(_ item: SearchItem) throws {
-        // App-Sandboxed apps (most Mac App Store apps) trap at launch if wrapped — macOS forbids
-        // nesting sandboxes. Surface it as a choice (start unwrapped / cancel), not a crash.
-        if case .app(let url) = item.kind, AppSandboxProbe.isSandboxed(url) {
-            throw LaunchError.appSandboxed(url)
-        }
         guard let argv = resolveArgv(for: item), !argv.isEmpty else { throw LaunchError.unresolved }
+
+        // App-Sandboxed targets (most Mac App Store apps) trap at launch if wrapped — macOS forbids
+        // nesting sandboxes. Probe the ACTUAL executable we'd exec, so this catches both .app items
+        // AND recent-command paths into a bundle (e.g. …/WeChat.app/Contents/MacOS/WeChat). Surface
+        // it as a choice (start unwrapped / cancel), not a crash.
+        let exeURL = URL(fileURLWithPath: argv[0])
+        if AppSandboxProbe.isSandboxed(exeURL) {
+            throw LaunchError.appSandboxed(appBundle(containing: exeURL) ?? exeURL)
+        }
+
         guard let raincoat = RaincoatLocator.find() else { throw LaunchError.raincoatNotFound }
 
         let process = Process()
@@ -47,6 +52,17 @@ enum LaunchService {
         try process.run()
 
         Recents.add(argv.joined(separator: " "))
+    }
+
+    /// Walk up from an executable path to the enclosing `.app` bundle, if any
+    /// (…/Foo.app/Contents/MacOS/Foo → …/Foo.app). Nil for a bare CLI binary.
+    static func appBundle(containing url: URL) -> URL? {
+        var cur = url
+        while cur.pathComponents.count > 1 {
+            if cur.pathExtension == "app" { return cur }
+            cur = cur.deletingLastPathComponent()
+        }
+        return nil
     }
 
     /// `["--profile", <path>]` when a default profile is configured, else empty.
