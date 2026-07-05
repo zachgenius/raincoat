@@ -24,3 +24,6 @@ test_*
 
 # Runtime artifacts
 .raincoat/
+
+# Editor / tooling artifacts
+.serena/
