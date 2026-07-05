@@ -71,6 +71,30 @@ Profiles are TOML. `--profile <path>` loads one; **CLI flags always override the
 templates live in [`examples/`](examples/) — see the [index](#the-examples-directory) below. They
 use generic placeholders (no real hosts/secrets); adapt the paths and hostnames before use.
 
+### Default config (auto-loaded)
+
+When you **don't** pass `--profile`, Raincoat auto-loads the first config it finds (and prints a
+one-line `Note:` so it's never silent), letting you set standing allows once instead of retyping
+`--allow-*` every run:
+
+1. `./.raincoat.toml` — project-local, in the current directory
+2. `$XDG_CONFIG_HOME/raincoat/config.toml` (falls back to `~/.config/raincoat/config.toml`)
+3. `~/.raincoat.toml`
+
+It's a **single** config (the first found wins, not layered), and your CLI `--allow-*` flags still
+add on top (allow-lists union). An explicit `--profile` disables discovery. Paths support a leading
+`~/`. This is the fix for tools installed under your home: e.g. **Claude Code** keeps its config in
+`~/.claude` *and* `~/.claude.json`, so a user config of
+
+```toml
+# ~/.config/raincoat/config.toml
+allow_read  = ["~/.claude", "~/.claude.json"]
+allow_write = ["~/.claude", "~/.claude.json"]
+```
+
+makes `raincoat -- claude` work with no flags. (A global allow means *any* tool you sandbox can read
+those paths — keep the list to things you're comfortable exposing.)
+
 ### `.raincoat.toml` schema
 
 ```toml
