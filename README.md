@@ -84,16 +84,25 @@ one-line `Note:` so it's never silent), letting you set standing allows once ins
 It's a **single** config (the first found wins, not layered), and your CLI `--allow-*` flags still
 add on top (allow-lists union). An explicit `--profile` disables discovery. Paths support a leading
 `~/`. This is the fix for tools installed under your home: e.g. **Claude Code** keeps its config in
-`~/.claude` *and* `~/.claude.json`, so a user config of
+`~/.claude` *and* `~/.claude.json` plus a per-user scratch dir at `/tmp/claude-<uid>`, so a user
+config of
 
 ```toml
 # ~/.config/raincoat/config.toml
 allow_read  = ["~/.claude", "~/.claude.json"]
-allow_write = ["~/.claude", "~/.claude.json"]
+allow_write = ["~/.claude", "~/.claude.json", "/tmp/claude-501"]  # /tmp = /private/tmp on macOS
 ```
 
-makes `raincoat -- claude` work with no flags. (A global allow means *any* tool you sandbox can read
+lets `raincoat -- claude` start with no flags. (A global allow means *any* tool you sandbox can read
 those paths — keep the list to things you're comfortable exposing.)
+
+Two honest caveats for interactive coding agents on **macOS**:
+- **Run them from a project directory, not bare `~`.** raincoat can't mount your home (that's the
+  point — the fail-closed probe even refuses `--allow-read ~`), so the agent's cwd must be a real
+  project dir it can auto-mount.
+- **Keychain-based login won't work.** Agents that store their auth token in the macOS login Keychain
+  (`~/Library/Keychains`) will run but read as *not logged in* — exposing the Keychain would hand the
+  sandboxed tool all your secrets, which is exactly what raincoat prevents.
 
 ### `.raincoat.toml` schema
 
@@ -498,6 +507,31 @@ honest reasons. Read [`docs/MACOS.md`](docs/MACOS.md) before trusting it:
    there is no seccomp-style backstop as on Linux. (One place macOS is actually *stronger*: the
    guarded-proxy egress firewall is kernel-enforced for **all** clients with no pasta helper — see
    [`docs/MACOS.md`](docs/MACOS.md).)
+
+#### "Hardened Runtime" costs you fingerprint faking — **not** confinement
+
+Hardened Runtime is a code-signing flag Apple **requires for notarization**, so nearly every
+distributed macOS app carries it (Chrome, Slack, VS Code, Docker, Claude Code, most Homebrew casks).
+It blocks `DYLD_INSERT_LIBRARIES`, which strips raincoat's interposer — so on a hardened tool the
+**identity/fingerprint faking (hostname / username / CPU / machine-id) does not apply**.
+
+It does **not** touch raincoat's load-bearing protection. Filesystem confinement and network control
+are enforced by the **Seatbelt kernel sandbox**, which applies to *every* binary regardless of
+hardening. A hardened tool under raincoat still **cannot read your `$HOME`, `~/.ssh`, `~/.aws`, or
+browser profiles** (unless you allow them), still has its network off/proxied/firewalled, and still
+gets its environment secrets scrubbed — you can watch Apple's own hardened `cat` be denied your SSH
+keys:
+
+```
+$ raincoat -- cat ~/.ssh/id_rsa
+cat: /Users/you/.ssh/id_rsa: No such file or directory
+$ raincoat -- ls ~/.ssh
+ls: /Users/you/.ssh: Operation not permitted
+```
+
+So on macOS, hardening costs you **anti-fingerprinting**, not **confinement**. If "don't let this tool
+read my secrets or phone home" is the goal, raincoat delivers that on hardened tools today; if
+anti-fingerprinting a hardened binary is the goal, that's the real gap.
 
 Same raincoat, thinner fabric: it keeps the everyday drizzle off on macOS too, but the seams are wider
 and honestly disclosed.
