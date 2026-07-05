@@ -45,114 +45,22 @@ choice the default one: run the tool, but don't let it casually rifle through yo
 
 ## Install / build
 
-Raincoat is a C++17 project built with CMake (≥ 3.16). Building needs a C/C++ toolchain,
-**OpenSSL** (the egress bridge terminates HTTPS via OpenSSL), and **GoogleTest** (the test
-suite is built by default). The runtime dependency is per-platform: **bubblewrap** on Linux;
-on macOS the sandbox is Apple's built-in Seatbelt, so there is nothing extra to install.
-
-### Quick install (one-liner)
+One line, Linux or macOS:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/zachgenius/raincoat/master/install.sh | sh
 ```
 
 The script installs the build dependencies with your package manager (apt/dnf/pacman/brew),
-builds, installs to `/usr/local`, and runs `raincoat doctor`. From a checkout, run
-`./install.sh` — flags: `--prefix <dir>` (or `PREFIX=`), `--no-deps` (skip the package
-manager), `--no-install` (build only). Prefer to do it by hand? Follow the steps below.
+builds, installs to `/usr/local`, and finishes with `raincoat doctor`, which verifies the
+host can actually sandbox (bubblewrap + user namespaces on Linux; Seatbelt on macOS) — run
+it any time you want to re-check a host.
 
-### 1. Install the dependencies
-
-**Linux**
-
-```sh
-# Ubuntu/Debian
-sudo apt install bubblewrap cmake g++ libssl-dev libgtest-dev
-# Fedora
-sudo dnf install bubblewrap cmake gcc-c++ openssl-devel gtest-devel
-# Arch
-sudo pacman -S bubblewrap cmake gcc openssl gtest
-```
-
-Optional: [`pasta`](https://passt.top/) (package `passt` on all three) enables the
-isolated-netns egress jail; without it the egress bridge falls back to the shared host
-network namespace (`raincoat doctor` reports which you have).
-
-**macOS**
-
-```sh
-xcode-select --install                    # compiler toolchain (skip if Xcode/CLT is installed)
-brew install cmake openssl@3 googletest
-```
-
-Apple's Seatbelt (`sandbox_init` / `sandbox-exec`) ships with macOS — nothing to install for
-the sandbox itself.
-
-### 2. Build
-
-```sh
-git clone https://github.com/zachgenius/raincoat.git
-cd raincoat
-cmake -S . -B build
-cmake --build build -j
-```
-
-On macOS, point CMake at Homebrew's keg-only `openssl@3` when configuring:
-
-```sh
-cmake -S . -B build -DCMAKE_PREFIX_PATH="$(brew --prefix openssl@3)"
-cmake --build build -j
-```
-
-The binary lands at `./build/raincoat`. CMake selects the sandbox backend at configure time:
-bubblewrap on Linux, Seatbelt on macOS (where it also builds the `rc_interpose.dylib`
-identity interposer next to the binary). See
-[`docs/MACOS.md`](docs/MACOS.md#building-and-running-on-macos) for macOS specifics.
-
-`sudo cmake --install build` installs to `/usr/local` (`bin/raincoat`, plus
-`lib/raincoat/rc_interpose.dylib` on macOS). Packaging lives in
-[`packaging/`](packaging/): a Homebrew formula (`packaging/homebrew/raincoat.rb`, ready for
-a `zachgenius/homebrew-raincoat` tap) and an AUR `PKGBUILD` (`packaging/aur/PKGBUILD`);
-`cpack -G DEB` / `cpack -G RPM` from the build dir produces installable `.deb`/`.rpm`
-packages with the right runtime dependencies (`bubblewrap`, recommends `passt`).
-
-### 3. Check your host
-
-`raincoat doctor` verifies that everything Raincoat needs is present and working — bwrap is
-installed and executable, user namespaces are available, and a `bwrap ... true` smoke test
-succeeds. It exits non-zero if the host is unusable.
-
-```
-$ raincoat doctor
-Raincoat doctor
-===============
-  [ OK ] bubblewrap (bwrap) found: /usr/bin/bwrap
-  [ OK ] bwrap version: bubblewrap 0.11.0
-  [ OK ] user namespaces available: yes
-  [ OK ] bwrap smoke test (`bwrap ... true`): passed
-  [ OK ] egress network jail: available (pasta) /usr/bin/pasta
-
-Result: PASS — host is usable. bwrap is present and the smoke test passed.
-```
-
-The `egress network jail` line is informational, never a `[FAIL]`: if neither `pasta` nor
-`slirp4netns` is installed it reads `[INFO] … unavailable` and the egress bridge simply falls
-back to the shared host network namespace (see [Egress bridge](#egress-bridge-endpoint-indirection)).
-
-On macOS, `doctor` is Seatbelt-aware instead: it checks that `sandbox-exec` is present, runs a
-real SBPL smoke test, and always prints the honest Seatbelt-deprecation warning (see
-[`docs/MACOS.md`](docs/MACOS.md)). No pasta helper is needed there — the egress firewall is
-kernel-level.
-
-### Running the tests
-
-```sh
-ctest --test-dir build --output-on-failure
-```
-
-CMake compiles the platform-appropriate suites (the bwrap/seccomp tests on Linux, the Seatbelt
-SBPL suite on macOS), and integration tests that actually invoke `bwrap` skip gracefully on
-hosts without it.
+Everything else — per-platform dependencies, manual CMake build steps, macOS specifics,
+running the tests, and packaging (Homebrew formula, AUR `PKGBUILD`, `.deb`/`.rpm` via CPack)
+— lives in [`docs/INSTALL.md`](docs/INSTALL.md). The only runtime dependency is
+[bubblewrap](https://github.com/containers/bubblewrap) on Linux; on macOS the sandbox is the
+built-in Seatbelt, so there is nothing extra to install.
 
 ---
 
@@ -566,26 +474,6 @@ and honestly disclosed.
 
 ---
 
-## Dependency: bubblewrap
-
-Raincoat does not sandbox anything itself — it builds an argument vector and hands it to
-`bwrap`. Bubblewrap must be installed and functional; `raincoat doctor` checks this. If bwrap is
-missing, Raincoat tells you how to install it and exits without running your command:
-
-```
-Error: bubblewrap / bwrap was not found.
-
-Install it with your package manager, for example:
-  Ubuntu/Debian: sudo apt install bubblewrap
-  Fedora: sudo dnf install bubblewrap
-  Arch: sudo pacman -S bubblewrap
-
-Then run:
-  raincoat doctor
-```
-
----
-
 ## Security limitations (read these)
 
 Being honest about the sharp edges:
@@ -809,68 +697,10 @@ A ready-to-edit profile lives at [`examples/browser.toml`](examples/browser.toml
 
 ## Roadmap
 
-The core sandbox implements the fake home, env scrub, generic identity/locale/timezone,
-filesystem restriction, `full`/`off` networking, and the audit log. Several items once on this
-roadmap have since shipped.
-
-**Delivered** (documented in the sections above / [`docs/EGRESS.md`](docs/EGRESS.md)):
-
-- **Curated font set** — masks `/usr/share/fonts` and re-binds only the curated Noto/DejaVu dirs,
-  so `fc-list` shows a generic set instead of your host's full font list (best-effort fallback when
-  no curated dirs exist).
-- **Minimal `/etc`** — generic `/etc/hostname`, `/etc/hosts`, and `/etc/localtime`.
-- **Machine-fingerprint masks** (value-driven; [`docs/FINGERPRINT-SYSCALLS.md`](docs/FINGERPRINT-SYSCALLS.md)) —
-  present generic CPU (`/proc/cpuinfo`), kernel (`/proc/version` + cmdline), RAM/uptime
-  (`/proc/meminfo`, `/proc/uptime`), machine-id and boot-id, and CPU count. On x86_64 the same
-  values are enforced at the **syscall level** via a seccomp user-notify supervisor
-  (`uname(2)`/`sysinfo(2)`/`sched_getaffinity(2)`), so a static/Go binary can't read the real host
-  by calling the raw syscall. DMI serials / product UUID / MAC never leak (no `/sys` mount).
-- **Neutral path remapping** ([`docs/MOUNT-REMAP.md`](docs/MOUNT-REMAP.md)) —
-  `[filesystem].remap_cwd` and `[[filesystem.mount]]` present the working directory / allow paths
-  at neutral mount points (e.g. `/work`) so the child can't read your username/layout via
-  `pwd`/`realpath`/`$PWD`.
-- **JSON audit logs** — `[audit].format = "json"` / `--audit-format json`, one structured object
-  per run alongside the human-readable format; `raincoat report` summarizes either.
-- **Tripwire / honeytoken files** — `[filesystem.tripwire]` plants inert decoy credentials in the
-  fake home.
-- **Egress bridge / endpoint indirection** — hides one upstream's URL from the child
-  ([Egress bridge](#egress-bridge-endpoint-indirection)).
-- **Isolated-netns jail** (`pasta`) — `isolate_netns = auto|on|off|strict`; fixes the
-  `/proc/net/tcp` upstream leak and hides other host-loopback services, and `strict` blocks general
-  internet for a real bridge-only egress firewall.
-- **Guarded proxy / domain firewall** — `[network_policy]` host allow/block + metadata-IP blocking,
-  a real domain-level egress firewall when composed with the strict jail
-  ([Network policy](#network-policy-guarded-proxy)).
-- **Browser isolation** (best-effort) — `[browser]` throwaway profile + generic PATH launch shims
-  ([Browser isolation](#browser-isolation-browser)).
-- **Per-job profile templates** — the [`examples/`](examples/) directory (strict, paranoid,
-  ai-agent, node-build, python-tool, egress, api-agent, guarded, browser).
-- **macOS best-effort mode** — a reduced-guarantee Seatbelt
-  backend behind the platform seam: in-process `sandbox_init` deny-based filtering + a fail-closed
-  per-run pre-flight probe, a kernel egress firewall, a best-effort **DYLD identity/fingerprint
-  interposer** (hostname/username/CPU/kernel/RAM for non-hardened targets), and honest `[-]` gaps (no
-  font/`/etc` masking). Full honest write-up in [`docs/MACOS.md`](docs/MACOS.md).
-
-**Still ahead / genuine non-goals:**
-
-- **Windows** — a non-goal; there is no bubblewrap/Seatbelt equivalent Raincoat targets.
-- **Interactive "ask" mode** — prompt before granting access at run time (reserved as `ask` in the
-  `NetMode` enum). Not implemented.
-- **General CIDR / allowlist egress firewall** — the guarded proxy is name-based, not CIDR, and the
-  strict jail is bridge-only; an arbitrary per-destination allow-list beyond those is future.
-  Also: `--map-host-loopback` on newer `pasta`, **transparent interception** of non-proxy-aware
-  clients without the jail, and an explicit MITM mode (off by default).
-- **DNS policy** — `[dns]` is parsed and reserved but not enforced.
-- **Deep anti-fingerprinting** — canvas/WebGL/audio/font-metrics/TLS-JA3 normalization would need
-  an instrumented browser build, not a launch shim. Explicit non-goal for the browser layer.
-- **uid/gid remap** — the numeric uid/gid stay visible (identity is masked via
-  username/hostname/HOME, not the uid); this also leaves `uid=` in `/proc/self/mountinfo`. Would
-  need bwrap `--unshare-user` mapping, with its own ownership tradeoffs.
-- **Remaining fingerprint vectors** ([`docs/FINGERPRINT-SYSCALLS.md`](docs/FINGERPRINT-SYSCALLS.md)
-  has the full roadmap) — `/proc/self/mountinfo` and `/proc/stat` have no clean mechanism
-  (per-reader `self` indirection / live counters); CPU **instructions** (`CPUID`/`RDTSC`) can't be
-  faked without a VM (Tier-3 non-goal); and macOS (`DYLD_INSERT_LIBRARIES`) / Windows (API hooks)
-  interposers are separate efforts.
+What has shipped (curated fonts, fingerprint masks + seccomp syscall enforcement, neutral
+path remapping, egress bridge + netns jail, guarded proxy, browser isolation, the macOS
+backend) and what is still ahead or a deliberate non-goal (Windows, deep anti-fingerprinting,
+uid/gid remap, DNS policy, ...) is tracked in [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ---
 
