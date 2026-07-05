@@ -122,7 +122,10 @@ struct LaunchInputs {
 
     // macOS / Seatbelt-only inputs (unused by the Linux backend). All realpath-resolved.
     std::string              real_home;          // host $HOME to hide (deny subtree)
-    std::vector<std::string> fs_deny_resolved;   // [filesystem].deny, realpath'd
+    std::vector<std::string> fs_deny_resolved;   // [filesystem].deny, realpath'd (deny wins over re-allows)
+    std::vector<std::string> fs_deny_early;      // denies emitted BEFORE the sandbox re-allows, so a
+                                                 // broad deny (host /tmp, Darwin TEMP) can coexist with the
+                                                 // sandbox scratch dirs nested under it (re-allows win)
     std::string              profile_path;        // where the runner will write the .sb
     std::vector<int>         allow_loopback_ports;// proxy + egress-bridge child ports for the firewall
     std::string              interpose_dylib;     // macOS: re-allow reading the injected interposer

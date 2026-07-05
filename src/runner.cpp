@@ -1219,7 +1219,11 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // upstream (redact_upstreams_in_audit=false) the child could read the upstream out
     // of the audit file. We force upstream redaction in that case (below) and disclose
     // it here rather than leak silently under this double opt-out.
+    // On a Filter backend the audit dir is denied unconditionally (see li.audit_mask_dir
+    // below), so it is never child-reachable — these mount-model tests apply only to the
+    // structural (bwrap) backend.
     const bool audit_child_reachable =
+        caps.fs_hiding != FsHiding::Filter &&
         mask_dir.empty() && audit_dir_child_writable(cfg.audit_log_path, mounts);
     // The egress upstream leak is about the child READING the on-disk audit "start"
     // block (written before the fork), which a READ-ONLY mount permits just as well as a
@@ -1229,6 +1233,7 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     // the broader readability test for the egress redaction decision so the real upstream
     // can never be read out of the audit regardless of the mount's read/write mode.
     const bool audit_child_readable =
+        caps.fs_hiding != FsHiding::Filter &&
         mask_dir.empty() && audit_dir_child_readable(cfg.audit_log_path, mounts);
     if (audit_child_reachable) {
         if (!warning.empty()) warning += "\n";
@@ -1436,7 +1441,18 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     li.sandbox_tmp = sandbox_tmp;
     li.bind_resolv_conf = binds_resolv_conf(cfg.net);
     li.font_dir = font.dir;
-    li.audit_mask_dir = mask_dir;
+    // Filter backend (macOS): allow-default makes the audit dir reachable regardless of the
+    // mount model, so masking only when a RW mount covers it (mask_dir) would leave it child-
+    // forgeable otherwise. Always deny the audit-log's PARENT dir so the log is tamper-proof
+    // every run; the generator emits this deny after the re-allows, so it wins. Structural
+    // (bwrap) backend keeps the mount-conditional mask_dir (tmpfs mask / structural absence).
+    std::string audit_deny_dir = mask_dir;
+    if (caps.fs_hiding == FsHiding::Filter && !cfg.audit_log_path.empty()) {
+        auto slash = cfg.audit_log_path.find_last_of('/');
+        if (slash != std::string::npos && slash > 0)
+            audit_deny_dir = cfg.audit_log_path.substr(0, slash);
+    }
+    li.audit_mask_dir = audit_deny_dir;
     li.sandbox_out = sandbox_out;
     li.mask_empty_file = mask_empty_file;
     li.mask_files = mask_files;
@@ -1570,8 +1586,16 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
             " path(s) never mounted)");
     }
     if (cfg.ext.fs_deny_by_default.value_or(false)) {
-        rec.active_policy_notes.push_back(
-            "filesystem deny-by-default: the working directory is not auto-mounted");
+        if (caps.fs_hiding == FsHiding::Filter) {
+            rec.active_policy_notes.push_back(
+                "filesystem deny-by-default: the working directory is not auto-mounted, but on "
+                "this backend (allow-default filter) the rest of the host filesystem stays "
+                "reachable -- only [filesystem].deny paths + the real home are withheld. This "
+                "is NOT the structural whitelist the Linux backend gives; add explicit denies.");
+        } else {
+            rec.active_policy_notes.push_back(
+                "filesystem deny-by-default: the working directory is not auto-mounted");
+        }
     }
     {
         // Backend overrides relative to the safe defaults (BackendConfig defaults).
@@ -1609,6 +1633,14 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
                 if (i) note += ", ";
                 note += flags[i];
             }
+            // These are Linux-namespace / bwrap-mechanism toggles. The Seatbelt backend has no
+            // namespaces or bind mounts, so disclose that they are not enforced here (it does
+            // forward SIGINT/SIGTERM to the child, but gives no PID/IPC/user/cgroup isolation,
+            // no minimal /dev, and no PID-death kill on a raincoat crash).
+            if (caps.fs_hiding == FsHiding::Filter)
+                note +=
+                    " (Linux-mechanism toggles; NOT enforced by the Seatbelt backend -- no "
+                    "namespace isolation and the child is orphaned if raincoat is SIGKILLed)";
             rec.active_policy_notes.push_back(note);
         }
     }
@@ -1691,6 +1723,14 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         rec.active_policy_notes.push_back(
             "/proc/sys/kernel/random/boot_id masked with a constant (per-boot correlation ID).");
     }
+    // Disclose fingerprint knobs that have no route on this backend (honesty: a set value that
+    // silently does nothing is worse than a clear "ignored"). kernel_cmdline has no macOS analog
+    // (no /proc/cmdline); machine_id/boot_id/uptime/cpu_* ARE wired to the DYLD interposer.
+    if (cfg.ext.backend.kernel_cmdline && caps.fs_hiding == FsHiding::Filter) {
+        rec.active_policy_notes.push_back(
+            "kernel_cmdline is set but has no macOS analog (there is no /proc/cmdline) and is "
+            "ignored on this backend.");
+    }
     const bool cfg_want_uname =
         cfg.ext.backend.kernel_osrelease.has_value() || cfg.ext.backend.kernel_version.has_value();
     const bool cfg_want_sysinfo =
@@ -1702,15 +1742,21 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         if (cfg_want_uname) add_which("uname(2)");
         if (cfg_want_sysinfo) add_which("sysinfo(2)");
         if (cfg_want_affinity) add_which("sched_getaffinity(2)");
-        bool active = false;
+        bool linux_active = false;
 #ifdef __linux__
-        active = id_hook;
+        linux_active = id_hook;
 #endif
-        if (active) {
+        if (linux_active) {
             rec.active_policy_notes.push_back(
                 which + " syscall(s) faked via a seccomp user-notify supervisor: even a "
                 "static/Go binary issuing the raw syscall gets the generic identity, matching "
                 "the /proc masks.");
+        } else if (caps.supports_dyld_interpose) {
+            rec.active_policy_notes.push_back(
+                which + " faked at the libc layer via the DYLD identity interposer "
+                "(uname/sysctl). Best-effort: injectable non-hardened targets only — a static "
+                "binary or a raw sysctl/Mach-trap caller bypasses it, as there is no seccomp "
+                "backstop on this backend.");
         } else {
             rec.active_policy_notes.push_back(
                 which + " syscall mask requested but not active on this run (unsupported on "

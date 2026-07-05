@@ -41,11 +41,20 @@ std::string canon_parent_join(const std::string& p) {
 }
 
 // The per-user Darwin cache dir (/private/var/folders/.../C/) holds app caches/credentials
-// and is NOT under $HOME, so the home deny misses it. (We deliberately do NOT deny the
-// Darwin TEMP dir — the sandbox itself lives under it.)
+// and is NOT under $HOME, so the home deny misses it.
 std::string darwin_cache_dir() {
     char buf[1024];
     size_t n = ::confstr(_CS_DARWIN_USER_CACHE_DIR, buf, sizeof(buf));
+    if (n == 0 || n > sizeof(buf)) return std::string();
+    return canon_or(std::string(buf));
+}
+
+// The per-user Darwin TEMP dir (/private/var/folders/.../T/) — other apps' scratch + the
+// host's sibling temp files. The sandbox's OWN scratch lives under it, so this must be an
+// EARLY deny (the sandbox re-allows nested under it win by last-match-wins), never a late one.
+std::string darwin_temp_dir() {
+    char buf[1024];
+    size_t n = ::confstr(_CS_DARWIN_USER_TEMP_DIR, buf, sizeof(buf));
     if (n == 0 || n > sizeof(buf)) return std::string();
     return canon_or(std::string(buf));
 }
@@ -132,6 +141,18 @@ std::optional<LaunchPlan> backend_build_launch(const LaunchInputs& in, std::stri
     std::string cache = darwin_cache_dir();
     if (!cache.empty()) c.fs_deny_resolved.push_back(cache);
 
+    // mount_tmpfs_tmp (default true): Linux gives the child a private tmpfs /tmp. macOS has no
+    // bind, so instead deny the host's shared temp dirs — the classic /private/tmp AND the
+    // per-user Darwin TEMP dir — as EARLY denies (before the sandbox re-allows), so the child's
+    // OWN scratch (sandbox_tmp/out under the Darwin TEMP dir) survives while sibling temp files
+    // stay hidden. The child's TMPDIR already points at its private scratch.
+    c.fs_deny_early.clear();
+    if (in.cfg->ext.backend.mount_tmpfs_tmp) {
+        c.fs_deny_early.push_back("/private/tmp");
+        std::string tmp = darwin_temp_dir();
+        if (!tmp.empty()) c.fs_deny_early.push_back(tmp);
+    }
+
     // A local Config with a canonical workdir (the generator reads cfg->workdir/strict/net).
     Config cfgc = *in.cfg;
     cfgc.workdir = canon_or(in.cfg->workdir);
@@ -166,16 +187,27 @@ std::optional<LaunchPlan> backend_build_launch(const LaunchInputs& in, std::stri
     // setting our OWN controlled value here is deliberate and wins over the scrub.
     if (!dylib.empty()) {
         const BackendConfig& bk = in.cfg->ext.backend;
+        // Source the identity fakes from the child's ACTUAL resolved env (HOME/USER/HOSTNAME),
+        // so the interposer's getpwuid/getlogin/gethostname can never disagree with $HOME/$USER/
+        // $HOSTNAME — a mismatch is itself a fingerprint. Fall back to the config/defaults.
+        auto env_or = [&](const char* k, const std::string& fb) -> std::string {
+            auto it = plan.child_env.find(k);
+            return (it != plan.child_env.end() && !it->second.empty()) ? it->second : fb;
+        };
         plan.child_env["DYLD_INSERT_LIBRARIES"] = dylib;
-        plan.child_env["RC_FAKE_HOSTNAME"] = in.cfg->ext.hostname.value_or("sandbox");
-        plan.child_env["RC_FAKE_USER"] = in.cfg->ext.username.value_or("user");
-        plan.child_env["RC_FAKE_HOME"] = c.fake_home;
+        plan.child_env["RC_FAKE_HOSTNAME"] = env_or("HOSTNAME", in.cfg->ext.hostname.value_or("sandbox"));
+        plan.child_env["RC_FAKE_USER"] = env_or("USER", in.cfg->ext.username.value_or("user"));
+        plan.child_env["RC_FAKE_HOME"] = env_or("HOME", c.fake_home);
         if (bk.kernel_osrelease) plan.child_env["RC_FAKE_OSRELEASE"] = *bk.kernel_osrelease;
         if (bk.kernel_version) plan.child_env["RC_FAKE_OSVERSION"] = *bk.kernel_version;
         if (bk.cpu_model_name) plan.child_env["RC_FAKE_CPU_BRAND"] = *bk.cpu_model_name;
+        if (bk.cpu_vendor_id) plan.child_env["RC_FAKE_CPU_VENDOR"] = *bk.cpu_vendor_id;
         if (bk.mem_total_kb)
             plan.child_env["RC_FAKE_MEMSIZE"] = std::to_string(*bk.mem_total_kb * 1024ull);
         if (bk.cpu_count) plan.child_env["RC_FAKE_NCPU"] = std::to_string(*bk.cpu_count);
+        if (bk.machine_id) plan.child_env["RC_FAKE_HOSTUUID"] = *bk.machine_id;
+        if (bk.boot_id) plan.child_env["RC_FAKE_BOOTUUID"] = *bk.boot_id;
+        if (bk.uptime_seconds) plan.child_env["RC_FAKE_UPTIME"] = std::to_string(*bk.uptime_seconds);
     }
     return plan;
 }

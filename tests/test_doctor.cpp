@@ -456,13 +456,18 @@ TEST(Doctor, MacRunDoctorUsableWithWarnNotes) {
     EXPECT_TRUE(r.smoke_ok) << "SBPL smoke test should pass on a functional macOS host";
     EXPECT_TRUE(r.usable());
 
-    bool has_warn = false, has_kernel = false;
+    // The deprecation WARN + kernel-egress INFO are ALWAYS-ON banner lines rendered by
+    // format_doctor(); they are deliberately NOT pushed into r.notes (that would double-print
+    // them under "Notes:"). Assert they appear exactly once in the formatted output.
+    const std::string out = format_doctor(r);
+    EXPECT_TRUE(icontains(out, "deprecated"))
+        << "the deprecation WARN must always be present, even on PASS";
+    EXPECT_TRUE(icontains(out, "kernel"))
+        << "the kernel-level egress firewall note should be present";
+    // And NOT duplicated in the notes section.
     for (const auto& n : r.notes) {
-        if (icontains(n, "deprecated")) has_warn = true;
-        if (icontains(n, "kernel")) has_kernel = true;
+        EXPECT_FALSE(icontains(n, "deprecated")) << "deprecation WARN must not be a note (banner only)";
     }
-    EXPECT_TRUE(has_warn) << "the deprecation WARN must always be present, even on PASS";
-    EXPECT_TRUE(has_kernel) << "the kernel-level egress firewall note should be present";
 }
 
 // find_bwrap() searches PATH for a literal `bwrap` and must not spuriously match

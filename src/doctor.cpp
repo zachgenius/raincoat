@@ -232,17 +232,9 @@ DoctorReport run_doctor() {
         }
     }
 
-    // ALWAYS emit the honest deprecation warning — even on PASS. Seatbelt still works
-    // today but Apple has deprecated it with no supported replacement for wrapping
-    // arbitrary CLIs (App Sandbox requires an app bundle + entitlements + code signing).
-    r.notes.push_back(
-        "[WARN] Seatbelt / sandbox-exec is Apple-DEPRECATED. It works today but has no "
-        "supported replacement for wrapping arbitrary CLIs (App Sandbox needs a bundle + "
-        "entitlements + code signing); Raincoat's macOS backend is best-effort. See "
-        "docs/MACOS.md.");
-    r.notes.push_back(
-        "The egress firewall on macOS is kernel-level (Seatbelt (deny network*) + allow "
-        "only the loopback proxy port); no pasta/slirp4netns helper is needed.");
+    // NB: the always-on deprecation [WARN] + kernel-egress [INFO] lines are rendered as fixed
+    // lines by format_doctor(); they are deliberately NOT pushed into r.notes here (that would
+    // print them twice — once as the banner, once under "Notes:").
 
     return r;
 }

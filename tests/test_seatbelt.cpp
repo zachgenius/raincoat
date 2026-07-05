@@ -194,6 +194,39 @@ TEST(Seatbelt, NonStrictProfileShape) {
         p, "(deny file-read* (literal \"/private/tmp/raincoat.sb\"))")) << p;
 }
 
+// An RO mount must be genuinely read-only under (allow default): read allowed AND writes
+// explicitly denied, with the write-deny emitted AFTER every RW allow so an --allow-read
+// subdir of an auto-mounted RW cwd stays read-only (Linux gives each its own mount point).
+TEST(Seatbelt, ReadOnlyMountDeniesWrite) {
+    Fixture f;
+    f.in.mounts = {
+        {"/data/ro", "/data/ro", MountMode::ReadOnly},
+        {"/data/rw", "/data/rw", MountMode::ReadWrite},
+    };
+    std::string err;
+    std::string p = f.build(err);
+    ASSERT_TRUE(err.empty()) << err;
+    EXPECT_TRUE(contains(p, "(allow file-read* (subpath \"/data/ro\"))")) << p;
+    EXPECT_TRUE(contains(p, "(deny file-write* (subpath \"/data/ro\"))")) << p;
+    // The RO write-deny must come AFTER the RW allow (so a broad RW mount cannot re-grant it).
+    EXPECT_LT(p.find("(allow file-read* file-write* (subpath \"/data/rw\"))"),
+              p.find("(deny file-write* (subpath \"/data/ro\"))")) << p;
+}
+
+// fs_deny_early is emitted BEFORE the sandbox re-allows, so a broad temp deny (host /tmp,
+// Darwin TEMP) coexists with the scratch dirs nested under it (the re-allows win).
+TEST(Seatbelt, EarlyDenyPrecedesSandboxReAllows) {
+    Fixture f;
+    f.in.fs_deny_early = {"/private/tmp"};
+    std::string err;
+    std::string p = f.build(err);
+    ASSERT_TRUE(err.empty()) << err;
+    EXPECT_TRUE(contains(p, "(deny file-read* file-write* (subpath \"/private/tmp\"))")) << p;
+    // Early deny precedes the sandbox_tmp re-allow (which lives under it and must win).
+    EXPECT_LT(p.find("(deny file-read* file-write* (subpath \"/private/tmp\"))"),
+              p.find("(allow file-read* file-write* (subpath \"/private/tmp/raincoat.tmp\")")) << p;
+}
+
 // The effective working directory is re-allowed when it is NOT already covered.
 TEST(Seatbelt, WorkdirAllowedWhenNotCovered) {
     Fixture f;  // workdir = /Users/tester/project, no mounts

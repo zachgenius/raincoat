@@ -19,7 +19,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sysctl.h>
+#include <sys/time.h>
 #include <sys/utsname.h>
+#include <time.h>
 #include <unistd.h>
 
 #define DYLD_INTERPOSE(_repl, _orig)                                                    \
@@ -94,6 +96,28 @@ DYLD_INTERPOSE(rc_getpwuid, getpwuid)
 static struct passwd* rc_getpwnam(const char* n) { return rc_fix_pw(getpwnam(n)); }
 DYLD_INTERPOSE(rc_getpwnam, getpwnam)
 
+// ---- gethostuuid (per-install hardware UUID) ----------------------------------------
+// Parse a hex string (dashes/other separators ignored) into up to 16 bytes.
+static void rc_parse_hex16(const char* s, unsigned char out[16]) {
+    memset(out, 0, 16);
+    int n = 0, hi = -1;
+    for (const char* p = s; *p && n < 16; ++p) {
+        int v;
+        if (*p >= '0' && *p <= '9') v = *p - '0';
+        else if (*p >= 'a' && *p <= 'f') v = *p - 'a' + 10;
+        else if (*p >= 'A' && *p <= 'F') v = *p - 'A' + 10;
+        else continue;
+        if (hi < 0) { hi = v; } else { out[n++] = (unsigned char)((hi << 4) | v); hi = -1; }
+    }
+}
+static int rc_gethostuuid(unsigned char* id, const struct timespec* wait) {
+    const char* v = rc_env("RC_FAKE_HOSTUUID");
+    if (!v) return gethostuuid(id, wait);
+    rc_parse_hex16(v, id);
+    return 0;
+}
+DYLD_INTERPOSE(rc_gethostuuid, gethostuuid)
+
 // ---- sysctlbyname (kern.hostname, CPU brand, kernel, RAM) ----------------------------
 // Return a fake string for a name when RC_FAKE_* is set, honoring the two-call
 // size-probe/read protocol (oldp==NULL just reports the length). Fall through otherwise.
@@ -147,6 +171,29 @@ static int rc_sysctlbyname(const char* name, void* oldp, size_t* oldlenp, void* 
             return rc_return_str(v, oldp, oldlenp);
         if (strcmp(name, "machdep.cpu.brand_string") == 0 && (v = rc_env("RC_FAKE_CPU_BRAND")))
             return rc_return_str(v, oldp, oldlenp);
+        if (strcmp(name, "machdep.cpu.vendor") == 0 && (v = rc_env("RC_FAKE_CPU_VENDOR")))
+            return rc_return_str(v, oldp, oldlenp);
+        if (strcmp(name, "kern.uuid") == 0 && (v = rc_env("RC_FAKE_HOSTUUID")))
+            return rc_return_str(v, oldp, oldlenp);
+        if (strcmp(name, "kern.bootsessionuuid") == 0 && (v = rc_env("RC_FAKE_BOOTUUID")))
+            return rc_return_str(v, oldp, oldlenp);
+        // kern.boottime is a struct timeval; derive it from the requested uptime so
+        // (now - boottime) == uptime, keeping /usr/bin/uptime and sysctl consistent.
+        if (strcmp(name, "kern.boottime") == 0 && (v = rc_env("RC_FAKE_UPTIME"))) {
+            struct timeval bt;
+            bt.tv_sec = time(NULL) - (time_t)strtoll(v, NULL, 10);
+            bt.tv_usec = 0;
+            if (oldlenp && !oldp) {
+                *oldlenp = sizeof(bt);
+                return 0;
+            }
+            if (oldp && oldlenp && *oldlenp >= sizeof(bt)) {
+                memcpy(oldp, &bt, sizeof(bt));
+                *oldlenp = sizeof(bt);
+                return 0;
+            }
+            return 0;
+        }
         if (strcmp(name, "kern.osrelease") == 0 && (v = rc_env("RC_FAKE_OSRELEASE")))
             return rc_return_str(v, oldp, oldlenp);
         if (strcmp(name, "kern.osversion") == 0 && (v = rc_env("RC_FAKE_OSVERSION")))

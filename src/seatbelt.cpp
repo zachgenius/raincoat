@@ -56,9 +56,10 @@ std::string build_seatbelt_profile(const LaunchInputs& in, std::string& err) {
     // which is why the runner runs a fail-closed pre-flight probe. See docs/MACOS.md.
     os << "(allow default)\n";
     if (cfg.strict) {
-        os << "; strict: allow-default + EXPANDED denies + no cwd auto-grant. This is NOT\n"
+        os << "; strict: allow-default + no cwd auto-grant (the working dir is NOT auto-\n"
+              "; exposed). The deny set is otherwise the same as non-strict. This is NOT\n"
               "; kernel default-deny (a bare (deny default) cannot even load libSystem on\n"
-              "; macOS); it is honest expanded denial. See docs/MACOS.md.\n";
+              "; macOS); the honest posture is disclosed in the audit. See docs/MACOS.md.\n";
     }
 
     // --- (1) Hide the real home + block username enumeration ---
@@ -72,6 +73,16 @@ std::string build_seatbelt_profile(const LaunchInputs& in, std::string& err) {
     // Deny READ of /Users so `ls /Users` cannot enumerate the real username; specific
     // subpaths (workdir, mounts) are RE-ALLOWED below and win by last-match-wins.
     os << "(deny file-read* (subpath \"/Users\"))\n";
+
+    // --- (1b) Broad early denies (host /tmp, Darwin per-user TEMP) emitted BEFORE the
+    // sandbox re-allows, so the sandbox scratch dirs nested under the Darwin TEMP dir survive
+    // (step 2 re-allows win by last-match-wins) while the rest of that tree stays hidden. ---
+    for (const std::string& d : in.fs_deny_early) {
+        if (!emit_subpath(os, "(deny file-read* file-write*", d, ok)) {
+            err = "seatbelt: unrepresentable fs_deny_early path";
+            return std::string();
+        }
+    }
 
     // --- (2) Re-allow the sandbox-private writable areas ---
     if (!emit_subpath(os, "(allow file-read* file-write*", in.fake_home, ok) ||
@@ -94,13 +105,25 @@ std::string build_seatbelt_profile(const LaunchInputs& in, std::string& err) {
         return std::string();
     }
 
-    // --- (4) Re-allow each user mount (RO -> read; RW -> read+write). (subpath ...) is
-    // correct for both files and dirs, so no filesystem probe is needed here. ---
+    // --- (4) Re-allow each user mount, in two passes so ordering is correct under the filter
+    // model. Pass 1: RW mounts (read+write). Pass 2: RO mounts — read allowed AND writes
+    // explicitly DENIED. Under (allow default) a bare read-allow would leave the path WRITABLE
+    // (unlike Linux --ro-bind = EROFS); and Linux gives each mount its own mount point, so an
+    // --allow-read subdir of an auto-mounted RW cwd stays read-only. To mirror that, the RO
+    // write-denies are emitted AFTER every RW allow, so an explicit --allow-read wins even when
+    // a broader RW mount (the cwd auto-mount) contains it. The fs-deny set below still wins over
+    // both. (subpath ...) is correct for files and dirs. ---
     for (const Mount& m : in.mounts) {
-        const char* rule = (m.mode == MountMode::ReadWrite)
-                               ? "(allow file-read* file-write*"
-                               : "(allow file-read*";
-        if (!emit_subpath(os, rule, m.host_path, ok)) {
+        if (m.mode == MountMode::ReadWrite &&
+            !emit_subpath(os, "(allow file-read* file-write*", m.host_path, ok)) {
+            err = "seatbelt: unrepresentable mount path";
+            return std::string();
+        }
+    }
+    for (const Mount& m : in.mounts) {
+        if (m.mode != MountMode::ReadWrite &&
+            (!emit_subpath(os, "(allow file-read*", m.host_path, ok) ||
+             !emit_subpath(os, "(deny file-write*", m.host_path, ok))) {
             err = "seatbelt: unrepresentable mount path";
             return std::string();
         }
