@@ -35,7 +35,8 @@ std::vector<std::string> build_bwrap_argv(const std::string& bwrap_path, const C
                                           const std::vector<std::string>& curated_font_dirs,
                                           bool mask_usr_local_fonts,
                                           const std::vector<std::pair<std::string, std::string>>&
-                                              proc_overlays) {
+                                              proc_overlays,
+                                          const std::string& command_exec_path) {
     std::vector<std::string> a;
     auto p1 = [&](const std::string& x) { a.push_back(x); };
     auto p2 = [&](const std::string& x, const std::string& y) {
@@ -176,9 +177,20 @@ std::vector<std::string> build_bwrap_argv(const std::string& bwrap_path, const C
     p1("--clearenv");
     for (const auto& kv : env.resolved) p3("--setenv", kv.first, kv.second);
 
+    // Expose the command's OWN binary when it lives outside the always-mounted /usr tree (e.g.
+    // a tool under ~/.local/bin): ro-bind it and exec it by absolute path, since bwrap's
+    // in-namespace PATH search can't reach a dir that was never mounted. Under /usr it is
+    // already visible (--ro-bind /usr above), so leave those runs byte-for-byte unchanged. The
+    // wrapped command must be runnable by definition — the sandbox hides your data, not the tool.
+    const bool expose_cmd =
+        !command_exec_path.empty() && command_exec_path.rfind("/usr/", 0) != 0;
+    if (expose_cmd) p3("--ro-bind-try", command_exec_path, command_exec_path);
+
     // Working directory, then the target command tokens last.
     p2("--chdir", cfg.workdir);
-    for (const auto& tok : cfg.command) p1(tok);
+    for (std::size_t i = 0; i < cfg.command.size(); ++i) {
+        p1((i == 0 && expose_cmd) ? command_exec_path : cfg.command[i]);
+    }
 
     return a;
 }

@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 # C is enabled for the macOS interposer dylib (src/rc_interpose.c); harmless on Linux.
-project(raincoat CXX C)
+# VERSION must match kVersion in src/main.cpp.
+project(raincoat VERSION 0.1.0 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -64,6 +65,36 @@ if(APPLE)
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
   add_dependencies(raincoat rc_interpose)
 endif()
+
+# ---------------------------------------------------------------------------
+# Install + packaging (CPack)
+# ---------------------------------------------------------------------------
+include(GNUInstallDirs)
+install(TARGETS raincoat RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+if(APPLE)
+  # The runner looks for the interposer next to its own binary first (dev builds), then at
+  # ../lib/raincoat/ relative to the binary (installed layout) — see interpose_dylib_path().
+  install(FILES "${CMAKE_BINARY_DIR}/rc_interpose.dylib"
+          DESTINATION ${CMAKE_INSTALL_LIBDIR}/raincoat)
+endif()
+
+set(CPACK_PACKAGE_NAME "raincoat")
+set(CPACK_PACKAGE_VENDOR "zachgenius")
+set(CPACK_PACKAGE_CONTACT "https://github.com/zachgenius/raincoat")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
+    "Lightweight privacy sandbox for nosy CLI tools and AI agents")
+set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/zachgenius/raincoat")
+set(CPACK_RESOURCE_FILE_README "${CMAKE_SOURCE_DIR}/README.md")
+set(CPACK_STRIP_FILES TRUE)
+# Debian: resolve libssl/libc automatically; bubblewrap is the hard runtime dep, pasta optional.
+set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+set(CPACK_DEBIAN_PACKAGE_DEPENDS "bubblewrap")
+set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "passt")
+set(CPACK_DEBIAN_PACKAGE_SECTION "utils")
+set(CPACK_RPM_PACKAGE_REQUIRES "bubblewrap")
+set(CPACK_RPM_PACKAGE_SUGGESTS "passt")
+set(CPACK_RPM_PACKAGE_LICENSE "GPL-3.0-or-later")
+include(CPack)
 
 # ---------------------------------------------------------------------------
 # Tests (GoogleTest)

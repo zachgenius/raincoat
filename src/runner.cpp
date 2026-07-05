@@ -416,6 +416,42 @@ Config resolve_config(const CliInvocation& inv,
     return cfg;
 }
 
+// Resolve the command's OWN executable to an absolute realpath, host-side (the supervisor is
+// not yet sandboxed), so the backend can expose it: a bare name is looked up on the CHILD's
+// PATH; a path is realpath'd (following symlinks). Returns "" if it can't be resolved, in which
+// case the backend falls back to the existing PATH-search-at-exec behavior. This is what makes
+// `raincoat -- foo` work when `foo` lives under a hidden dir (e.g. ~/.local/bin/foo).
+static std::string resolve_command_exec_path(const std::vector<std::string>& command,
+                                             const std::map<std::string, std::string>& child_env) {
+    if (command.empty() || command[0].empty()) return std::string();
+    const std::string& c0 = command[0];
+    if (c0.find('/') != std::string::npos) {
+        return canonicalize(c0).value_or(std::string());
+    }
+    std::string path;
+    auto it = child_env.find("PATH");
+    if (it != child_env.end()) {
+        path = it->second;
+    } else if (const char* p = std::getenv("PATH")) {
+        path = p;
+    }
+    std::size_t start = 0;
+    while (true) {
+        std::size_t colon = path.find(':', start);
+        std::string dir =
+            path.substr(start, colon == std::string::npos ? std::string::npos : colon - start);
+        if (!dir.empty()) {
+            std::string cand = dir + "/" + c0;
+            if (::access(cand.c_str(), X_OK) == 0) {
+                return canonicalize(cand).value_or(cand);
+            }
+        }
+        if (colon == std::string::npos) break;
+        start = colon + 1;
+    }
+    return std::string();
+}
+
 int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         const std::string& cwd, const std::string& assets_dir, std::string& err) {
     err.clear();
@@ -1479,6 +1515,9 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
     }
     li.profile_path = root + "/rc-seatbelt.sb";
     if (mac_kernel_firewall) li.allow_loopback_ports = jail_forward_ports;
+    // Resolve the wrapped command's own binary so the backend can expose it even if it lives
+    // under a hidden path (~/.local/bin, /opt, ...). Uses the CHILD's PATH (env.resolved).
+    li.command_exec_path = resolve_command_exec_path(cfg.command, env.resolved);
 
     std::optional<LaunchPlan> plan = backend_build_launch(li, err);
     if (!plan.has_value()) {
@@ -1747,9 +1786,13 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         if (cfg_want_uname) add_which("uname(2)");
         if (cfg_want_sysinfo) add_which("sysinfo(2)");
         if (cfg_want_affinity) add_which("sched_getaffinity(2)");
+        // Mirrors the id_hook gate computed just before fork(): the audit start record is
+        // written before that point, so predict from the same capability checks. (A later
+        // socketpair/listener setup failure downgrades silently — best-effort, as disclosed
+        // in the "not active" branch below.)
         bool linux_active = false;
 #ifdef __linux__
-        linux_active = id_hook;
+        linux_active = caps.supports_seccomp_identity && seccomp_identity_supported();
 #endif
         if (linux_active) {
             rec.active_policy_notes.push_back(
@@ -1998,7 +2041,10 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
                     _exit(127);
                 }
                 *_NSGetEnviron() = envp.data();
-                ::execvp(cargv[0], cargv.data());
+                // launch_path is the host-resolved realpath of the target (absolute → execvp
+                // won't PATH-search inside the sandbox, where the tool's dir may be hidden).
+                // Falls back to cargv[0] (old PATH-search behavior) only if resolution failed.
+                ::execvp(launch_path.empty() ? cargv[0] : launch_path.c_str(), cargv.data());
                 std::perror("raincoat: failed to exec sandboxed command");
                 _exit(127);
             }

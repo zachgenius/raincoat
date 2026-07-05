@@ -45,60 +45,144 @@ choice the default one: run the tool, but don't let it casually rifle through yo
 
 ## Install / build
 
-Raincoat is a C++17 project built with CMake. Its one runtime dependency is **bubblewrap**.
-
-### 1. Install bubblewrap
+One line, Linux or macOS:
 
 ```sh
-# Ubuntu/Debian
-sudo apt install bubblewrap
-# Fedora
-sudo dnf install bubblewrap
-# Arch
-sudo pacman -S bubblewrap
+curl -fsSL https://raw.githubusercontent.com/zachgenius/raincoat/master/install.sh | sh
 ```
 
-### 2. Build
+The script installs the build dependencies with your package manager (apt/dnf/pacman/brew),
+builds, installs to `/usr/local`, and finishes with `raincoat doctor`, which verifies the
+host can actually sandbox (bubblewrap + user namespaces on Linux; Seatbelt on macOS) — run
+it any time you want to re-check a host.
+
+Everything else — per-platform dependencies, manual CMake build steps, macOS specifics,
+running the tests, and packaging (Homebrew formula, AUR `PKGBUILD`, `.deb`/`.rpm` via CPack)
+— lives in [`docs/INSTALL.md`](docs/INSTALL.md). The only runtime dependency is
+[bubblewrap](https://github.com/containers/bubblewrap) on Linux; on macOS the sandbox is the
+built-in Seatbelt, so there is nothing extra to install.
+
+---
+
+## Example profiles
+
+Profiles are TOML. `--profile <path>` loads one; **CLI flags always override the profile.**
+`raincoat init` writes a starter `.raincoat.toml` you can edit. Ready-made, heavily-commented
+templates live in [`examples/`](examples/) — see the [index](#the-examples-directory) below. They
+use generic placeholders (no real hosts/secrets); adapt the paths and hostnames before use.
+
+### `.raincoat.toml` schema
+
+```toml
+strict  = false            # deny CWD unless explicitly allowed
+network = "full"           # "full" (host networking) or "off" (isolated)
+
+allow_read  = ["./src"]    # mounted read-only  at the same absolute path (must exist)
+allow_write = ["./out"]    # mounted read-write at the same absolute path (must exist)
+allow_env   = ["OPENAI_API_KEY"]   # copied from the parent env if present
+
+[env]                      # synthetic locale/timezone handed to the command
+TZ     = "UTC"
+LANG   = "en_US.UTF-8"
+LC_ALL = "en_US.UTF-8"
+
+[fontconfig]
+enabled = true             # curated Noto/DejaVu font-set isolation
+
+[audit]
+log_file = ".raincoat/audit.log"
+```
+
+Every path listed in `allow_read` / `allow_write` **must exist**, or Raincoat refuses to start
+with `Error: allowed path does not exist: <path>`. `set_env` is CLI-only (not read from
+profiles). Wrong-typed `strict` / `network` / `fontconfig.enabled` values are rejected rather
+than silently ignored — a silently-dropped `strict` would be a privacy downgrade. The full
+sectioned schema (identity / environment / filesystem / backend / egress / network_policy /
+browser / proxy / tripwire) is documented in
+[`docs/full-config-reference.toml`](docs/full-config-reference.toml).
+
+### The `examples/` directory
+
+Each template is heavily commented and safe to *parse*; several need you to point paths and
+hostnames at real targets first. All values are generic placeholders — **no** real
+providers/secrets/hosts.
+
+| Profile | Job | Highlights |
+|---------|-----|------------|
+| [`strict.toml`](examples/strict.toml) | Fully untrusted tool | `strict`, network off, grants nothing until you add paths. Runs as-is. |
+| [`paranoid.toml`](examples/paranoid.toml) | Maximum lockdown | `strict` + net off + deny-by-default fs + genericized identity + curated fonts + tripwire decoys + JSON audit. Runs as-is. |
+| [`ai-agent.toml`](examples/ai-agent.toml) | AI coding agent | Non-strict, project RW, network on, a couple of API keys forwarded. |
+| [`node-build.toml`](examples/node-build.toml) | npm / pnpm / yarn build | Project RO, `node_modules`/`dist` RW; optional registry allow-list. Pre-create the write dirs. |
+| [`python-tool.toml`](examples/python-tool.toml) | pip / poetry / CLI run | Project RO, `out` RW, extra env scrub; optional index allow-list. Pre-create `out`. |
+| [`egress.toml`](examples/egress.toml) | Hide one upstream's URL | Egress bridge (endpoint indirection); `isolate_netns` defaults to `auto` (URL hidden, general net retained). |
+| [`api-agent.toml`](examples/api-agent.toml) | Agent that may talk to **one** API only | Egress bridge **+ `isolate_netns = "strict"`** = real bridge-only egress firewall. Keep the profile **outside** mounted paths. Needs `pasta`. |
+| [`guarded.toml`](examples/guarded.toml) | Domain allow-list firewall | `[network_policy]` guarded proxy **+ strict jail** = real domain-level egress firewall. Needs `pasta`. |
+| [`browser.toml`](examples/browser.toml) | Playwright / Puppeteer / Selenium | Browser profile isolation + launch shims + strict egress allow-list. Needs `pasta` for the firewall. |
+
+The `api-agent`, `guarded`, and `browser` templates use `isolate_netns = "strict"`, which requires
+[`pasta`](https://passt.top/) and fails **closed** (refuses the run) if it is absent — check with
+`raincoat doctor`. Drop them to `"auto"` to accept the weaker (NAT / proxy-aware-clients-only)
+guarantee. Below are the two simplest templates in full; the rest are best read in `examples/`.
+
+### `examples/strict.toml` — fully untrusted
+
+Denies the working directory, forces network off, grants nothing until you add paths. Safe to
+run as-is (it just warns that no writable paths were allowed and falls back to the fake home).
+
+```toml
+strict  = true
+network = "off"
+
+allow_read  = []           # adjust to your project, then create the dirs
+allow_write = []
+allow_env   = []
+
+[env]
+TZ     = "UTC"
+LANG   = "en_US.UTF-8"
+LC_ALL = "en_US.UTF-8"
+
+[fontconfig]
+enabled = true
+
+[audit]
+log_file = ".raincoat/audit.log"
+```
+
+### `examples/ai-agent.toml` — AI coding agent
+
+Non-strict so the agent can edit your project, network on for model APIs, and a couple of API
+keys forwarded explicitly. `"."` resolves to the directory you launch from, so it is safe to run
+from any project.
+
+```toml
+strict  = false
+network = "full"
+
+allow_read  = ["."]        # your project (the launch directory)
+allow_write = ["."]
+
+allow_env = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]   # trim to the provider you use
+
+[env]
+TZ     = "UTC"
+LANG   = "en_US.UTF-8"
+LC_ALL = "en_US.UTF-8"
+
+[fontconfig]
+enabled = true
+
+[audit]
+log_file = ".raincoat/audit.log"
+```
+
+Run either with:
 
 ```sh
-git clone <your-fork-url> Raincoat
-cd Raincoat
-cmake -S . -B build
-cmake --build build -j
+raincoat --profile examples/strict.toml   -- true
+cd /path/to/your/project
+raincoat --profile /path/to/ai-agent.toml -- your-agent ...
 ```
-
-The binary lands at `./build/raincoat`.
-
-### 3. Check your host
-
-`raincoat doctor` verifies that everything Raincoat needs is present and working — bwrap is
-installed and executable, user namespaces are available, and a `bwrap ... true` smoke test
-succeeds. It exits non-zero if the host is unusable.
-
-```
-$ raincoat doctor
-Raincoat doctor
-===============
-  [ OK ] bubblewrap (bwrap) found: /usr/bin/bwrap
-  [ OK ] bwrap version: bubblewrap 0.11.0
-  [ OK ] user namespaces available: yes
-  [ OK ] bwrap smoke test (`bwrap ... true`): passed
-  [ OK ] egress network jail: available (pasta) /usr/bin/pasta
-
-Result: PASS — host is usable. bwrap is present and the smoke test passed.
-```
-
-The `egress network jail` line is informational, never a `[FAIL]`: if neither `pasta` nor
-`slirp4netns` is installed it reads `[INFO] … unavailable` and the egress bridge simply falls
-back to the shared host network namespace (see [Egress bridge](#egress-bridge-endpoint-indirection)).
-
-### Running the tests
-
-```sh
-ctest --test-dir build --output-on-failure
-```
-
-Integration tests that actually invoke `bwrap` skip gracefully on hosts without it.
 
 ---
 
@@ -180,6 +264,12 @@ cat: /home/you/.ssh/id_rsa: No such file or directory
 ```
 
 The fake `$HOME` is empty, and your real `~/.ssh` simply isn't there.
+
+**The tool you run is always runnable.** Hiding your home would otherwise hide the tool itself when
+it's installed there (`~/.local/bin`, a version manager, etc.). Raincoat resolves the command's own
+binary and exposes just that file (read-only) inside the sandbox — so `raincoat -- mytool` works even
+when `mytool` lives under the hidden `$HOME`, without exposing anything else. The sandbox hides your
+*data*, not the tool you asked it to run.
 
 ### Non-strict (default): the working directory is writable
 
@@ -353,7 +443,7 @@ CONSTRUCTS a fresh namespace: hidden paths simply don't exist, and a failed moun
 structural, fail-closed guarantees. This is the platform every guarantee in this README is measured
 against.
 
-**macOS is a best-effort Seatbelt backend** (in progress on the `macos-seatbelt-backend` branch).
+**macOS is a best-effort Seatbelt backend**, selected automatically when you build on macOS.
 Instead of bubblewrap it confines your command with an Apple Seatbelt profile — applied
 **in-process** (`sandbox_init`, then it `exec`s your command itself so an injected identity
 interposer survives SIP; a plain `/usr/bin/sandbox-exec` would strip it) and validated first by a
@@ -430,26 +520,6 @@ symlinking its bundled copy into `/usr/local/bin`:
 
 ---
 
-## Dependency: bubblewrap
-
-Raincoat does not sandbox anything itself — it builds an argument vector and hands it to
-`bwrap`. Bubblewrap must be installed and functional; `raincoat doctor` checks this. If bwrap is
-missing, Raincoat tells you how to install it and exits without running your command:
-
-```
-Error: bubblewrap / bwrap was not found.
-
-Install it with your package manager, for example:
-  Ubuntu/Debian: sudo apt install bubblewrap
-  Fedora: sudo dnf install bubblewrap
-  Arch: sudo pacman -S bubblewrap
-
-Then run:
-  raincoat doctor
-```
-
----
-
 ## Security limitations (read these)
 
 Being honest about the sharp edges:
@@ -509,128 +579,6 @@ Being honest about the sharp edges:
   `--set-env` are escape hatches by design. Grant the minimum the tool needs.
 - **`--net full` shares host networking.** In `full` mode the command has normal network access
   and can reach your LAN and the internet just like any local process.
-
----
-
-## Example profiles
-
-Profiles are TOML. `--profile <path>` loads one; **CLI flags always override the profile.**
-`raincoat init` writes a starter `.raincoat.toml` you can edit. Ready-made, heavily-commented
-templates live in [`examples/`](examples/) — see the [index](#the-examples-directory) below. They
-use generic placeholders (no real hosts/secrets); adapt the paths and hostnames before use.
-
-### `.raincoat.toml` schema
-
-```toml
-strict  = false            # deny CWD unless explicitly allowed
-network = "full"           # "full" (host networking) or "off" (isolated)
-
-allow_read  = ["./src"]    # mounted read-only  at the same absolute path (must exist)
-allow_write = ["./out"]    # mounted read-write at the same absolute path (must exist)
-allow_env   = ["OPENAI_API_KEY"]   # copied from the parent env if present
-
-[env]                      # synthetic locale/timezone handed to the command
-TZ     = "UTC"
-LANG   = "en_US.UTF-8"
-LC_ALL = "en_US.UTF-8"
-
-[fontconfig]
-enabled = true             # curated Noto/DejaVu font-set isolation
-
-[audit]
-log_file = ".raincoat/audit.log"
-```
-
-Every path listed in `allow_read` / `allow_write` **must exist**, or Raincoat refuses to start
-with `Error: allowed path does not exist: <path>`. `set_env` is CLI-only (not read from
-profiles). Wrong-typed `strict` / `network` / `fontconfig.enabled` values are rejected rather
-than silently ignored — a silently-dropped `strict` would be a privacy downgrade. The full
-sectioned schema (identity / environment / filesystem / backend / egress / network_policy /
-browser / proxy / tripwire) is documented in
-[`docs/full-config-reference.toml`](docs/full-config-reference.toml).
-
-### The `examples/` directory
-
-Each template is heavily commented and safe to *parse*; several need you to point paths and
-hostnames at real targets first. All values are generic placeholders — **no** real
-providers/secrets/hosts.
-
-| Profile | Job | Highlights |
-|---------|-----|------------|
-| [`strict.toml`](examples/strict.toml) | Fully untrusted tool | `strict`, network off, grants nothing until you add paths. Runs as-is. |
-| [`paranoid.toml`](examples/paranoid.toml) | Maximum lockdown | `strict` + net off + deny-by-default fs + genericized identity + curated fonts + tripwire decoys + JSON audit. Runs as-is. |
-| [`ai-agent.toml`](examples/ai-agent.toml) | AI coding agent | Non-strict, project RW, network on, a couple of API keys forwarded. |
-| [`node-build.toml`](examples/node-build.toml) | npm / pnpm / yarn build | Project RO, `node_modules`/`dist` RW; optional registry allow-list. Pre-create the write dirs. |
-| [`python-tool.toml`](examples/python-tool.toml) | pip / poetry / CLI run | Project RO, `out` RW, extra env scrub; optional index allow-list. Pre-create `out`. |
-| [`egress.toml`](examples/egress.toml) | Hide one upstream's URL | Egress bridge (endpoint indirection); `isolate_netns` defaults to `auto` (URL hidden, general net retained). |
-| [`api-agent.toml`](examples/api-agent.toml) | Agent that may talk to **one** API only | Egress bridge **+ `isolate_netns = "strict"`** = real bridge-only egress firewall. Keep the profile **outside** mounted paths. Needs `pasta`. |
-| [`guarded.toml`](examples/guarded.toml) | Domain allow-list firewall | `[network_policy]` guarded proxy **+ strict jail** = real domain-level egress firewall. Needs `pasta`. |
-| [`browser.toml`](examples/browser.toml) | Playwright / Puppeteer / Selenium | Browser profile isolation + launch shims + strict egress allow-list. Needs `pasta` for the firewall. |
-
-The `api-agent`, `guarded`, and `browser` templates use `isolate_netns = "strict"`, which requires
-[`pasta`](https://passt.top/) and fails **closed** (refuses the run) if it is absent — check with
-`raincoat doctor`. Drop them to `"auto"` to accept the weaker (NAT / proxy-aware-clients-only)
-guarantee. Below are the two simplest templates in full; the rest are best read in `examples/`.
-
-### `examples/strict.toml` — fully untrusted
-
-Denies the working directory, forces network off, grants nothing until you add paths. Safe to
-run as-is (it just warns that no writable paths were allowed and falls back to the fake home).
-
-```toml
-strict  = true
-network = "off"
-
-allow_read  = []           # adjust to your project, then create the dirs
-allow_write = []
-allow_env   = []
-
-[env]
-TZ     = "UTC"
-LANG   = "en_US.UTF-8"
-LC_ALL = "en_US.UTF-8"
-
-[fontconfig]
-enabled = true
-
-[audit]
-log_file = ".raincoat/audit.log"
-```
-
-### `examples/ai-agent.toml` — AI coding agent
-
-Non-strict so the agent can edit your project, network on for model APIs, and a couple of API
-keys forwarded explicitly. `"."` resolves to the directory you launch from, so it is safe to run
-from any project.
-
-```toml
-strict  = false
-network = "full"
-
-allow_read  = ["."]        # your project (the launch directory)
-allow_write = ["."]
-
-allow_env = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]   # trim to the provider you use
-
-[env]
-TZ     = "UTC"
-LANG   = "en_US.UTF-8"
-LC_ALL = "en_US.UTF-8"
-
-[fontconfig]
-enabled = true
-
-[audit]
-log_file = ".raincoat/audit.log"
-```
-
-Run either with:
-
-```sh
-raincoat --profile examples/strict.toml   -- true
-cd /path/to/your/project
-raincoat --profile /path/to/ai-agent.toml -- your-agent ...
-```
 
 ---
 
@@ -795,68 +743,18 @@ A ready-to-edit profile lives at [`examples/browser.toml`](examples/browser.toml
 
 ## Roadmap
 
-The core sandbox implements the fake home, env scrub, generic identity/locale/timezone,
-filesystem restriction, `full`/`off` networking, and the audit log. Several items once on this
-roadmap have since shipped.
+What has shipped (curated fonts, fingerprint masks + seccomp syscall enforcement, neutral
+path remapping, egress bridge + netns jail, guarded proxy, browser isolation, the macOS
+backend) and what is still ahead or a deliberate non-goal (Windows, deep anti-fingerprinting,
+uid/gid remap, DNS policy, ...) is tracked in [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
-**Delivered** (documented in the sections above / [`docs/EGRESS.md`](docs/EGRESS.md)):
+---
 
-- **Curated font set** — masks `/usr/share/fonts` and re-binds only the curated Noto/DejaVu dirs,
-  so `fc-list` shows a generic set instead of your host's full font list (best-effort fallback when
-  no curated dirs exist).
-- **Minimal `/etc`** — generic `/etc/hostname`, `/etc/hosts`, and `/etc/localtime`.
-- **Machine-fingerprint masks** (value-driven; [`docs/FINGERPRINT-SYSCALLS.md`](docs/FINGERPRINT-SYSCALLS.md)) —
-  present generic CPU (`/proc/cpuinfo`), kernel (`/proc/version` + cmdline), RAM/uptime
-  (`/proc/meminfo`, `/proc/uptime`), machine-id and boot-id, and CPU count. On x86_64 the same
-  values are enforced at the **syscall level** via a seccomp user-notify supervisor
-  (`uname(2)`/`sysinfo(2)`/`sched_getaffinity(2)`), so a static/Go binary can't read the real host
-  by calling the raw syscall. DMI serials / product UUID / MAC never leak (no `/sys` mount).
-- **Neutral path remapping** ([`docs/MOUNT-REMAP.md`](docs/MOUNT-REMAP.md)) —
-  `[filesystem].remap_cwd` and `[[filesystem.mount]]` present the working directory / allow paths
-  at neutral mount points (e.g. `/work`) so the child can't read your username/layout via
-  `pwd`/`realpath`/`$PWD`.
-- **JSON audit logs** — `[audit].format = "json"` / `--audit-format json`, one structured object
-  per run alongside the human-readable format; `raincoat report` summarizes either.
-- **Tripwire / honeytoken files** — `[filesystem.tripwire]` plants inert decoy credentials in the
-  fake home.
-- **Egress bridge / endpoint indirection** — hides one upstream's URL from the child
-  ([Egress bridge](#egress-bridge-endpoint-indirection)).
-- **Isolated-netns jail** (`pasta`) — `isolate_netns = auto|on|off|strict`; fixes the
-  `/proc/net/tcp` upstream leak and hides other host-loopback services, and `strict` blocks general
-  internet for a real bridge-only egress firewall.
-- **Guarded proxy / domain firewall** — `[network_policy]` host allow/block + metadata-IP blocking,
-  a real domain-level egress firewall when composed with the strict jail
-  ([Network policy](#network-policy-guarded-proxy)).
-- **Browser isolation** (best-effort) — `[browser]` throwaway profile + generic PATH launch shims
-  ([Browser isolation](#browser-isolation-browser)).
-- **Per-job profile templates** — the [`examples/`](examples/) directory (strict, paranoid,
-  ai-agent, node-build, python-tool, egress, api-agent, guarded, browser).
-- **macOS best-effort mode** (in progress on `macos-seatbelt-backend`) — a reduced-guarantee Seatbelt
-  backend behind the platform seam: in-process `sandbox_init` deny-based filtering + a fail-closed
-  per-run pre-flight probe, a kernel egress firewall, a best-effort **DYLD identity/fingerprint
-  interposer** (hostname/username/CPU/kernel/RAM for non-hardened targets), and honest `[-]` gaps (no
-  font/`/etc` masking). Full honest write-up in [`docs/MACOS.md`](docs/MACOS.md).
+## License
 
-**Still ahead / genuine non-goals:**
-
-- **Windows** — a non-goal; there is no bubblewrap/Seatbelt equivalent Raincoat targets.
-- **Interactive "ask" mode** — prompt before granting access at run time (reserved as `ask` in the
-  `NetMode` enum). Not implemented.
-- **General CIDR / allowlist egress firewall** — the guarded proxy is name-based, not CIDR, and the
-  strict jail is bridge-only; an arbitrary per-destination allow-list beyond those is future.
-  Also: `--map-host-loopback` on newer `pasta`, **transparent interception** of non-proxy-aware
-  clients without the jail, and an explicit MITM mode (off by default).
-- **DNS policy** — `[dns]` is parsed and reserved but not enforced.
-- **Deep anti-fingerprinting** — canvas/WebGL/audio/font-metrics/TLS-JA3 normalization would need
-  an instrumented browser build, not a launch shim. Explicit non-goal for the browser layer.
-- **uid/gid remap** — the numeric uid/gid stay visible (identity is masked via
-  username/hostname/HOME, not the uid); this also leaves `uid=` in `/proc/self/mountinfo`. Would
-  need bwrap `--unshare-user` mapping, with its own ownership tradeoffs.
-- **Remaining fingerprint vectors** ([`docs/FINGERPRINT-SYSCALLS.md`](docs/FINGERPRINT-SYSCALLS.md)
-  has the full roadmap) — `/proc/self/mountinfo` and `/proc/stat` have no clean mechanism
-  (per-reader `self` indirection / live counters); CPU **instructions** (`CPUID`/`RDTSC`) can't be
-  faked without a VM (Tier-3 non-goal); and macOS (`DYLD_INSERT_LIBRARIES`) / Windows (API hooks)
-  interposers are separate efforts.
+Raincoat is free software, licensed under the **GNU General Public License v3.0 or later**
+([GPL-3.0-or-later](LICENSE)). Copyright (C) 2026 zachgenius. You may run, study, share, and
+modify it; if you distribute a modified version, it must stay under the same license.
 
 ---
 
