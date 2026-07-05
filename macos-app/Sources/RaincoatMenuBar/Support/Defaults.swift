@@ -8,6 +8,7 @@ enum Defaults {
 
     private enum Key {
         static let raincoatPath = "raincoat.binaryPath"
+        static let defaultProfile = "raincoat.defaultProfile"
         static let hotKeyCode = "hotkey.keyCode"
         static let hotKeyModifiers = "hotkey.modifiers"
         static let recents = "launcher.recents"
@@ -15,8 +16,32 @@ enum Defaults {
 
     /// Optional explicit path to the `raincoat` binary, used as a final fallback by RaincoatLocator.
     static var raincoatPath: String? {
-        get { (store.string(forKey: Key.raincoatPath)?.trimmingCharacters(in: .whitespaces)).flatMap { $0.isEmpty ? nil : $0 } }
-        set { store.set(newValue, forKey: Key.raincoatPath) }
+        get { readTrimmed(Key.raincoatPath) }
+        set { writeTrimmed(newValue, forKey: Key.raincoatPath) }
+    }
+
+    /// Optional path to a raincoat profile. When set, the launcher passes `--profile <path>`
+    /// before `--`. Empty/unset omits it (raincoat uses its own default).
+    static var defaultProfilePath: String? {
+        get { readTrimmed(Key.defaultProfile) }
+        set { writeTrimmed(newValue, forKey: Key.defaultProfile) }
+    }
+
+    // Trims whitespace and treats empty as absent, so a blank text field == "not set"
+    // and the key is removed rather than left as "".
+    private static func readTrimmed(_ key: String) -> String? {
+        guard let raw = store.string(forKey: key) else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func writeTrimmed(_ value: String?, forKey key: String) {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let trimmed, !trimmed.isEmpty {
+            store.set(trimmed, forKey: key)
+        } else {
+            store.removeObject(forKey: key)
+        }
     }
 
     // Global hotkey. Default ⌥Space (Space = kVK_Space = 49, option = Carbon optionKey).

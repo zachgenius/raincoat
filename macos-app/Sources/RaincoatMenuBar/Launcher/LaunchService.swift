@@ -30,11 +30,18 @@ enum LaunchService {
 
         let process = Process()
         process.executableURL = raincoat
-        process.arguments = ["--"] + argv
+        // raincoat [--profile <p>] -- <target...>
+        process.arguments = profileArguments() + ["--"] + argv
         // Run detached; raincoat is the sandbox supervisor and owns its own lifecycle/status file.
         try process.run()
 
         Recents.add(argv.joined(separator: " "))
+    }
+
+    /// `["--profile", <path>]` when a default profile is configured, else empty.
+    static func profileArguments() -> [String] {
+        guard let profile = Defaults.defaultProfilePath else { return [] }
+        return ["--profile", profile]
     }
 
     /// The argv to hand to `raincoat --`, or nil if the item can't be resolved.

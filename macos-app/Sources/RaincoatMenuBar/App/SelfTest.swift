@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 // Headless smoke test for the read-only pipeline (RunStore + Codable + liveness).
@@ -22,5 +23,20 @@ enum SelfTest {
                 notes=\(run.notes)
             """)
         }
+    }
+
+    // Constructs the Preferences window (and exercises LoginItem / RaincoatLocator /
+    // KeyCombo) without running the event loop, to confirm nothing throws off-screen.
+    static func runPrefs() {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+
+        let controller = PreferencesWindowController(hotKeys: HotKeyManager())
+        controller.show()   // builds UI + refresh(): reads status, formats the current combo
+
+        print("preferences window constructed OK")
+        print("current hotkey: \(KeyCombo.current.displayString)")
+        print("raincoat resolved: \(RaincoatLocator.find()?.path ?? "not found")")
+        print("login: bundled=\(LoginItem.isBundled) status=\(String(describing: LoginItem.status))")
     }
 }

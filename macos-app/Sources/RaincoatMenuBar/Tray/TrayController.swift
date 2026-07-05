@@ -9,6 +9,8 @@ import Darwin
 final class TrayController: NSObject, NSMenuDelegate {
     /// Invoked when the user picks "Open Launcher…" from the menu.
     var onShowLauncher: (() -> Void)?
+    /// Invoked when the user picks "Preferences…" from the menu.
+    var onOpenPreferences: (() -> Void)?
 
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let store = RunStore()
@@ -83,6 +85,19 @@ final class TrayController: NSObject, NSMenuDelegate {
         let launcher = NSMenuItem(title: "Open Launcher…", action: #selector(openLauncher), keyEquivalent: "")
         launcher.target = self
         menu.addItem(launcher)
+
+        menu.addItem(.separator())
+
+        // Mirror of the Preferences "Start at login" checkbox.
+        let login = NSMenuItem(title: "Launch at Login", action: #selector(toggleLoginItem), keyEquivalent: "")
+        login.target = self
+        login.state = LoginItem.isEnabled ? .on : .off
+        login.isEnabled = LoginItem.isBundled
+        menu.addItem(login)
+
+        let prefs = NSMenuItem(title: "Preferences…", action: #selector(openPreferences), keyEquivalent: ",")
+        prefs.target = self
+        menu.addItem(prefs)
 
         menu.addItem(.separator())
 
@@ -200,6 +215,19 @@ final class TrayController: NSObject, NSMenuDelegate {
 
     @objc private func openLauncher() {
         onShowLauncher?()
+    }
+
+    @objc private func openPreferences() {
+        onOpenPreferences?()
+    }
+
+    @objc private func toggleLoginItem() {
+        do {
+            _ = try LoginItem.setEnabled(!LoginItem.isEnabled)
+        } catch {
+            NSSound.beep()
+            log.error("login item toggle failed: \(String(describing: error), privacy: .public)")
+        }
     }
 
     @objc private func quit() {

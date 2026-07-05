@@ -9,6 +9,12 @@ if CommandLine.arguments.contains("--selftest") {
     exit(0)
 }
 
+// Headless preferences-construction smoke test.
+if CommandLine.arguments.contains("--selftest-prefs") {
+    SelfTest.runPrefs()
+    exit(0)
+}
+
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate

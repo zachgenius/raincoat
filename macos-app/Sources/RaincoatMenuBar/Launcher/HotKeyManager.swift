@@ -15,10 +15,32 @@ final class HotKeyManager {
     private let signature: OSType = 0x5243484B
     private let hotKeyID: UInt32 = 1
 
-    func register(keyCode: UInt32, modifiers: UInt32, onTrigger: @escaping () -> Void) {
-        unregister()
+    /// Installs the Carbon event handler (once) and registers the given combo.
+    /// Returns whether RegisterEventHotKey succeeded.
+    @discardableResult
+    func register(keyCode: UInt32, modifiers: UInt32, onTrigger: @escaping () -> Void) -> Bool {
         self.onTrigger = onTrigger
+        installHandlerIfNeeded()
+        return registerHotKey(keyCode: keyCode, modifiers: modifiers)
+    }
 
+    /// LIVE re-bind to a new combo, keeping the existing trigger handler installed.
+    /// Returns false if the new combo could not be registered (the caller can then
+    /// restore the previous binding).
+    @discardableResult
+    func rebind(keyCode: UInt32, modifiers: UInt32) -> Bool {
+        installHandlerIfNeeded()
+        return registerHotKey(keyCode: keyCode, modifiers: modifiers)
+    }
+
+    func unregister() {
+        if let ref = hotKeyRef { UnregisterEventHotKey(ref); hotKeyRef = nil }
+        if let ref = handlerRef { RemoveEventHandler(ref); handlerRef = nil }
+        onTrigger = nil
+    }
+
+    private func installHandlerIfNeeded() {
+        guard handlerRef == nil else { return }
         var eventType = EventTypeSpec(
             eventClass: OSType(kEventClassKeyboard),
             eventKind: UInt32(kEventHotKeyPressed)
@@ -32,7 +54,10 @@ final class HotKeyManager {
             selfPtr,
             &handlerRef
         )
+    }
 
+    private func registerHotKey(keyCode: UInt32, modifiers: UInt32) -> Bool {
+        if let ref = hotKeyRef { UnregisterEventHotKey(ref); hotKeyRef = nil }
         let id = EventHotKeyID(signature: signature, id: hotKeyID)
         let status = RegisterEventHotKey(
             keyCode,
@@ -44,13 +69,10 @@ final class HotKeyManager {
         )
         if status != noErr {
             log.error("RegisterEventHotKey failed: \(status)")
+            hotKeyRef = nil
+            return false
         }
-    }
-
-    func unregister() {
-        if let ref = hotKeyRef { UnregisterEventHotKey(ref); hotKeyRef = nil }
-        if let ref = handlerRef { RemoveEventHandler(ref); handlerRef = nil }
-        onTrigger = nil
+        return true
     }
 
     fileprivate func fire() {
