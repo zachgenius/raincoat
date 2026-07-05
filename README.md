@@ -354,10 +354,12 @@ structural, fail-closed guarantees. This is the platform every guarantee in this
 against.
 
 **macOS is a best-effort Seatbelt backend** (in progress on the `macos-seatbelt-backend` branch).
-Instead of bubblewrap it runs your command under Apple's Seatbelt via
-`/usr/bin/sandbox-exec -f <profile.sb> -- <cmd>`, behind the same platform seam as the Linux backend
-(selected at compile time; the runner skips any guarantee the backend can't deliver rather than fake
-the audit note). **Windows remains a non-goal.**
+Instead of bubblewrap it confines your command with an Apple Seatbelt profile — applied
+**in-process** (`sandbox_init`, then it `exec`s your command itself so an injected identity
+interposer survives SIP; a plain `/usr/bin/sandbox-exec` would strip it) and validated first by a
+fail-closed pre-flight probe. This sits behind the same platform seam as the Linux backend (selected
+at compile time; the runner skips any guarantee the backend can't deliver rather than fake the audit
+note). **Windows remains a non-goal.**
 
 ### macOS (best-effort)
 
@@ -375,12 +377,13 @@ honest reasons. Read [`docs/MACOS.md`](docs/MACOS.md) before trusting it:
    bundle + entitlements). Raincoat uses the deprecated-but-functional path and says so.
 3. **No font / `/etc` masking; hostname/fingerprint faking is best-effort.** macOS uses Core Text (not
    fontconfig) and has no UTS namespace, so the curated font set and the minimal `/etc` view are
-   unavailable. Hostname/username/CPU/kernel/RAM *are* now faked — best-effort — by a small **DYLD
-   interposer** that rewrites `gethostname()`/`uname()`/`getpwuid()`/`getlogin()`/`sysctl` for
-   **non-hardened** targets (unsigned/ad-hoc Homebrew/dev tools); a hardened-runtime, SIP-protected, or
-   static binary ignores it and still sees the truth, and there is no seccomp-style backstop as on
-   Linux. (One place macOS is actually *stronger*: the guarded-proxy egress firewall is kernel-enforced
-   for **all** clients with no pasta helper — see [`docs/MACOS.md`](docs/MACOS.md).)
+   unavailable. Hostname/username/CPU/kernel/RAM/machine-id/boot-id/uptime *are* now faked —
+   best-effort — by a small **DYLD interposer** that rewrites `gethostname()`/`uname()`/`getpwuid()`/
+   `getlogin()`/`gethostuuid()`/`sysctl` for **non-hardened** targets (unsigned/ad-hoc Homebrew/dev
+   tools); a hardened-runtime, SIP-protected, or static binary ignores it and still sees the truth, and
+   there is no seccomp-style backstop as on Linux. (One place macOS is actually *stronger*: the
+   guarded-proxy egress firewall is kernel-enforced for **all** clients with no pasta helper — see
+   [`docs/MACOS.md`](docs/MACOS.md).)
 
 Same raincoat, thinner fabric: it keeps the everyday drizzle off on macOS too, but the seams are wider
 and honestly disclosed.
