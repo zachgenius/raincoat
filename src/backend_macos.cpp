@@ -167,6 +167,10 @@ std::optional<LaunchPlan> backend_build_launch(const LaunchInputs& in, std::stri
     const std::string dylib = canon_or(interpose_dylib_path());
     c.interpose_dylib = dylib;
 
+    // The command's own binary (realpath). The generator re-allows reading it after the denies,
+    // so a tool under the hidden $HOME (e.g. ~/.local/bin/foo) can still be read + exec'd.
+    c.command_exec_path = canon_or(in.command_exec_path);
+
     std::string profile = build_seatbelt_profile(c, err);
     if (!err.empty()) return std::nullopt;
 
@@ -178,7 +182,11 @@ std::optional<LaunchPlan> backend_build_launch(const LaunchInputs& in, std::stri
     // probe, which still runs via sandbox-exec -f (same SBPL, same enforcement).
     plan.apply_sbpl = profile;
     plan.argv = in.cfg->command;
-    plan.launch_path = plan.argv.empty() ? std::string() : plan.argv.front();
+    // Exec the resolved realpath (absolute → no in-sandbox PATH search, whose dirs may be
+    // hidden). Fall back to the raw command[0] when resolution failed.
+    plan.launch_path = !c.command_exec_path.empty()
+                           ? c.command_exec_path
+                           : (plan.argv.empty() ? std::string() : plan.argv.front());
     plan.child_env = in.env.resolved;      // applied at exec by the runner
     plan.env_apply = EnvApply::ViaExec;
     plan.profile_text = profile;

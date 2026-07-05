@@ -877,3 +877,39 @@ TEST(BwrapBackend, UnshareNetStillEmittedByDefaultWhenNetOff) {
     Argv a = buildWith(makeConfig(NetMode::Off, "/work", {"true"}));
     EXPECT_TRUE(has(a, "--unshare-net"));
 }
+
+// --- command_exec_path: expose the wrapped command's OWN binary (the last defaulted param) ---
+
+static Argv buildWithCmdPath(const Config& cfg, const std::string& cmdPath) {
+    return build_bwrap_argv("/usr/bin/bwrap", cfg, {}, makeEnv({}), "/fh", "/tmp",
+                            /*bind_resolv_conf=*/false, "", "", "", "", {}, {}, true, {}, cmdPath);
+}
+
+// A binary OUTSIDE /usr (e.g. ~/.local/bin) is ro-bound into the namespace and the command's
+// argv[0] is rewritten to that absolute realpath, so bwrap can exec it even though its dir was
+// never mounted. Trailing args are preserved.
+TEST(BwrapBackend, CommandBinaryOutsideUsrIsBoundAndExecdByAbsolutePath) {
+    Config cfg = makeConfig(NetMode::Full, "/work", {"tool", "--version"});
+    const std::string real = "/home/you/.local/share/tool/2.1.0";
+    Argv a = buildWithCmdPath(cfg, real);
+    EXPECT_TRUE(hasTriple(a, "--ro-bind-try", real, real));
+    ASSERT_GE(a.size(), 2u);
+    EXPECT_EQ(a[a.size() - 2], real);   // argv[0] rewritten to the realpath
+    EXPECT_EQ(a.back(), "--version");   // trailing args untouched
+}
+
+// A binary already under /usr is visible via --ro-bind /usr, so nothing changes: no extra
+// bind, and the command token stays exactly as given.
+TEST(BwrapBackend, CommandBinaryUnderUsrIsLeftUnchanged) {
+    Config cfg = makeConfig(NetMode::Full, "/work", {"ls"});
+    Argv a = buildWithCmdPath(cfg, "/usr/bin/ls");
+    EXPECT_FALSE(hasTriple(a, "--ro-bind-try", "/usr/bin/ls", "/usr/bin/ls"));
+    EXPECT_EQ(a.back(), "ls");
+}
+
+// Empty command_exec_path (the default, and what every other test passes) is a no-op.
+TEST(BwrapBackend, EmptyCommandExecPathLeavesCommandVerbatim) {
+    Config cfg = makeConfig(NetMode::Full, "/work", {"true"});
+    Argv a = buildWithCmdPath(cfg, "");
+    EXPECT_EQ(a.back(), "true");
+}
