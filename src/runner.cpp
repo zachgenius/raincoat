@@ -1742,9 +1742,13 @@ int run(const Config& cfg, const std::map<std::string, std::string>& parent_env,
         if (cfg_want_uname) add_which("uname(2)");
         if (cfg_want_sysinfo) add_which("sysinfo(2)");
         if (cfg_want_affinity) add_which("sched_getaffinity(2)");
+        // Mirrors the id_hook gate computed just before fork(): the audit start record is
+        // written before that point, so predict from the same capability checks. (A later
+        // socketpair/listener setup failure downgrades silently — best-effort, as disclosed
+        // in the "not active" branch below.)
         bool linux_active = false;
 #ifdef __linux__
-        linux_active = id_hook;
+        linux_active = caps.supports_seccomp_identity && seccomp_identity_supported();
 #endif
         if (linux_active) {
             rec.active_policy_notes.push_back(
