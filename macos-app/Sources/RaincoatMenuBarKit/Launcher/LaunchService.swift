@@ -12,7 +12,9 @@ enum LaunchService {
     enum LaunchError: Error, LocalizedError {
         case unresolved
         case raincoatNotFound
-        case appSandboxed(String)
+        /// The target is an App-Sandboxed app and can't be wrapped. Carries its bundle URL so the
+        /// caller can offer to launch it normally instead.
+        case appSandboxed(URL)
 
         var errorDescription: String? {
             switch self {
@@ -20,8 +22,9 @@ enum LaunchService {
                 return "Couldn't resolve that item to a runnable command."
             case .raincoatNotFound:
                 return "The raincoat binary wasn't found."
-            case .appSandboxed(let name):
-                return "\(name) already uses Apple's App Sandbox, and macOS won't let Raincoat wrap an app that sandboxes itself — it would crash on launch. App Store apps generally can't be run under Raincoat on macOS."
+            case .appSandboxed(let url):
+                let name = url.deletingPathExtension().lastPathComponent
+                return "\(name) already uses Apple's App Sandbox, and macOS won't let Raincoat wrap an app that sandboxes itself — it would crash on launch."
             }
         }
     }
@@ -29,9 +32,9 @@ enum LaunchService {
     /// Launches `item` under raincoat and records it in recents. Throws on resolution or spawn failure.
     static func launch(_ item: SearchItem) throws {
         // App-Sandboxed apps (most Mac App Store apps) trap at launch if wrapped — macOS forbids
-        // nesting sandboxes. Detect and refuse cleanly rather than crash. See AppSandboxProbe.
+        // nesting sandboxes. Surface it as a choice (start unwrapped / cancel), not a crash.
         if case .app(let url) = item.kind, AppSandboxProbe.isSandboxed(url) {
-            throw LaunchError.appSandboxed(url.deletingPathExtension().lastPathComponent)
+            throw LaunchError.appSandboxed(url)
         }
         guard let argv = resolveArgv(for: item), !argv.isEmpty else { throw LaunchError.unresolved }
         guard let raincoat = RaincoatLocator.find() else { throw LaunchError.raincoatNotFound }

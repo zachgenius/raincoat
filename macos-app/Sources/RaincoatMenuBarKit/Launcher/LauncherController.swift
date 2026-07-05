@@ -237,8 +237,38 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
         hide()
         do {
             try LaunchService.launch(item)
+        } catch LaunchService.LaunchError.appSandboxed(let appURL) {
+            presentAppSandboxChoice(appURL)
         } catch {
             presentLaunchError(error)
+        }
+    }
+
+    // An App-Sandboxed app can't be wrapped (it would trap at launch). Rather than dead-end, offer
+    // to start it normally — outside Raincoat — or cancel.
+    private func presentAppSandboxChoice(_ appURL: URL) {
+        NSApp.activate(ignoringOtherApps: true)
+        let name = appURL.deletingPathExtension().lastPathComponent
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Can't run \(name) under Raincoat"
+        alert.informativeText = """
+        \(name) is an App Store app that runs in Apple's own App Sandbox. macOS won't let Raincoat \
+        wrap an app that sandboxes itself — it would crash on launch.
+
+        You can start \(name) normally instead — it just won't be confined by Raincoat.
+        """
+        alert.addButton(withTitle: "Start without Raincoat")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        // Launch via LaunchServices (NOT under raincoat) — the normal way to open a GUI app.
+        if !NSWorkspace.shared.open(appURL) {
+            let fail = NSAlert()
+            fail.alertStyle = .warning
+            fail.messageText = "Couldn't open \(name)"
+            fail.addButton(withTitle: "OK")
+            fail.runModal()
         }
     }
 
@@ -256,9 +286,6 @@ final class LauncherController: NSObject, NSTextFieldDelegate, NSTableViewDataSo
 
               defaults write dev.raincoat.menubar raincoat.binaryPath /full/path/to/raincoat
             """
-        } else if case LaunchService.LaunchError.appSandboxed = error {
-            alert.messageText = "Can't sandbox an App Store app"
-            alert.informativeText = error.localizedDescription
         } else {
             alert.messageText = "Couldn't launch under Raincoat"
             alert.informativeText = error.localizedDescription

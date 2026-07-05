@@ -101,9 +101,10 @@ The launcher must resolve and disclose these — they are OS facts, not Raincoat
    (`SET_USERLAND_PROFILE` in `libsecinit`). macOS refuses to sandbox an already-sandboxed process,
    so wrapping one **traps at startup** (SIGTRAP in `_libsecinit_appsandbox`) before it runs. The
    launcher checks the target's entitlements (`AppSandboxProbe`, via `SecCodeCopySigningInformation`)
-   and **refuses with a clear message** instead of launching into a crash. *(The bare CLI —
-   `raincoat -- /Applications/WeChat.app/Contents/MacOS/WeChat` — has no such guard yet; that belongs
-   in the macOS backend on `master`.)*
+   and, instead of crashing, shows a dialog offering **Start without Raincoat** (launch it normally
+   via LaunchServices — unconfined by Raincoat, but still in Apple's own App Sandbox) or **Cancel**.
+   *(The bare CLI — `raincoat -- /Applications/WeChat.app/Contents/MacOS/WeChat` — has no such guard
+   yet; that belongs in the macOS backend on `master`.)*
 
 ## Build & packaging
 
