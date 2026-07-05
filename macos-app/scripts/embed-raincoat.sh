@@ -17,7 +17,9 @@ set -uo pipefail
 APP="${1:?usage: embed-raincoat.sh <Raincoat.app> [identity]}"
 IDENTITY="${2:--}"
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"   # macos-app/scripts -> repo root
-BUILD_DIR="$REPO_ROOT/build"
+# A DEDICATED build dir so we never fight a stale cache in the user's own ./build (which may
+# have been configured differently, e.g. without the OpenSSL prefix) and never disturb it.
+BUILD_DIR="$REPO_ROOT/build-app"
 HELPERS="$APP/Contents/Helpers"
 
 find_cmake() {
@@ -36,8 +38,17 @@ CMAKE="$(find_cmake)" || {
 echo "==> building raincoat with $CMAKE"
 ARCH_FLAG=()
 [ "${RAINCOAT_UNIVERSAL:-0}" = "1" ] && ARCH_FLAG=(-DCMAKE_OSX_ARCHITECTURES="arm64;x86_64")
+# raincoat links OpenSSL (egress bridge). Homebrew's openssl@3 is keg-only, so find_package
+# needs an explicit hint — mirror install.sh / the Homebrew formula, else the configure fails
+# with "OpenSSL::SSL target not found" and the bundled CLI is silently skipped.
+SSL_FLAG=()
+if command -v brew >/dev/null 2>&1; then
+  ssl_prefix="$(brew --prefix openssl@3 2>/dev/null || true)"
+  [ -n "$ssl_prefix" ] && SSL_FLAG=(-DCMAKE_PREFIX_PATH="$ssl_prefix")
+fi
 # Expand safely even when empty (macOS bash 3.2 + `set -u` errors on "${arr[@]}" if unset).
-if ! "$CMAKE" -S "$REPO_ROOT" -B "$BUILD_DIR" ${ARCH_FLAG[@]+"${ARCH_FLAG[@]}"} >/dev/null; then
+if ! "$CMAKE" -S "$REPO_ROOT" -B "$BUILD_DIR" \
+     ${ARCH_FLAG[@]+"${ARCH_FLAG[@]}"} ${SSL_FLAG[@]+"${SSL_FLAG[@]}"} >/dev/null; then
   echo "warning: cmake configure failed; skipping bundled CLI" >&2; exit 0
 fi
 if ! "$CMAKE" --build "$BUILD_DIR" --target raincoat -j >/dev/null; then
