@@ -45,29 +45,58 @@ choice the default one: run the tool, but don't let it casually rifle through yo
 
 ## Install / build
 
-Raincoat is a C++17 project built with CMake. Its one runtime dependency is **bubblewrap**.
+Raincoat is a C++17 project built with CMake (≥ 3.16). Building needs a C/C++ toolchain,
+**OpenSSL** (the egress bridge terminates HTTPS via OpenSSL), and **GoogleTest** (the test
+suite is built by default). The runtime dependency is per-platform: **bubblewrap** on Linux;
+on macOS the sandbox is Apple's built-in Seatbelt, so there is nothing extra to install.
 
-### 1. Install bubblewrap
+### 1. Install the dependencies
+
+**Linux**
 
 ```sh
 # Ubuntu/Debian
-sudo apt install bubblewrap
+sudo apt install bubblewrap cmake g++ libssl-dev libgtest-dev
 # Fedora
-sudo dnf install bubblewrap
+sudo dnf install bubblewrap cmake gcc-c++ openssl-devel gtest-devel
 # Arch
-sudo pacman -S bubblewrap
+sudo pacman -S bubblewrap cmake gcc openssl gtest
 ```
+
+Optional: [`pasta`](https://passt.top/) (package `passt` on all three) enables the
+isolated-netns egress jail; without it the egress bridge falls back to the shared host
+network namespace (`raincoat doctor` reports which you have).
+
+**macOS**
+
+```sh
+xcode-select --install                    # compiler toolchain (skip if Xcode/CLT is installed)
+brew install cmake openssl@3 googletest
+```
+
+Apple's Seatbelt (`sandbox_init` / `sandbox-exec`) ships with macOS — nothing to install for
+the sandbox itself.
 
 ### 2. Build
 
 ```sh
-git clone <your-fork-url> Raincoat
-cd Raincoat
+git clone https://github.com/zachgenius/raincoat.git
+cd raincoat
 cmake -S . -B build
 cmake --build build -j
 ```
 
-The binary lands at `./build/raincoat`.
+On macOS, point CMake at Homebrew's keg-only `openssl@3` when configuring:
+
+```sh
+cmake -S . -B build -DCMAKE_PREFIX_PATH="$(brew --prefix openssl@3)"
+cmake --build build -j
+```
+
+The binary lands at `./build/raincoat`. CMake selects the sandbox backend at configure time:
+bubblewrap on Linux, Seatbelt on macOS (where it also builds the `rc_interpose.dylib`
+identity interposer next to the binary). See
+[`docs/MACOS.md`](docs/MACOS.md#building-and-running-on-macos) for macOS specifics.
 
 ### 3. Check your host
 
@@ -92,13 +121,20 @@ The `egress network jail` line is informational, never a `[FAIL]`: if neither `p
 `slirp4netns` is installed it reads `[INFO] … unavailable` and the egress bridge simply falls
 back to the shared host network namespace (see [Egress bridge](#egress-bridge-endpoint-indirection)).
 
+On macOS, `doctor` is Seatbelt-aware instead: it checks that `sandbox-exec` is present, runs a
+real SBPL smoke test, and always prints the honest Seatbelt-deprecation warning (see
+[`docs/MACOS.md`](docs/MACOS.md)). No pasta helper is needed there — the egress firewall is
+kernel-level.
+
 ### Running the tests
 
 ```sh
 ctest --test-dir build --output-on-failure
 ```
 
-Integration tests that actually invoke `bwrap` skip gracefully on hosts without it.
+CMake compiles the platform-appropriate suites (the bwrap/seccomp tests on Linux, the Seatbelt
+SBPL suite on macOS), and integration tests that actually invoke `bwrap` skip gracefully on
+hosts without it.
 
 ---
 
@@ -353,7 +389,7 @@ CONSTRUCTS a fresh namespace: hidden paths simply don't exist, and a failed moun
 structural, fail-closed guarantees. This is the platform every guarantee in this README is measured
 against.
 
-**macOS is a best-effort Seatbelt backend** (in progress on the `macos-seatbelt-backend` branch).
+**macOS is a best-effort Seatbelt backend**, selected automatically when you build on macOS.
 Instead of bubblewrap it confines your command with an Apple Seatbelt profile — applied
 **in-process** (`sandbox_init`, then it `exec`s your command itself so an injected identity
 interposer survives SIP; a plain `/usr/bin/sandbox-exec` would strip it) and validated first by a
@@ -791,7 +827,7 @@ roadmap have since shipped.
   ([Browser isolation](#browser-isolation-browser)).
 - **Per-job profile templates** — the [`examples/`](examples/) directory (strict, paranoid,
   ai-agent, node-build, python-tool, egress, api-agent, guarded, browser).
-- **macOS best-effort mode** (in progress on `macos-seatbelt-backend`) — a reduced-guarantee Seatbelt
+- **macOS best-effort mode** — a reduced-guarantee Seatbelt
   backend behind the platform seam: in-process `sandbox_init` deny-based filtering + a fail-closed
   per-run pre-flight probe, a kernel egress firewall, a best-effort **DYLD identity/fingerprint
   interposer** (hostname/username/CPU/kernel/RAM for non-hardened targets), and honest `[-]` gaps (no
